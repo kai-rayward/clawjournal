@@ -1,0 +1,2 @@
+recursive-include clawjournal/prompts *.md
+recursive-include clawjournal/web/frontend/dist *

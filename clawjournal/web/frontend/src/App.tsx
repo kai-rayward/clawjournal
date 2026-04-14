@@ -1,0 +1,148 @@
+import { useState, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
+import { Inbox } from './views/Inbox.tsx';
+import { Search } from './views/Search.tsx';
+import SessionDetail from './views/SessionDetail.tsx';
+import { Share } from './views/Share.tsx';
+import { Policies } from './views/Policies.tsx';
+import { Dashboard } from './views/Dashboard.tsx';
+import { Insights } from './views/Insights.tsx';
+import { ToastProvider } from './components/Toast.tsx';
+import { colors, fontFamily } from './theme.ts';
+import { api } from './api.ts';
+
+interface SidebarCounts {
+  toReview: number;
+  approved: number;
+}
+
+function Sidebar() {
+  const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0 });
+
+  useEffect(() => {
+    api.stats()
+      .then(s => setCounts({
+        toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
+        approved: s.by_status['approved'] ?? 0,
+      }))
+      .catch(() => {});
+    // Refresh counts periodically
+    const iv = setInterval(() => {
+      api.stats()
+        .then(s => setCounts({
+          toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
+          approved: s.by_status['approved'] ?? 0,
+        }))
+        .catch(() => {});
+    }, 30_000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const NAV_ITEMS = [
+    { to: '/dashboard', label: 'Dashboard', badge: null },
+    { to: '/insights', label: 'Insights', badge: null },
+    { to: '/search', label: 'Search', badge: null },
+    { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
+    { to: '/share', label: 'Share', badge: counts.approved > 0 ? counts.approved : null },
+  ];
+
+  return (
+    <nav style={{
+      width: 190,
+      background: colors.gray50,
+      borderRight: `1px solid ${colors.gray200}`,
+      display: 'flex',
+      flexDirection: 'column',
+      padding: '16px 0',
+      flexShrink: 0,
+      fontFamily,
+    }}>
+      <div style={{
+        padding: '0 16px 18px',
+        fontSize: 17,
+        fontWeight: 700,
+        color: colors.gray800,
+        letterSpacing: '-0.02em',
+      }}>
+        ClawJournal
+      </div>
+      {NAV_ITEMS.map((item) => (
+        <NavLink
+          key={item.to}
+          to={item.to}
+          end={item.to === '/'}
+          style={({ isActive }) => ({
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '8px 16px',
+            fontSize: 14,
+            fontWeight: isActive ? 600 : 400,
+            color: isActive ? colors.gray800 : colors.gray500,
+            background: isActive ? colors.gray200 : 'transparent',
+            textDecoration: 'none',
+            borderLeft: isActive ? `3px solid ${colors.gray700}` : '3px solid transparent',
+            borderRadius: '0 6px 6px 0',
+            marginRight: 8,
+            transition: 'background 0.15s ease',
+          })}
+        >
+          <span>{item.label}</span>
+          {item.badge != null && (
+            <span style={{
+              minWidth: 20,
+              height: 20,
+              padding: '0 6px',
+              borderRadius: 10,
+              background: colors.gray700,
+              color: colors.gray50,
+              fontSize: 11,
+              fontWeight: 600,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              lineHeight: 1,
+            }}>
+              {item.badge > 99 ? '99+' : item.badge}
+            </span>
+          )}
+        </NavLink>
+      ))}
+      <div style={{ flex: 1 }} />
+      <div style={{ padding: '8px 16px', fontSize: 12, color: colors.gray400 }}>
+        Workbench v0.1
+      </div>
+    </nav>
+  );
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <ToastProvider>
+        <div style={{
+          display: 'flex',
+          height: '100vh',
+          fontFamily,
+          color: colors.gray900,
+          WebkitFontSmoothing: 'antialiased',
+        }}>
+          <Sidebar />
+          <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
+            <Routes>
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/insights" element={<Insights />} />
+              <Route path="/" element={<Inbox />} />
+              <Route path="/search" element={<Search />} />
+              <Route path="/session/:id" element={<SessionDetail />} />
+              <Route path="/bundles" element={<Navigate to="/share" replace />} />
+              <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+              <Route path="/share" element={<Share />} />
+              <Route path="/share/rules" element={<Policies />} />
+            </Routes>
+          </main>
+        </div>
+      </ToastProvider>
+    </BrowserRouter>
+  );
+}

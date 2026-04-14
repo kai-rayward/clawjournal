@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.egg-info/
+/dist/
+build/
+.DS_Store
+*.jsonl
+
+# Frontend build output — built locally via `npm run build`, never committed
+clawjournal/web/frontend/dist/
+
+# ClawJournal local export/review artifacts
+clawjournal_conversations.jsonl
+clawjournal_export.jsonl
+findings.json
+
+# Node modules
+node_modules/
+
+# Local tooling state
+.desloppify/
+.worktrees/
+.claude/
+docs/
+
+# PII review artifacts
+*.pii_findings.json

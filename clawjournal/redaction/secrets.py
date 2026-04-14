@@ -1,0 +1,614 @@
+"""Detect and redact secrets in conversation data."""
+
+import math
+import re
+from typing import Any
+
+REDACTED = "[REDACTED]"
+
+# Ordered from most specific to least specific
+SECRET_PATTERNS = [
+    # JWT tokens — full 3-segment form
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}")),
+
+    # JWT tokens — partial (header only or header+partial payload, e.g. truncated)
+    ("jwt_partial", re.compile(r"eyJ[A-Za-z0-9_-]{15,}")),
+
+    # PostgreSQL/database connection strings with passwords
+    ("db_url", re.compile(r"postgres(?:ql)?://[^:]+:[^@\s]+@[^\s\"'`]+")),
+
+    # Anthropic API keys
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+
+    # OpenAI API keys
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
+
+    # Hugging Face tokens
+    ("hf_token", re.compile(r"hf_[A-Za-z0-9]{20,}")),
+
+    # GitHub tokens
+    ("github_token", re.compile(r"(?:ghp|gho|ghs|ghr)_[A-Za-z0-9]{30,}")),
+
+    # PyPI tokens
+    ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_-]{50,}")),
+
+    # NPM tokens
+    ("npm_token", re.compile(r"npm_[A-Za-z0-9]{30,}")),
+
+    # AWS access key IDs (but not in regex pattern context)
+    ("aws_key", re.compile(r"(?<![A-Za-z0-9\[])AKIA[0-9A-Z]{16}(?![0-9A-Z\]{}])")),
+
+    # AWS secret keys (40 chars, mixed case + special)
+    ("aws_secret", re.compile(
+        r"(?:aws_secret_access_key|secret_key)\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?",
+        re.IGNORECASE,
+    )),
+
+    # Slack tokens
+    ("slack_token", re.compile(r"xox[bpsa]-[A-Za-z0-9-]{20,}")),
+
+    # Discord webhook URLs (contain a secret token in the path)
+    ("discord_webhook", re.compile(
+        r"https?://(?:discord\.com|discordapp\.com)/api/webhooks/\d+/[A-Za-z0-9_-]{20,}"
+    )),
+
+    # Private keys
+    ("private_key", re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+        r"[\s\S]*?"
+        r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    )),
+
+    # CLI flags that pass tokens/secrets: --token VALUE, --access-token VALUE, etc.
+    ("cli_token_flag", re.compile(
+        r"(?:--|-)(?:access[_-]?token|auth[_-]?token|api[_-]?key|secret|password|token)"
+        r"[\s=]+([A-Za-z0-9_/+=.-]{8,})",
+        re.IGNORECASE,
+    )),
+
+    # Environment variable assignments with secret-like names (with or without quotes)
+    ("env_secret", re.compile(
+        r"(?:SECRET|PASSWORD|TOKEN|API_KEY|AUTH_KEY|ACCESS_KEY|SERVICE_KEY|DB_PASSWORD"
+        r"|SUPABASE_KEY|SUPABASE_SERVICE|ANON_KEY|SERVICE_ROLE)"
+        r"\s*[=]\s*['\"]?([^\s'\"]{6,})['\"]?",
+        re.IGNORECASE,
+    )),
+
+    # Generic secret assignments: SECRET_KEY = "value", api_key: "value", etc.
+    ("generic_secret", re.compile(
+        r"""(?:secret[_-]?key|api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token"""
+        r"""|service[_-]?role[_-]?key|private[_-]?key)"""
+        r"""\s*[=:]\s*['"]([A-Za-z0-9_/+=.-]{20,})['"]""",
+        re.IGNORECASE,
+    )),
+
+    # Bearer tokens in headers
+    ("bearer", re.compile(
+        r"Bearer\s+(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})"
+    )),
+
+    # IP addresses (public, non-loopback, non-private-by-default)
+    ("ip_address", re.compile(
+        r"\b(?!127\.0\.0\.)(?!0\.0\.0\.0)(?!255\.255\.)"
+        r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b"
+    )),
+
+    # URL query params with secrets: ?key=VALUE, &token=VALUE, etc.
+    ("url_token", re.compile(
+        r"[?&](?:key|token|secret|password|apikey|api_key|access_token|auth)"
+        r"=([A-Za-z0-9_/+=.-]{8,})",
+        re.IGNORECASE,
+    )),
+
+    # Email addresses (for PII removal) — require at least 2-char local part
+    ("email", re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+
+    # Long base64-like strings in quotes (checked for entropy — see scan_text)
+    ("high_entropy", re.compile(r"""['"][A-Za-z0-9_/+=.-]{40,}['"]""")),
+]
+
+# Confidence scores per pattern type, used in redaction reports.
+# High (>=0.90): exact prefix/format matches, almost certainly secrets.
+# Medium (0.70-0.89): structural patterns, worth reviewing.
+# Low (<0.70): heuristic/PII, may be false positives.
+CONFIDENCE: dict[str, float] = {
+    "jwt": 0.98, "private_key": 0.98,
+    "anthropic_key": 0.98, "openai_key": 0.98,
+    "github_token": 0.98, "hf_token": 0.98,
+    "pypi_token": 0.98, "npm_token": 0.98,
+    "aws_key": 0.98, "aws_secret": 0.95,
+    "slack_token": 0.98, "discord_webhook": 0.95,
+    "jwt_partial": 0.80, "db_url": 0.85,
+    "bearer": 0.85, "cli_token_flag": 0.80,
+    "env_secret": 0.75, "generic_secret": 0.80,
+    "url_token": 0.80,
+    "ip_address": 0.60, "email": 0.65,
+    "high_entropy": 0.55,
+}
+
+# Typed placeholders per secret type — preserves what kind of secret was
+# removed so model-training data retains task structure.
+SECRET_PLACEHOLDER: dict[str, str] = {
+    "jwt": "[REDACTED_JWT]",
+    "jwt_partial": "[REDACTED_JWT]",
+    "db_url": "[REDACTED_DB_URL]",
+    "anthropic_key": "[REDACTED_ANTHROPIC_KEY]",
+    "openai_key": "[REDACTED_OPENAI_KEY]",
+    "hf_token": "[REDACTED_HF_TOKEN]",
+    "github_token": "[REDACTED_GITHUB_TOKEN]",
+    "pypi_token": "[REDACTED_PYPI_TOKEN]",
+    "npm_token": "[REDACTED_NPM_TOKEN]",
+    "aws_key": "[REDACTED_AWS_KEY]",
+    "aws_secret": "[REDACTED_AWS_SECRET]",
+    "slack_token": "[REDACTED_SLACK_TOKEN]",
+    "discord_webhook": "[REDACTED_DISCORD_WEBHOOK]",
+    "private_key": "[REDACTED_PRIVATE_KEY]",
+    "cli_token_flag": "[REDACTED_CLI_TOKEN]",
+    "env_secret": "[REDACTED_ENV_SECRET]",
+    "generic_secret": "[REDACTED_SECRET]",
+    "bearer": "[REDACTED_BEARER]",
+    "ip_address": "[REDACTED_IP]",
+    "url_token": "[REDACTED_URL_TOKEN]",
+    "email": "[REDACTED_EMAIL]",
+    "high_entropy": "[REDACTED_SECRET]",
+}
+
+ALLOWLIST = [
+    re.compile(r"noreply@"),
+    re.compile(r"@example\.com"),
+    re.compile(r"@localhost"),
+    re.compile(r"@anthropic\.com"),
+    re.compile(r"@github\.com"),
+    re.compile(r"@users\.noreply\.github\.com"),
+    re.compile(r"AKIA\["),  # regex patterns about AWS keys
+    re.compile(r"sk-ant-\.\*"),  # regex patterns about API keys
+    re.compile(r"postgres://user:pass@"),  # example/documentation URLs
+    re.compile(r"postgres://username:password@"),
+    re.compile(r"@pytest"),  # Python decorator false positives
+    re.compile(r"@tasks\."),
+    re.compile(r"@mcp\."),
+    re.compile(r"@server\."),
+    re.compile(r"@app\."),
+    re.compile(r"@router\."),
+    re.compile(r"192\.168\."),  # private IPs (low risk)
+    re.compile(r"10\.\d+\.\d+\.\d+"),
+    re.compile(r"172\.(?:1[6-9]|2\d|3[01])\."),
+    re.compile(r"8\.8\.8\.8"),  # Google DNS
+    re.compile(r"8\.8\.4\.4"),
+    re.compile(r"1\.1\.1\.1"),  # Cloudflare DNS
+]
+
+
+def _shannon_entropy(s: str) -> float:
+    """Higher values indicate more random-looking strings."""
+    if not s:
+        return 0.0
+    freq: dict[str, int] = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    length = len(s)
+    return -sum((count / length) * math.log2(count / length) for count in freq.values())
+
+
+def _has_mixed_char_types(s: str) -> bool:
+    """Check if string has a mix of uppercase, lowercase, and digits."""
+    has_upper = any(c.isupper() for c in s)
+    has_lower = any(c.islower() for c in s)
+    has_digit = any(c.isdigit() for c in s)
+    return has_upper and has_lower and has_digit
+
+
+def _check_user_allowlist(matched_text: str, match_type: str,
+                         user_allowlist: list[dict] | None) -> bool:
+    """Return True if the finding should be skipped due to user allowlist."""
+    if not user_allowlist:
+        return False
+    for entry in user_allowlist:
+        etype = entry.get("type", "exact")
+        if etype == "exact" and entry.get("text") == matched_text:
+            return True
+        if etype == "pattern":
+            regex = entry.get("regex", "")
+            if regex:
+                try:
+                    if re.search(regex, matched_text):
+                        return True
+                except re.error:
+                    pass  # invalid regex in user config, skip this entry
+        if etype == "category" and entry.get("match_type") == match_type:
+            return True
+    return False
+
+
+# Minimum text length worth scanning — the shortest possible match is an
+# email like "a@b.co" (6 chars).  Anything shorter cannot contain a secret.
+_MIN_SCAN_LENGTH = 6
+
+# Patterns that match key=value / key: value assignments.  These are the
+# most expensive regexes (IGNORECASE alternation).  If the text contains
+# no '=' or ':' character, all three can be skipped.
+_ASSIGNMENT_PATTERNS = frozenset({"env_secret", "generic_secret", "aws_secret"})
+
+
+def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
+    if not text or len(text) < _MIN_SCAN_LENGTH:
+        return []
+
+    # Fast-reject: skip the expensive assignment-style patterns when the
+    # text has no separator character.
+    has_assignment_sep = "=" in text or ":" in text
+
+    findings = []
+    for name, pattern in SECRET_PATTERNS:
+        if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
+            continue
+
+        for match in pattern.finditer(text):
+            matched_text = match.group(0)
+
+            if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
+                continue
+
+            if _check_user_allowlist(matched_text, name, user_allowlist):
+                continue
+
+            # For high_entropy, verify string actually looks like a secret
+            if name == "high_entropy":
+                inner = matched_text[1:-1]  # strip quotes
+                if not _has_mixed_char_types(inner):
+                    continue
+                if _shannon_entropy(inner) < 3.5:
+                    continue
+                if inner.count(".") > 2:
+                    continue
+
+            findings.append({
+                "type": name,
+                "start": match.start(),
+                "end": match.end(),
+                "match": matched_text,
+                "confidence": CONFIDENCE.get(name, 0.5),
+            })
+
+    return findings
+
+
+def redact_text(
+    text: str, user_allowlist: list[dict] | None = None,
+) -> tuple[str, int, list[dict]]:
+    """Redact secrets from text. Returns (redacted_text, count, redaction_log)."""
+    if not text:
+        return text, 0, []
+
+    findings = scan_text(text, user_allowlist=user_allowlist)
+    if not findings:
+        return text, 0, []
+
+    # Sort by position (descending start) to replace without shifting indices
+    findings.sort(key=lambda f: f["start"], reverse=True)
+
+    # Deduplicate overlapping findings (keep the later-starting match on overlap)
+    deduped = []
+    for f in findings:
+        if not deduped or f["end"] <= deduped[-1]["start"]:
+            deduped.append(f)
+
+    # Build redaction log (no secret text — only metadata)
+    log: list[dict] = []
+    for f in deduped:
+        entry: dict = {
+            "type": f["type"],
+            "confidence": f["confidence"],
+            "original_length": len(f["match"]),
+        }
+        # Capture surrounding context for medium/low confidence findings
+        if f["confidence"] < 0.90:
+            start, end = f["start"], f["end"]
+            ctx_before = text[max(0, start - 40):start]
+            ctx_after = text[end:end + 40]
+            # Redact high-confidence secrets in context (recursive, but only
+            # captures high-conf patterns so no infinite recursion risk)
+            safe_before = _redact_high_confidence_only(ctx_before)
+            safe_after = _redact_high_confidence_only(ctx_after)
+            entry["context_before"] = safe_before
+            entry["context_after"] = safe_after
+        log.append(entry)
+
+    # Replace from end-to-start (deduped is already in descending start order)
+    result = text
+    for f in deduped:
+        placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
+        result = result[:f["start"]] + placeholder + result[f["end"]:]
+
+    return result, len(deduped), log
+
+
+def _redact_high_confidence_only(text: str) -> str:
+    """Redact only high-confidence patterns (>=0.90) in context snippets."""
+    if not text:
+        return text
+    findings = scan_text(text)
+    high_conf = [f for f in findings if f["confidence"] >= 0.90]
+    if not high_conf:
+        return text
+    high_conf.sort(key=lambda f: f["start"], reverse=True)
+    # Deduplicate overlapping matches (same logic as redact_text)
+    deduped = []
+    for f in high_conf:
+        if not deduped or f["end"] <= deduped[-1]["start"]:
+            deduped.append(f)
+    result = text
+    for f in deduped:
+        placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
+        result = result[:f["start"]] + placeholder + result[f["end"]:]
+    return result
+
+
+def redact_custom_strings(text: str, strings: list[str]) -> tuple[str, int]:
+    if not text or not strings:
+        return text, 0
+
+    count = 0
+    for target in strings:
+        if not target or len(target) < 3:
+            continue
+        escaped = re.escape(target)
+        pattern = rf"\b{escaped}\b" if len(target) >= 4 else escaped
+        text, replacements = re.subn(pattern, "[REDACTED_CUSTOM]", text)
+        count += replacements
+
+    return text, count
+
+
+def _redact_value(
+    value: Any, custom_strings: list[str] | None = None,
+    user_allowlist: list[dict] | None = None,
+) -> tuple[Any, int, list[dict]]:
+    """Recursively redact secrets from a string, list, or dict value."""
+    if isinstance(value, str):
+        result, count, log = redact_text(value, user_allowlist=user_allowlist)
+        if custom_strings:
+            result, n = redact_custom_strings(result, custom_strings)
+            count += n
+        return result, count, log
+    if isinstance(value, dict):
+        total = 0
+        all_log: list[dict] = []
+        out = {}
+        for k, v in value.items():
+            out[k], n, log = _redact_value(v, custom_strings, user_allowlist)
+            total += n
+            all_log.extend(log)
+        return out, total, all_log
+    if isinstance(value, list):
+        total = 0
+        all_log = []
+        out_list = []
+        for item in value:
+            redacted, n, log = _redact_value(item, custom_strings, user_allowlist)
+            out_list.append(redacted)
+            total += n
+            all_log.extend(log)
+        return out_list, total, all_log
+    return value, 0, []
+
+
+def _collect_all_text(session: dict) -> list[tuple[str, str, int | None, str | None]]:
+    """Collect all text fields from a session for scanning.
+
+    Returns list of (text, field_name, message_index, tool_field).
+    """
+    texts: list[tuple[str, str, int | None, str | None]] = []
+
+    for field in ("display_title", "project", "git_branch"):
+        val = session.get(field)
+        if val and isinstance(val, str):
+            texts.append((val, field, None, None))
+
+    for msg_idx, msg in enumerate(session.get("messages", [])):
+        for field in ("content", "thinking"):
+            val = msg.get(field)
+            if val and isinstance(val, str):
+                texts.append((val, field, msg_idx, None))
+        for tool_use in msg.get("tool_uses", []):
+            for tf in ("input", "output"):
+                val = tool_use.get(tf)
+                if val and isinstance(val, str):
+                    texts.append((val, f"tool_{tf}", msg_idx, tf))
+                elif val and isinstance(val, (dict, list)):
+                    # Flatten structured tool data to scan
+                    flat = _flatten_to_strings(val)
+                    for s in flat:
+                        texts.append((s, f"tool_{tf}", msg_idx, tf))
+
+    return texts
+
+
+def _flatten_to_strings(value: Any) -> list[str]:
+    """Recursively extract all string values from a nested dict/list."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        result: list[str] = []
+        for v in value.values():
+            result.extend(_flatten_to_strings(v))
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_flatten_to_strings(item))
+        return result
+    return []
+
+
+def _build_redaction_set(
+    texts: list[tuple[str, str, int | None, str | None]],
+    user_allowlist: list[dict] | None = None,
+    custom_strings: list[str] | None = None,
+) -> tuple[dict[str, str], list[dict]]:
+    """Scan all text at once to build a global map of secret strings to typed placeholders.
+
+    Returns (secret_map, redaction_log) where secret_map maps each secret
+    string to its typed replacement (e.g. ``"sk-ant-xxx" -> "[REDACTED_ANTHROPIC_KEY]"``).
+    """
+    secret_map: dict[str, str] = {}
+    all_log: list[dict] = []
+
+    for text, field, msg_idx, _tool_field in texts:
+        findings = scan_text(text, user_allowlist=user_allowlist)
+        for f in findings:
+            matched = f["match"]
+            placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
+            secret_map.setdefault(matched, placeholder)
+
+            # For patterns with capture groups (env_secret, generic_secret,
+            # cli_token_flag, aws_secret, url_token), also add the group
+            for _name, pattern in SECRET_PATTERNS:
+                if _name == f["type"]:
+                    m = pattern.search(text[f["start"]:f["end"]])
+                    if m and m.lastindex:
+                        secret_map.setdefault(m.group(m.lastindex), placeholder)
+                    break
+
+            # Build log entry
+            entry: dict = {
+                "type": f["type"],
+                "confidence": f["confidence"],
+                "original_length": len(matched),
+                "field": field,
+            }
+            if msg_idx is not None:
+                entry["message_index"] = msg_idx
+            if f["confidence"] < 0.90:
+                start, end = f["start"], f["end"]
+                ctx_before = text[max(0, start - 40):start]
+                ctx_after = text[end:end + 40]
+                entry["context_before"] = _redact_high_confidence_only(ctx_before)
+                entry["context_after"] = _redact_high_confidence_only(ctx_after)
+            all_log.append(entry)
+
+    # Add custom strings to the redaction set
+    if custom_strings:
+        for s in custom_strings:
+            if s and len(s) >= 3:
+                secret_map.setdefault(s, "[REDACTED_CUSTOM]")
+
+    return secret_map, all_log
+
+
+def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, int]:
+    """Replace all known secrets in text using typed placeholders.
+
+    Returns (redacted_text, replacement_count).
+
+    Short secrets (< 20 chars) that look like plain words use word-boundary
+    matching to avoid false positives (e.g. "Kai" matching inside "Kaizen").
+    Long secrets and those containing special characters use plain str.replace
+    since they are unique enough to match safely.
+    """
+    if not text or not secret_map:
+        return text, 0
+
+    count = 0
+    # Sort by length descending so longer matches replace first
+    for secret in sorted(secret_map, key=len, reverse=True):
+        replacement = secret_map[secret]
+        # Short alphanumeric strings need word boundaries to avoid matching
+        # inside unrelated words (e.g. custom redact_strings like "Kai").
+        if len(secret) < 20 and secret.isalnum():
+            pattern = re.compile(rf"\b{re.escape(secret)}\b", re.IGNORECASE)
+            text, n = pattern.subn(replacement, text)
+            count += n
+        elif secret in text:
+            n = text.count(secret)
+            text = text.replace(secret, replacement)
+            count += n
+
+    return text, count
+
+
+def _apply_to_value(value: Any, secret_map: dict[str, str]) -> tuple[Any, int]:
+    """Recursively apply redaction map to a value (string, dict, or list)."""
+    if isinstance(value, str):
+        return _apply_redaction_set(value, secret_map)
+    if isinstance(value, dict):
+        total = 0
+        out = {}
+        for k, v in value.items():
+            out[k], n = _apply_to_value(v, secret_map)
+            total += n
+        return out, total
+    if isinstance(value, list):
+        total = 0
+        out_list = []
+        for item in value:
+            redacted, n = _apply_to_value(item, secret_map)
+            out_list.append(redacted)
+            total += n
+        return out_list, total
+    return value, 0
+
+
+def redact_session(
+    session: dict, custom_strings: list[str] | None = None,
+    user_allowlist: list[dict] | None = None,
+    max_passes: int = 3,
+) -> tuple[dict, int, list[dict]]:
+    """Redact all secrets in a session dict using scan-mark-replace strategy.
+
+    Strategy:
+    1. Collect all text from the entire trace
+    2. Scan once to build a global set of secret strings
+    3. Replace all secrets across all fields in one sweep
+    4. Repeat 2-3 passes to catch secrets revealed by earlier replacements
+
+    Returns (redacted_session, total_redactions, redaction_log).
+    The log contains metadata about each redaction (type, confidence,
+    original_length, field) but never the secret text itself.
+    """
+    all_log: list[dict] = []
+    total = 0
+
+    for pass_num in range(max_passes):
+        # Step 1: Collect all text from the session
+        texts = _collect_all_text(session)
+
+        # Step 2: Scan to build global redaction map (secret -> typed placeholder)
+        secret_map, log = _build_redaction_set(
+            texts, user_allowlist=user_allowlist,
+            custom_strings=custom_strings if pass_num == 0 else None,  # custom strings only on first pass
+        )
+
+        if not secret_map:
+            break  # Nothing more to redact
+
+        # Only keep log from the first pass (subsequent passes are verification)
+        if pass_num == 0:
+            all_log = log
+
+        # Step 3: Apply typed redaction map across all fields
+        pass_count = 0
+
+        for field in ("display_title", "project", "git_branch"):
+            if session.get(field) and isinstance(session[field], str):
+                session[field], n = _apply_redaction_set(session[field], secret_map)
+                pass_count += n
+
+        for msg in session.get("messages", []):
+            for field in ("content", "thinking"):
+                if msg.get(field) and isinstance(msg[field], str):
+                    msg[field], n = _apply_redaction_set(msg[field], secret_map)
+                    pass_count += n
+            for tool_use in msg.get("tool_uses", []):
+                for tf in ("input", "output"):
+                    if tool_use.get(tf):
+                        tool_use[tf], n = _apply_to_value(tool_use[tf], secret_map)
+                        pass_count += n
+
+        total += pass_count
+
+        if pass_count == 0 and pass_num > 0:
+            break  # Verification pass found nothing new
+
+    return session, total, all_log

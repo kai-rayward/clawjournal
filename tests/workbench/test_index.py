@@ -1,0 +1,679 @@
+"""Tests for the workbench SQLite index."""
+
+import json
+import sqlite3
+
+import pytest
+
+from clawjournal.workbench.index import (
+    _migrate_bundles_to_shares,
+    add_policy,
+    create_share,
+    get_effective_share_settings,
+    get_dashboard_analytics,
+    get_share,
+    get_shares,
+    get_policies,
+    get_share_ready_stats,
+    get_session_detail,
+    get_stats,
+    link_subagent_hierarchy,
+    open_index,
+    query_sessions,
+    remove_policy,
+    search_fts,
+    update_session,
+    upsert_sessions,
+)
+
+
+@pytest.fixture
+def index_conn(tmp_path, monkeypatch):
+    """Open an index DB in a temp directory."""
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    conn = open_index()
+    yield conn
+    conn.close()
+
+
+def _make_session(session_id="sess-1", project="test-project", source="claude",
+                  model="claude-sonnet-4", content="Fix the login bug",
+                  start_time="2025-01-01T00:00:00+00:00",
+                  end_time="2025-01-01T00:10:00+00:00"):
+    return {
+        "session_id": session_id,
+        "project": project,
+        "source": source,
+        "model": model,
+        "start_time": start_time,
+        "end_time": end_time,
+        "git_branch": "main",
+        "messages": [
+            {"role": "user", "content": content, "tool_uses": []},
+            {"role": "assistant", "content": "I'll fix it.", "tool_uses": [
+                {"tool": "bash", "input": {"command": "pytest"}, "output": "1 passed", "status": "success"},
+            ]},
+        ],
+        "stats": {
+            "user_messages": 1,
+            "assistant_messages": 1,
+            "tool_uses": 1,
+            "input_tokens": 500,
+            "output_tokens": 100,
+        },
+    }
+
+
+class TestUpsertSessions:
+    def test_insert_new_session(self, index_conn):
+        sessions = [_make_session()]
+        new_count = upsert_sessions(index_conn, sessions)
+        assert new_count == 1
+
+    def test_insert_multiple_sessions(self, index_conn):
+        sessions = [
+            _make_session("s1", content="First task"),
+            _make_session("s2", content="Second task"),
+        ]
+        new_count = upsert_sessions(index_conn, sessions)
+        assert new_count == 2
+
+    def test_upsert_preserves_review_status(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        update_session(index_conn, "sess-1", status="approved")
+
+        # Re-index same session
+        upsert_sessions(index_conn, [_make_session()])
+
+        row = index_conn.execute(
+            "SELECT review_status FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["review_status"] == "approved"
+
+    def test_upsert_preserves_manual_review_metadata(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        update_session(
+            index_conn,
+            "sess-1",
+            status="approved",
+            notes="Keep this trace",
+            reason="useful debugging arc",
+        )
+        reviewed_before = index_conn.execute(
+            "SELECT reviewed_at FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()["reviewed_at"]
+
+        upsert_sessions(index_conn, [_make_session()])
+
+        row = index_conn.execute(
+            "SELECT review_status, reviewer_notes, selection_reason, reviewed_at "
+            "FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["review_status"] == "approved"
+        assert row["reviewer_notes"] == "Keep this trace"
+        assert row["selection_reason"] == "useful debugging arc"
+        assert row["reviewed_at"] == reviewed_before
+
+    def test_upsert_preserves_subagent_hierarchy_metadata(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("parent"), _make_session("child")])
+        index_conn.execute(
+            "UPDATE sessions SET subagent_session_ids = ? WHERE session_id = ?",
+            (json.dumps(["child"]), "parent"),
+        )
+        index_conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE session_id = ?",
+            ("parent", "child"),
+        )
+        index_conn.commit()
+
+        upsert_sessions(index_conn, [_make_session("parent"), _make_session("child")])
+
+        parent_row = index_conn.execute(
+            "SELECT subagent_session_ids FROM sessions WHERE session_id = 'parent'"
+        ).fetchone()
+        child_row = index_conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE session_id = 'child'"
+        ).fetchone()
+        assert json.loads(parent_row["subagent_session_ids"]) == ["child"]
+        assert child_row["parent_session_id"] == "parent"
+
+    def test_upsert_preserves_estimated_cost_for_completed_session(self, index_conn, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 12.34)
+        upsert_sessions(index_conn, [_make_session()])
+
+        monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 56.78)
+        upsert_sessions(index_conn, [_make_session()])
+
+        row = index_conn.execute(
+            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] == pytest.approx(12.34)
+
+    def test_upsert_recomputes_estimated_cost_for_ongoing_session(self, index_conn, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 1.23)
+        upsert_sessions(index_conn, [_make_session(end_time=None)])
+
+        monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 4.56)
+        upsert_sessions(index_conn, [_make_session(end_time=None)])
+
+        row = index_conn.execute(
+            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] == pytest.approx(4.56)
+
+    def test_skips_session_without_id(self, index_conn):
+        session = _make_session()
+        del session["session_id"]
+        assert upsert_sessions(index_conn, [session]) == 0
+
+    def test_empty_list(self, index_conn):
+        assert upsert_sessions(index_conn, []) == 0
+
+    def test_badges_computed(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        row = index_conn.execute(
+            "SELECT outcome_badge, task_type, display_title FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["display_title"] == "Fix the login bug"
+        assert row["outcome_badge"] is not None
+        assert row["task_type"] is not None
+
+    def test_provenance_fields_stored(self, index_conn):
+        session = _make_session()
+        session["raw_source_path"] = "/path/to/session.jsonl"
+        session["client_origin"] = "desktop"
+        session["runtime_channel"] = "local-agent"
+        session["outer_session_id"] = "local_abc123"
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT raw_source_path, client_origin, runtime_channel, outer_session_id "
+            "FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["raw_source_path"] == "/path/to/session.jsonl"
+        assert row["client_origin"] == "desktop"
+        assert row["runtime_channel"] == "local-agent"
+        assert row["outer_session_id"] == "local_abc123"
+
+    def test_provenance_columns_nullable(self, index_conn):
+        """Sessions without provenance fields should have NULL values."""
+        upsert_sessions(index_conn, [_make_session()])
+        row = index_conn.execute(
+            "SELECT raw_source_path, client_origin, runtime_channel, outer_session_id "
+            "FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["raw_source_path"] is None
+        assert row["client_origin"] is None
+        assert row["runtime_channel"] is None
+        assert row["outer_session_id"] is None
+
+    def test_link_subagent_hierarchy_skips_conflicting_existing_parent(self, index_conn):
+        parent_one = _make_session(
+            "parent-1",
+            project="proj",
+            start_time="2025-01-01T00:00:00+00:00",
+            end_time="2025-01-01T00:10:00+00:00",
+        )
+        parent_one["messages"].append({
+            "role": "assistant",
+            "tool": "Task",
+            "input": {"description": "delegate child work"},
+            "status": "success",
+        })
+        parent_two = _make_session(
+            "parent-2",
+            project="proj",
+            start_time="2025-01-01T00:00:00+00:00",
+            end_time="2025-01-01T00:10:00+00:00",
+        )
+        parent_two["messages"].append({
+            "role": "assistant",
+            "tool": "Task",
+            "input": {"description": "also delegate child work"},
+            "status": "success",
+        })
+        child = _make_session(
+            "child",
+            project="proj",
+            start_time="2025-01-01T00:05:00+00:00",
+            end_time="2025-01-01T00:06:00+00:00",
+        )
+
+        upsert_sessions(index_conn, [parent_one, parent_two, child])
+        index_conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE session_id = ?",
+            ("external-root-one", "parent-1"),
+        )
+        index_conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE session_id = ?",
+            ("parent-1", "child"),
+        )
+        index_conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE session_id = ?",
+            ("external-parent", "parent-2"),
+        )
+        index_conn.commit()
+
+        link_subagent_hierarchy(index_conn)
+
+        parent_one_row = index_conn.execute(
+            "SELECT subagent_session_ids FROM sessions WHERE session_id = 'parent-1'"
+        ).fetchone()
+        parent_two_row = index_conn.execute(
+            "SELECT subagent_session_ids FROM sessions WHERE session_id = 'parent-2'"
+        ).fetchone()
+        child_row = index_conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE session_id = 'child'"
+        ).fetchone()
+
+        assert json.loads(parent_one_row["subagent_session_ids"]) == ["child"]
+        assert parent_two_row["subagent_session_ids"] is None
+        assert child_row["parent_session_id"] == "parent-1"
+
+
+class TestQuerySessions:
+    def test_query_all(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("s1"), _make_session("s2")])
+        results = query_sessions(index_conn)
+        assert len(results) == 2
+
+    def test_filter_by_status(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("s1"), _make_session("s2")])
+        update_session(index_conn, "s1", status="approved")
+
+        results = query_sessions(index_conn, status="approved")
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
+
+    def test_filter_by_source(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("s1", source="claude"),
+            _make_session("s2", source="codex"),
+        ])
+        results = query_sessions(index_conn, source="codex")
+        assert len(results) == 1
+        assert results[0]["source"] == "codex"
+
+    def test_limit_and_offset(self, index_conn):
+        sessions = [_make_session(f"s{i}") for i in range(10)]
+        upsert_sessions(index_conn, sessions)
+
+        results = query_sessions(index_conn, limit=3, offset=0)
+        assert len(results) == 3
+
+        results2 = query_sessions(index_conn, limit=3, offset=3)
+        assert len(results2) == 3
+        assert results[0]["session_id"] != results2[0]["session_id"]
+
+
+class TestGetSessionDetail:
+    def test_returns_messages(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        detail = get_session_detail(index_conn, "sess-1")
+        assert detail is not None
+        assert len(detail["messages"]) == 2
+        assert detail["messages"][0]["role"] == "user"
+
+    def test_not_found(self, index_conn):
+        assert get_session_detail(index_conn, "nonexistent") is None
+
+
+class TestSearchFts:
+    def test_search_fts_matches_free_text_with_apostrophe(self, index_conn):
+        upsert_sessions(index_conn, [_make_session(content="I'd like to examine these options carefully")])
+
+        results = search_fts(index_conn, "I'd like to examine")
+
+        assert len(results) == 1
+        assert results[0]["session_id"] == "sess-1"
+
+    def test_search_fts_returns_empty_for_punctuation_only(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+
+        results = search_fts(index_conn, "!!! ??? '''")
+
+        assert results == []
+
+
+class TestUpdateSession:
+    def test_update_status(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        ok = update_session(index_conn, "sess-1", status="shortlisted")
+        assert ok is True
+
+        row = index_conn.execute(
+            "SELECT review_status, reviewed_at FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["review_status"] == "shortlisted"
+        assert row["reviewed_at"] is not None
+
+    def test_update_notes(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        update_session(index_conn, "sess-1", notes="Good trace", reason="strong debugging")
+
+        row = index_conn.execute(
+            "SELECT reviewer_notes, selection_reason FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["reviewer_notes"] == "Good trace"
+        assert row["selection_reason"] == "strong debugging"
+
+    def test_not_found(self, index_conn):
+        assert update_session(index_conn, "nope", status="blocked") is False
+
+
+class TestStats:
+    def test_stats(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("s1", source="claude"),
+            _make_session("s2", source="codex"),
+        ])
+        stats = get_stats(index_conn)
+        assert stats["total"] == 2
+        assert stats["by_source"]["claude"] == 1
+        assert stats["by_source"]["codex"] == 1
+        assert stats["by_status"]["new"] == 2
+
+    def test_stats_filters_by_date_range(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session(
+                "old",
+                start_time="2025-01-01T00:00:00+00:00",
+                end_time="2025-01-01T00:10:00+00:00",
+            ),
+            _make_session(
+                "new",
+                source="codex",
+                start_time="2025-01-10T00:00:00+00:00",
+                end_time="2025-01-10T00:10:00+00:00",
+            ),
+        ])
+
+        stats = get_stats(index_conn, start="2025-01-10", end="2025-01-10")
+
+        assert stats["total"] == 1
+        assert stats["by_source"] == {"codex": 1}
+        assert stats["by_status"] == {"new": 1}
+
+
+class TestDashboardAnalytics:
+    def test_filters_by_date_range(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session(
+                "old",
+                start_time="2025-01-01T00:00:00+00:00",
+                end_time="2025-01-01T00:10:00+00:00",
+            ),
+            _make_session(
+                "new",
+                source="codex",
+                start_time="2025-01-10T00:00:00+00:00",
+                end_time="2025-01-10T00:10:00+00:00",
+            ),
+        ])
+
+        analytics = get_dashboard_analytics(index_conn, start="2025-01-10", end="2025-01-10")
+
+        assert analytics["summary"]["total_sessions"] == 1
+        assert analytics["summary"]["unique_sources"] == 1
+        assert analytics["tokens_by_source"] == [
+            {"source": "codex", "input_tokens": 500, "output_tokens": 100},
+        ]
+
+
+class TestShares:
+    def test_create_and_get(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("s1"), _make_session("s2")])
+        share_id = create_share(index_conn, ["s1", "s2"], note="Test share")
+
+        share = get_share(index_conn, share_id)
+        assert share is not None
+        assert share["bundle_id"] == share_id
+        assert share["session_count"] == 2
+        assert share["submission_note"] == "Test share"
+        assert len(share["sessions"]) == 2
+
+    def test_list_shares(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        create_share(index_conn, ["sess-1"])
+        shares = get_shares(index_conn)
+        assert len(shares) == 1
+        assert shares[0]["bundle_id"] == shares[0]["share_id"]
+
+    def test_nonexistent_sessions(self, index_conn):
+        share_id = create_share(index_conn, ["nonexistent"])
+        share = get_share(index_conn, share_id)
+        assert share["session_count"] == 0
+
+    def test_share_history_and_share_ready_recommendations(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("s1", start_time="2025-01-01T00:00:00+00:00"),
+            _make_session("s2", start_time="2025-01-02T00:00:00+00:00"),
+            _make_session("s3", start_time="2025-01-03T00:00:00+00:00"),
+        ])
+        for sid in ("s1", "s2", "s3"):
+            update_session(index_conn, sid, status="approved")
+
+        shared_share_id = create_share(index_conn, ["s1"])
+        index_conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+            ("2025-01-04T00:00:00+00:00", shared_share_id),
+        )
+        newer_share_id = create_share(index_conn, ["s1", "s2"])
+        index_conn.commit()
+
+        shared_share = get_share(index_conn, shared_share_id)
+        assert [s["session_id"] for s in shared_share["sessions"]] == ["s1"]
+
+        newer_share = get_share(index_conn, newer_share_id)
+        assert [s["session_id"] for s in newer_share["sessions"]] == ["s1", "s2"]
+
+        stats = get_share_ready_stats(index_conn)
+        assert [s["session_id"] for s in stats["sessions"]] == ["s3", "s2"]
+        assert stats["recommended_session_ids"] == ["s3", "s2"]
+
+    def test_share_ready_respects_excluded_project_rules(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("private", project="claude:private-repo", start_time="2025-01-02T00:00:00+00:00"),
+            _make_session("public", project="claude:public-repo", start_time="2025-01-03T00:00:00+00:00"),
+        ])
+        update_session(index_conn, "private", status="approved")
+        update_session(index_conn, "public", status="approved")
+        add_policy(index_conn, "exclude_project", "private-repo")
+
+        settings = get_effective_share_settings(index_conn, {"excluded_projects": []})
+        stats = get_share_ready_stats(
+            index_conn,
+            excluded_projects=settings["excluded_projects"],
+        )
+
+        assert [s["session_id"] for s in stats["sessions"]] == ["public"]
+        assert stats["recommended_session_ids"] == ["public"]
+
+
+class TestPolicies:
+    def test_add_and_list(self, index_conn):
+        pid = add_policy(index_conn, "redact_string", "my-secret", reason="API key")
+        policies = get_policies(index_conn)
+        assert len(policies) == 1
+        assert policies[0]["policy_id"] == pid
+        assert policies[0]["value"] == "my-secret"
+
+    def test_remove(self, index_conn):
+        pid = add_policy(index_conn, "exclude_project", "private-repo")
+        assert remove_policy(index_conn, pid) is True
+        assert len(get_policies(index_conn)) == 0
+
+    def test_remove_nonexistent(self, index_conn):
+        assert remove_policy(index_conn, "nope") is False
+
+
+def _build_pre_migration_db() -> sqlite3.Connection:
+    """Create an in-memory DB matching the pre-rename schema (bundles + bundle_id)."""
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(
+        """CREATE TABLE bundles (
+            bundle_id       TEXT PRIMARY KEY,
+            created_at      TEXT NOT NULL,
+            session_count   INTEGER,
+            status          TEXT DEFAULT 'draft',
+            attestation     TEXT,
+            submission_note TEXT,
+            bundle_hash     TEXT,
+            manifest        TEXT,
+            shared_at       TEXT,
+            gcs_uri         TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE sessions (
+            session_id         TEXT PRIMARY KEY,
+            project            TEXT NOT NULL,
+            source             TEXT NOT NULL,
+            model              TEXT,
+            start_time         TEXT,
+            end_time           TEXT,
+            duration_seconds   INTEGER,
+            git_branch         TEXT,
+            user_messages      INTEGER DEFAULT 0,
+            assistant_messages INTEGER DEFAULT 0,
+            tool_uses          INTEGER DEFAULT 0,
+            input_tokens       INTEGER DEFAULT 0,
+            output_tokens      INTEGER DEFAULT 0,
+            display_title      TEXT,
+            outcome_badge      TEXT,
+            value_badges       TEXT,
+            risk_badges        TEXT,
+            sensitivity_score  REAL DEFAULT 0.0,
+            task_type          TEXT,
+            files_touched      TEXT,
+            commands_run       TEXT,
+            review_status      TEXT DEFAULT 'new',
+            selection_reason   TEXT,
+            reviewer_notes     TEXT,
+            reviewed_at        TEXT,
+            blob_path          TEXT,
+            raw_source_path    TEXT,
+            indexed_at         TEXT NOT NULL,
+            updated_at         TEXT,
+            bundle_id          TEXT REFERENCES bundles(bundle_id),
+            ai_quality_score   INTEGER,
+            ai_score_reason    TEXT,
+            ai_display_title   TEXT,
+            ai_summary         TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE bundle_sessions (
+            bundle_id    TEXT NOT NULL REFERENCES bundles(bundle_id),
+            session_id   TEXT NOT NULL REFERENCES sessions(session_id),
+            added_at     TEXT NOT NULL,
+            PRIMARY KEY (bundle_id, session_id)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX idx_bundle_sessions_session_id ON bundle_sessions(session_id)"
+    )
+    return conn
+
+
+class TestMigration:
+    def test_migrates_bundles_to_shares(self):
+        conn = _build_pre_migration_db()
+
+        # Seed a row in each table with proper FK references.
+        conn.execute(
+            "INSERT INTO bundles (bundle_id, created_at, session_count, status,"
+            " attestation, submission_note, bundle_hash, manifest, shared_at, gcs_uri)"
+            " VALUES ('bundle-1', '2025-01-01T00:00:00+00:00', 1, 'draft',"
+            " 'I attest', 'note', 'hash123', '{}', NULL, NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (session_id, project, source, indexed_at,"
+            " bundle_id, ai_summary)"
+            " VALUES ('sess-1', 'proj', 'claude', 'now', 'bundle-1', 'summary')"
+        )
+        conn.execute(
+            "INSERT INTO bundle_sessions (bundle_id, session_id, added_at)"
+            " VALUES ('bundle-1', 'sess-1', 'now')"
+        )
+
+        _migrate_bundles_to_shares(conn)
+
+        # shares has share_id, no bundle_id.
+        shares_cols = [r[1] for r in conn.execute("PRAGMA table_info(shares)").fetchall()]
+        assert "share_id" in shares_cols
+        assert "bundle_id" not in shares_cols
+
+        # share_sessions has share_id.
+        ss_cols = [r[1] for r in conn.execute("PRAGMA table_info(share_sessions)").fetchall()]
+        assert "share_id" in ss_cols
+        assert "bundle_id" not in ss_cols
+
+        # sessions has share_id, no bundle_id; other columns (ai_summary) preserved.
+        sess_cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        assert "share_id" in sess_cols
+        assert "bundle_id" not in sess_cols
+        assert "ai_summary" in sess_cols
+
+        # Data survived.
+        share_row = conn.execute("SELECT share_id FROM shares").fetchone()
+        assert share_row[0] == "bundle-1"
+        sess_row = conn.execute(
+            "SELECT session_id, share_id, ai_summary FROM sessions"
+        ).fetchone()
+        assert sess_row[0] == "sess-1"
+        assert sess_row[1] == "bundle-1"
+        assert sess_row[2] == "summary"
+        ss_row = conn.execute(
+            "SELECT share_id, session_id FROM share_sessions"
+        ).fetchone()
+        assert ss_row[0] == "bundle-1"
+        assert ss_row[1] == "sess-1"
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+        # No dangling FKs after migration.
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # create_share insert must work (this is what was broken pre-fix).
+        new_id = create_share(conn, ["sess-1"], attestation="ok", note="n")
+        assert new_id
+        row = conn.execute(
+            "SELECT share_id FROM shares WHERE share_id = ?", (new_id,)
+        ).fetchone()
+        assert row is not None
+
+        conn.close()
+
+    def test_migration_idempotent(self):
+        conn = _build_pre_migration_db()
+        conn.execute(
+            "INSERT INTO bundles (bundle_id, created_at, session_count, status)"
+            " VALUES ('bundle-1', '2025-01-01T00:00:00+00:00', 0, 'draft')"
+        )
+
+        _migrate_bundles_to_shares(conn)
+        first_shares_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='shares'"
+        ).fetchone()[0]
+        first_sessions_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='sessions'"
+        ).fetchone()[0]
+
+        # Second call — must be a no-op.
+        _migrate_bundles_to_shares(conn)
+
+        second_shares_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='shares'"
+        ).fetchone()[0]
+        second_sessions_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='sessions'"
+        ).fetchone()[0]
+        assert first_shares_sql == second_shares_sql
+        assert first_sessions_sql == second_sessions_sql
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+        conn.close()

@@ -1,0 +1,426 @@
+import { useState, useEffect, useCallback } from 'react';
+import type { AdvisorData, InsightsData, InsightsTrendRow, InsightsDurationVsScoreRow } from '../types.ts';
+import { api } from '../api.ts';
+import { Spinner } from '../components/Spinner.tsx';
+import { useToast } from '../components/Toast.tsx';
+import { colors } from '../theme.ts';
+
+function formatCost(c: number | null | undefined): string {
+  if (c == null || c === 0) return '$0';
+  if (c < 0.01) return `$${c.toFixed(4)}`;
+  return `$${c.toFixed(2)}`;
+}
+
+function localDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getDateRange(days: number): { start: string; end: string } {
+  const now = new Date();
+  const end = localDate(now);
+  const d = new Date(now);
+  d.setDate(d.getDate() - days);
+  return { start: localDate(d), end };
+}
+
+const PRIORITY_COLORS: Record<string, string> = {
+  high: colors.red400,
+  medium: colors.yellow400,
+  low: colors.blue400,
+};
+
+const PRIORITY_BG: Record<string, string> = {
+  high: '#fef2f2',
+  medium: '#fffbeb',
+  low: '#eff6ff',
+};
+
+/* ---------- SVG Trends Chart ---------- */
+
+const CHART_W = 760;
+const CHART_H = 160;
+const PAD = { top: 8, right: 50, bottom: 24, left: 36 };
+
+function TrendsChart({ trends }: { trends: InsightsTrendRow[] }) {
+  if (trends.length < 2) {
+    return <div style={{ fontSize: 13, color: colors.gray400, padding: '12px 0' }}>Not enough data for trends</div>;
+  }
+
+  const sorted = [...trends].sort((a, b) => a.day.localeCompare(b.day));
+  const maxSessions = Math.max(...sorted.map(t => t.sessions), 1);
+  const plotW = CHART_W - PAD.left - PAD.right;
+  const plotH = CHART_H - PAD.top - PAD.bottom;
+
+  const xStep = plotW / Math.max(sorted.length - 1, 1);
+
+  // Sessions area + line
+  const sessionPoints = sorted.map((t, i) => ({
+    x: PAD.left + i * xStep,
+    y: PAD.top + plotH - (t.sessions / maxSessions) * plotH,
+  }));
+  const sessionLine = sessionPoints.map(p => `${p.x},${p.y}`).join(' ');
+  const areaPath = `M${sessionPoints[0].x},${PAD.top + plotH} ` +
+    sessionPoints.map(p => `L${p.x},${p.y}`).join(' ') +
+    ` L${sessionPoints[sessionPoints.length - 1].x},${PAD.top + plotH} Z`;
+
+  // Resolve rate line (0-100% on right axis)
+  const rrPoints = sorted.map((t, i) => ({
+    x: PAD.left + i * xStep,
+    y: PAD.top + plotH - (t.resolve_rate ?? 0) * plotH,
+  }));
+  const rrLine = rrPoints.map(p => `${p.x},${p.y}`).join(' ');
+
+  // X-axis labels (show ~5 evenly spaced)
+  const labelStep = Math.max(1, Math.floor(sorted.length / 5));
+  const xLabels = sorted.filter((_, i) => i % labelStep === 0 || i === sorted.length - 1);
+
+  return (
+    <svg width={CHART_W} height={CHART_H} style={{ display: 'block' }}>
+      {/* Grid lines */}
+      {[0, 0.25, 0.5, 0.75, 1].map(frac => (
+        <line key={frac} x1={PAD.left} x2={CHART_W - PAD.right}
+          y1={PAD.top + plotH * (1 - frac)} y2={PAD.top + plotH * (1 - frac)}
+          stroke={colors.gray100} strokeWidth={1} />
+      ))}
+
+      {/* Sessions area fill */}
+      <path d={areaPath} fill={colors.primary200} opacity={0.35} />
+      {/* Sessions line */}
+      <polyline points={sessionLine} fill="none" stroke={colors.primary500} strokeWidth={2} />
+
+      {/* Resolve rate line */}
+      <polyline points={rrLine} fill="none" stroke={colors.green500} strokeWidth={2} strokeDasharray="4,3" />
+
+      {/* Left axis label */}
+      <text x={PAD.left - 4} y={PAD.top + 4} textAnchor="end" fontSize={10} fill={colors.gray400}>{maxSessions}</text>
+      <text x={PAD.left - 4} y={PAD.top + plotH} textAnchor="end" fontSize={10} fill={colors.gray400}>0</text>
+
+      {/* Right axis labels */}
+      <text x={CHART_W - PAD.right + 4} y={PAD.top + 4} textAnchor="start" fontSize={10} fill={colors.green500}>100%</text>
+      <text x={CHART_W - PAD.right + 4} y={PAD.top + plotH} textAnchor="start" fontSize={10} fill={colors.green500}>0%</text>
+
+      {/* X-axis labels */}
+      {xLabels.map(t => {
+        const i = sorted.indexOf(t);
+        const x = PAD.left + i * xStep;
+        const label = t.day.slice(5); // MM-DD
+        return <text key={t.day} x={x} y={CHART_H - 2} textAnchor="middle" fontSize={10} fill={colors.gray400}>{label}</text>;
+      })}
+
+      {/* Dots on hover area */}
+      {sessionPoints.map((p, i) => (
+        <circle key={i} cx={p.x} cy={p.y} r={3} fill={colors.primary500} opacity={0.7}>
+          <title>{sorted[i].day}: {sorted[i].sessions} sessions, {Math.round((sorted[i].resolve_rate ?? 0) * 100)}% resolved</title>
+        </circle>
+      ))}
+    </svg>
+  );
+}
+
+/* ---------- SVG Scatter Plot ---------- */
+
+const SCATTER_W = 760;
+const SCATTER_H = 200;
+const SPAD = { top: 16, right: 16, bottom: 28, left: 50 };
+
+const RESOLUTION_COLORS: Record<string, string> = {
+  resolved: colors.green500,
+  completed: colors.green500,
+  tests_passed: colors.green400,
+  partial: colors.yellow400,
+  failed: colors.red400,
+  abandoned: colors.red500,
+};
+
+function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
+  if (data.length < 3) {
+    return <div style={{ fontSize: 13, color: colors.gray400, padding: '12px 0' }}>Not enough scored sessions for scatter plot</div>;
+  }
+
+  const plotW = SCATTER_W - SPAD.left - SPAD.right;
+  const plotH = SCATTER_H - SPAD.top - SPAD.bottom;
+
+  // X axis: duration in minutes, capped at 95th percentile for legibility
+  const durations = data.map(d => (d.duration_seconds || 0) / 60).sort((a, b) => a - b);
+  const p95Idx = Math.floor(durations.length * 0.95);
+  const maxMinutes = Math.max(durations[p95Idx] || 60, 10);
+
+  // Y axis: quality score 1-5
+  const minScore = 1;
+  const maxScore = 5;
+
+  const dots = data.map(d => {
+    const mins = Math.min((d.duration_seconds || 0) / 60, maxMinutes);
+    const x = SPAD.left + (mins / maxMinutes) * plotW;
+    const y = SPAD.top + plotH - ((d.ai_quality_score - minScore) / (maxScore - minScore)) * plotH;
+    const color = RESOLUTION_COLORS[d.resolution ?? ''] ?? colors.gray400;
+    return { x, y, color, d };
+  });
+
+  return (
+    <svg width={SCATTER_W} height={SCATTER_H} style={{ display: 'block' }}>
+      {/* Grid */}
+      {[1, 2, 3, 4, 5].map(score => {
+        const y = SPAD.top + plotH - ((score - minScore) / (maxScore - minScore)) * plotH;
+        return (
+          <g key={score}>
+            <line x1={SPAD.left} x2={SCATTER_W - SPAD.right} y1={y} y2={y} stroke={colors.gray100} strokeWidth={1} />
+            <text x={SPAD.left - 6} y={y + 4} textAnchor="end" fontSize={10} fill={colors.gray400}>{score}</text>
+          </g>
+        );
+      })}
+
+      {/* X-axis ticks */}
+      {[0, 0.25, 0.5, 0.75, 1].map(frac => {
+        const x = SPAD.left + frac * plotW;
+        const mins = Math.round(frac * maxMinutes);
+        return <text key={frac} x={x} y={SCATTER_H - 4} textAnchor="middle" fontSize={10} fill={colors.gray400}>{mins}m</text>;
+      })}
+
+      {/* Dots */}
+      {dots.map((dot, i) => (
+        <circle key={i} cx={dot.x} cy={dot.y} r={4} fill={dot.color} opacity={0.6}>
+          <title>{Math.round(dot.d.duration_seconds / 60)}min, score {dot.d.ai_quality_score}, {dot.d.resolution ?? 'unknown'}{dot.d.cost ? `, ${formatCost(dot.d.cost)}` : ''}</title>
+        </circle>
+      ))}
+
+      {/* Axis labels */}
+      <text x={SPAD.left + plotW / 2} y={SCATTER_H - 14} textAnchor="middle" fontSize={10} fill={colors.gray500}>Duration (minutes)</text>
+      <text x={12} y={SPAD.top + plotH / 2} textAnchor="middle" fontSize={10} fill={colors.gray500} transform={`rotate(-90, 12, ${SPAD.top + plotH / 2})`}>Score</text>
+    </svg>
+  );
+}
+
+/* ---------- Section wrapper ---------- */
+
+function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
+  return (
+    <div style={{
+      background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 10,
+      padding: '14px 18px', marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+        <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: colors.gray800 }}>{title}</h3>
+        {subtitle && <span style={{ fontSize: 12, color: colors.gray400 }}>{subtitle}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/* ---------- Legend ---------- */
+
+function TrendsLegend() {
+  return (
+    <div style={{ display: 'flex', gap: 16, fontSize: 11, color: colors.gray500, marginTop: 4 }}>
+      <span><span style={{ display: 'inline-block', width: 12, height: 3, background: colors.primary500, marginRight: 4, verticalAlign: 'middle' }} />Sessions/day</span>
+      <span><span style={{ display: 'inline-block', width: 12, height: 3, background: colors.green500, borderTop: '1px dashed', marginRight: 4, verticalAlign: 'middle' }} />Resolve rate</span>
+    </div>
+  );
+}
+
+function ScatterLegend() {
+  const items = [
+    { label: 'Resolved', color: colors.green500 },
+    { label: 'Partial', color: colors.yellow400 },
+    { label: 'Failed', color: colors.red400 },
+    { label: 'Other', color: colors.gray400 },
+  ];
+  return (
+    <div style={{ display: 'flex', gap: 14, fontSize: 11, color: colors.gray500, marginTop: 4 }}>
+      {items.map(it => (
+        <span key={it.label}>
+          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: it.color, marginRight: 4, verticalAlign: 'middle' }} />
+          {it.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Main Component ---------- */
+
+export function Insights() {
+  const { toast } = useToast();
+  const [advisor, setAdvisor] = useState<AdvisorData | null>(null);
+  const [insights, setInsights] = useState<InsightsData | null>(null);
+  const [days, setDays] = useState(7);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { start, end } = getDateRange(days);
+      const [adv, ins] = await Promise.all([
+        api.advisor({ days }),
+        api.insights({ start, end }),
+      ]);
+      setAdvisor(adv);
+      setInsights(ins);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Failed to load insights', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [toast, days]);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (loading && !advisor) {
+    return (
+      <div style={{ padding: '16px 20px' }}>
+        <Spinner text="Analyzing usage patterns..." />
+      </div>
+    );
+  }
+
+  if (!advisor) return null;
+
+  const { headline, recommendations, summary_stats: stats } = advisor;
+
+  return (
+    <div style={{ padding: '16px 20px', maxWidth: 840 }}>
+      <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 14px', color: colors.gray900 }}>
+        Insights
+      </h1>
+
+      {/* Period selector */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+        {[[7, 'Week'], [14, '2 Weeks'], [30, 'Month']].map(([d, label]) => (
+          <button
+            key={d as number}
+            onClick={() => setDays(d as number)}
+            style={{
+              padding: '4px 12px', borderRadius: 6,
+              border: `1px solid ${days === d ? colors.primary500 : colors.gray200}`,
+              background: days === d ? colors.primary500 : colors.white,
+              color: days === d ? colors.white : colors.gray700,
+              fontSize: 13, cursor: 'pointer', fontWeight: days === d ? 600 : 400,
+            }}
+          >{label as string}</button>
+        ))}
+        <button
+          onClick={load}
+          disabled={loading}
+          style={{
+            marginLeft: 'auto', padding: '4px 12px', borderRadius: 6,
+            border: `1px solid ${colors.gray200}`, background: colors.white,
+            color: colors.gray700, fontSize: 13, cursor: 'pointer',
+          }}
+        >{loading ? 'Analyzing...' : 'Refresh'}</button>
+      </div>
+
+      {/* Headline card */}
+      <div style={{
+        background: colors.gray800, color: colors.gray50, borderRadius: 10,
+        padding: '18px 22px', marginBottom: 16,
+      }}>
+        <div style={{ fontSize: 15, lineHeight: 1.6 }}>{headline}</div>
+        {stats.potential_savings_usd > 0 && (
+          <div style={{ marginTop: 8, fontSize: 13, color: colors.primary200 }}>
+            Est. potential savings: {formatCost(stats.potential_savings_usd)}/period
+          </div>
+        )}
+      </div>
+
+      {/* Summary stats */}
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+        {[
+          { label: 'API Equivalent', value: formatCost(stats.total_cost_usd) },
+          { label: 'Sessions', value: String(stats.total_sessions) },
+          { label: 'API Cost/Session', value: formatCost(stats.cost_per_session) },
+        ].map(s => (
+          <div key={s.label} style={{
+            flex: 1, minWidth: 100, background: colors.white,
+            border: `1px solid ${colors.gray200}`, borderRadius: 8,
+            padding: '12px 14px',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: colors.gray900 }}>{s.value}</div>
+            <div style={{ fontSize: 12, color: colors.gray500, marginTop: 2 }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Model info */}
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+        {stats.most_efficient_model && (
+          <div style={{
+            flex: 1, background: colors.green50, border: `1px solid ${colors.green200}`, borderRadius: 8,
+            padding: '10px 14px',
+          }}>
+            <div style={{ fontSize: 12, color: colors.green700, fontWeight: 600 }}>Most Efficient</div>
+            <div style={{ fontSize: 14, color: colors.green500, marginTop: 2 }}>{stats.most_efficient_model}</div>
+          </div>
+        )}
+        {stats.highest_quality_model && (
+          <div style={{
+            flex: 1, background: colors.blue50, border: `1px solid ${colors.blue100}`, borderRadius: 8,
+            padding: '10px 14px',
+          }}>
+            <div style={{ fontSize: 12, color: colors.blue700, fontWeight: 600 }}>Highest Quality</div>
+            <div style={{ fontSize: 14, color: colors.blue600, marginTop: 2 }}>{stats.highest_quality_model}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Trends chart */}
+      {insights && insights.trends.length >= 2 && (
+        <Section title="Trends" subtitle="Sessions per day and resolve rate over time">
+          <TrendsChart trends={insights.trends} />
+          <TrendsLegend />
+        </Section>
+      )}
+
+      {/* Duration vs Quality scatter */}
+      {insights && insights.duration_vs_score && insights.duration_vs_score.length >= 3 && (
+        <Section title="Duration vs Quality" subtitle="Longer sessions aren't always better">
+          <ScatterPlot data={insights.duration_vs_score} />
+          <ScatterLegend />
+        </Section>
+      )}
+
+      {/* Recommendations */}
+      <h2 style={{ fontSize: 14, fontWeight: 700, color: colors.gray700, margin: '0 0 10px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        Recommendations
+      </h2>
+      {recommendations.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {recommendations.map((rec, i) => (
+            <div key={i} style={{
+              border: `1px solid ${colors.gray200}`,
+              borderLeft: `4px solid ${PRIORITY_COLORS[rec.priority] || colors.gray400}`,
+              borderRadius: 8, padding: '12px 16px',
+              background: PRIORITY_BG[rec.priority] || colors.white,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+                  color: PRIORITY_COLORS[rec.priority] || colors.gray500,
+                }}>{rec.priority}</span>
+                <span style={{ fontSize: 14, fontWeight: 600, color: colors.gray800 }}>{rec.title}</span>
+              </div>
+              <div style={{ fontSize: 13, color: colors.gray600, lineHeight: 1.5 }}>{rec.detail}</div>
+              {rec.estimated_savings_usd != null && rec.estimated_savings_usd > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, color: colors.green500 }}>
+                  Est. savings: {formatCost(rec.estimated_savings_usd)}/period
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{
+          border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: '20px',
+          textAlign: 'center', color: colors.gray400, fontSize: 13,
+        }}>
+          No specific optimization suggestions for this period. Your usage looks efficient.
+        </div>
+      )}
+
+      {/* Footer */}
+      <div style={{ marginTop: 16, fontSize: 11, color: colors.gray400, textAlign: 'right' }}>
+        Generated {advisor.generated_at ? new Date(advisor.generated_at).toLocaleString() : '--'}
+      </div>
+    </div>
+  );
+}

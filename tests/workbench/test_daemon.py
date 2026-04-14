@@ -1,0 +1,786 @@
+"""Tests for the workbench daemon HTTP API."""
+
+import json
+import time
+import urllib.error
+import zipfile
+from http.client import HTTPConnection
+from io import BytesIO
+from threading import Thread
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+from clawjournal.workbench.daemon import Scanner, WorkbenchHandler, run_server, _SHARE_COOLDOWN_SECONDS
+from clawjournal.workbench.index import open_index, upsert_sessions
+
+
+@pytest.fixture
+def index_setup(tmp_path, monkeypatch):
+    """Set up an index DB in a temp directory and seed it."""
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+    monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+    monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", tmp_path / "nonexistent_dist")
+    monkeypatch.setattr("clawjournal.workbench.daemon._SHARE_INGEST_URL", "https://test-ingest.example.com")
+    monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+    # Mock PII review in share tests — no AI backend available in test env
+    monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", lambda session, **kw: ([], "full") if kw.get("return_coverage") else [])
+
+    conn = open_index()
+    sessions = [
+        {
+            "session_id": f"sess-{i}",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": f"2025-01-0{i+1}T00:00:00+00:00",
+            "end_time": f"2025-01-0{i+1}T00:10:00+00:00",
+            "messages": [
+                {"role": "user", "content": f"Task {i}: fix the bug", "tool_uses": []},
+                {"role": "assistant", "content": "Done.", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1, "assistant_messages": 1,
+                "tool_uses": 0, "input_tokens": 100, "output_tokens": 50,
+            },
+        }
+        for i in range(3)
+    ]
+    upsert_sessions(conn, sessions)
+    conn.close()
+    return tmp_path
+
+
+@pytest.fixture
+def server(index_setup):
+    """Start a test HTTP server."""
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+    port = srv.server_address[1]
+    thread = Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    srv.shutdown()
+
+
+def _get(port, path):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read().decode()
+    return resp.status, json.loads(body) if resp.getheader("Content-Type", "").startswith("application/json") else body
+
+
+def _get_raw(port, path):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    return resp.status, resp.getheader("Content-Type", ""), resp.read()
+
+
+def _post(port, path, data=None):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(data or {}).encode()
+    conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp_body = resp.read().decode()
+    return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+class TestSessionsAPI:
+    def test_list_sessions(self, server):
+        status, data = _get(server, "/api/sessions")
+        assert status == 200
+        assert len(data) == 3
+
+    def test_list_sessions_with_limit(self, server):
+        status, data = _get(server, "/api/sessions?limit=2")
+        assert status == 200
+        assert len(data) == 2
+
+    def test_get_session_detail(self, server):
+        status, data = _get(server, "/api/sessions/sess-0")
+        assert status == 200
+        assert data["session_id"] == "sess-0"
+        assert "messages" in data
+
+    def test_get_session_not_found(self, server):
+        status, data = _get(server, "/api/sessions/nonexistent")
+        assert status == 404
+
+    def test_redaction_report_applies_policy_rules(self, server, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "policy-sess",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "MySecretName and PartnerDev use api.foo.internal", "tool_uses": []},
+                {"role": "assistant", "content": "PartnerDev confirmed api.foo.internal is live.", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 1,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+        }])
+        conn.close()
+
+        assert _post(server, "/api/policies", {
+            "policy_type": "redact_string",
+            "value": "MySecretName",
+        })[0] == 201
+        assert _post(server, "/api/policies", {
+            "policy_type": "redact_username",
+            "value": "PartnerDev",
+        })[0] == 201
+        assert _post(server, "/api/policies", {
+            "policy_type": "block_domain",
+            "value": "*.internal",
+        })[0] == 201
+
+        status, data = _get(server, "/api/sessions/policy-sess/redaction-report")
+        assert status == 200
+        redacted = json.dumps(data["redacted_session"])
+        assert "MySecretName" not in redacted
+        assert "PartnerDev" not in redacted
+        assert "foo.internal" not in redacted
+        assert any(entry["type"] == "blocked_domain" for entry in data["redaction_log"])
+
+    def test_update_session_status(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"status": "approved"})
+        assert status == 200
+        assert data["ok"] is True
+
+        # Verify it persisted
+        status, detail = _get(server, "/api/sessions/sess-0")
+        assert detail["review_status"] == "approved"
+
+    def test_score_session_endpoint_updates_session(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session",
+            lambda conn, session_id, model=None, backend="auto": SimpleNamespace(
+                quality=4,
+                reason="Solid debugging session",
+                detail_json='{"substance": 4}',
+                task_type="debugging",
+                outcome_label="completed",
+                value_labels=["tool_rich"],
+                risk_level=[],
+                display_title="Scored title",
+                effort_estimate=2.0,
+                summary="Good progress",
+            ),
+        )
+
+        status, data = _post(server, "/api/sessions/sess-0/score", {"backend": "auto"})
+        assert status == 200
+        assert data["ok"] is True
+        assert data["ai_quality_score"] == 4
+
+        status, detail = _get(server, "/api/sessions/sess-0")
+        assert status == 200
+        assert detail["ai_quality_score"] == 4
+        assert detail["ai_summary"] == "Good progress"
+
+    def test_score_session_endpoint_rejects_missing_transcript_blob(self, server, index_setup):
+        (index_setup / "blobs" / "sess-0.json").unlink()
+
+        status, data = _post(server, "/api/sessions/sess-0/score")
+        assert status == 503
+        assert "Re-run `clawjournal scan`" in data["error"]
+
+
+class TestStatsAPI:
+    def test_stats(self, server):
+        status, data = _get(server, "/api/stats")
+        assert status == 200
+        assert data["total"] == 3
+        assert "by_status" in data
+        assert "by_source" in data
+
+
+class TestScanner:
+    def test_scan_once_links_subagent_hierarchy(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        seen = {}
+
+        def fake_discover_projects(source_filter=None):
+            seen["source_filter"] = source_filter
+            return []
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.discover_projects", fake_discover_projects)
+
+        called = {}
+
+        def fake_link(conn):
+            called["linked"] = True
+            return 3
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.link_subagent_hierarchy", fake_link)
+
+        scanner = Scanner(source_filter="cursor")
+        results = scanner.scan_once()
+
+        assert results == {}
+        assert seen["source_filter"] == "cursor"
+        assert called["linked"] is True
+        assert scanner.last_linked_count == 3
+
+    def test_score_unscored_once_uses_default_agent_scoring(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "sess-1",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": "2025-01-01T00:00:00+00:00",
+            "end_time": "2025-01-01T00:10:00+00:00",
+            "messages": [
+                {"role": "user", "content": "Fix it", "tool_uses": []},
+                {"role": "assistant", "content": "Done", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1, "assistant_messages": 1,
+                "tool_uses": 0, "input_tokens": 100, "output_tokens": 50,
+            },
+        }])
+        conn.close()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session",
+            lambda conn, session_id, model=None, backend="auto": SimpleNamespace(
+                quality=5,
+                reason="Strong trace",
+                detail_json='{"substance": 5}',
+                task_type="debugging",
+                outcome_label="resolved",
+                value_labels=["tool_rich"],
+                risk_level=[],
+                display_title="Great trace",
+                effort_estimate=0.8,
+                summary="Useful fix",
+            ),
+        )
+
+        scanner = Scanner(source_filter="claude")
+        scored = scanner.score_unscored_once(limit=5)
+        assert scored == 1
+
+        conn = open_index()
+        row = conn.execute(
+            "SELECT ai_quality_score, ai_score_reason, ai_summary FROM sessions WHERE session_id = ?",
+            ("sess-1",),
+        ).fetchone()
+        conn.close()
+        assert row["ai_quality_score"] == 5
+        assert row["ai_score_reason"] == "Strong trace"
+        assert row["ai_summary"] == "Useful fix"
+
+
+class TestProjectsAPI:
+    def test_projects(self, server):
+        status, data = _get(server, "/api/projects")
+        assert status == 200
+        assert len(data) >= 1
+        assert data[0]["project"] == "test-project"
+
+
+class TestSharesAPI:
+    def test_create_and_list(self, server):
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0", "sess-1"],
+            "note": "Test share",
+        })
+        assert status == 201
+        assert "share_id" in data
+        assert data["bundle_id"] == data["share_id"]
+
+        status, shares = _get(server, "/api/shares")
+        assert status == 200
+        assert len(shares) == 1
+        assert shares[0]["bundle_id"] == shares[0]["share_id"]
+
+    def test_legacy_bundle_routes_remain_available(self, server):
+        status, created = _post(server, "/api/bundles", {
+            "session_ids": ["sess-0"],
+            "note": "Legacy bundle route",
+        })
+        assert status == 201
+        assert created["bundle_id"] == created["share_id"]
+
+        share_id = created["share_id"]
+        status, bundles = _get(server, "/api/bundles")
+        assert status == 200
+        assert bundles[0]["bundle_id"] == share_id
+
+        status, detail = _get(server, f"/api/bundles/{share_id}")
+        assert status == 200
+        assert detail["bundle_id"] == share_id
+
+    def test_create_empty_fails(self, server):
+        status, data = _post(server, "/api/shares", {"session_ids": []})
+        assert status == 400
+
+
+class TestPoliciesAPI:
+    def test_add_and_list(self, server):
+        status, data = _post(server, "/api/policies", {
+            "policy_type": "redact_string",
+            "value": "my-secret",
+            "reason": "API key",
+        })
+        assert status == 201
+
+        status, policies = _get(server, "/api/policies")
+        assert status == 200
+        assert len(policies) == 1
+
+    def test_add_missing_fields(self, server):
+        status, data = _post(server, "/api/policies", {"policy_type": "redact_string"})
+        assert status == 400
+
+
+class TestStaticServing:
+    def test_placeholder_when_no_frontend(self, server):
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        assert "ClawJournal Workbench" in body
+
+    def test_serves_built_frontend_and_spa_fallback(self, server, index_setup, monkeypatch):
+        dist = index_setup / "frontend_dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<!DOCTYPE html><title>Built UI</title>", encoding="utf-8")
+        (dist / "app.js").write_text("console.log('ok');", encoding="utf-8")
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        assert "Built UI" in body
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/session/sess-0")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        assert "Built UI" in body
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/traces/session/sess-0")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        assert "Built UI" in body
+
+
+class TestRunServerPortFallback:
+    def test_fallback_to_free_port_on_oserror(self, index_setup):
+        """If the default port is busy, run_server falls back to port 0 and opens the browser."""
+        from http.server import ThreadingHTTPServer
+
+        real_server = MagicMock()
+        real_server.server_address = ("127.0.0.1", 9999)
+        real_server.serve_forever.side_effect = KeyboardInterrupt
+
+        call_count = 0
+
+        def fake_init(addr, handler):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise OSError("Address already in use")
+            return real_server
+
+        with patch("clawjournal.workbench.daemon.ThreadingHTTPServer", side_effect=fake_init), \
+             patch("clawjournal.workbench.daemon.Scanner"), \
+             patch("webbrowser.open") as mock_open:
+            run_server(port=8384, open_browser=True)
+
+        mock_open.assert_called_once_with("http://localhost:9999/")
+
+
+def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert=None):
+    """Create a mock urlopen that handles /upload calls."""
+    upload_resp = upload_response or {"ok": True}
+
+    def mock_urlopen(req, **kwargs):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "/upload" in url:
+            if upload_assert is not None:
+                upload_assert(req)
+            if upload_error:
+                raise upload_error
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(upload_resp).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+        raise ValueError(f"Unexpected URL: {url}")
+
+    return mock_urlopen
+
+
+def _share_config(**overrides):
+    """Return a standard mock config for share tests with valid (non-expired) upload token."""
+    config = {
+        "verified_email": "test@university.edu",
+        "verified_email_token": "test-upload-token",
+        "verified_email_token_expires_at": int(time.time()) + 3600,
+    }
+    config.update(overrides)
+    return config
+
+
+class TestVerifyEmailAPI:
+    def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
+        from clawjournal.workbench.daemon import confirm_email_verification
+
+        saved = {}
+
+        monkeypatch.setattr("clawjournal.workbench.daemon._SHARE_INGEST_URL", "https://test-ingest.example.com")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        def mock_urlopen(req, **kwargs):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({
+                "verified": True,
+                "upload_token": "upload-token-123",
+                "upload_token_expires_at": 1700000000,
+            }).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = confirm_email_verification("Test@University.edu", "123456")
+
+        assert result["verified"] is True
+        assert saved["verified_email"] == "test@university.edu"
+        assert saved["verified_email_token"] == "upload-token-123"
+        assert saved["verified_email_token_expires_at"] == 1700000000
+
+
+class TestShareAPI:
+    """Tests for the share-to-GCS HTTP upload flow."""
+
+    def _create_and_export_share(self, port):
+        """Helper: create a share and export it, return share_id."""
+        status, data = _post(port, "/api/shares", {
+            "session_ids": ["sess-0", "sess-1"],
+            "note": "Share test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, data = _post(port, f"/api/shares/{share_id}/export")
+        assert status == 200
+        assert data["ok"] is True
+        return share_id
+
+    def test_share_success(self, server, monkeypatch):
+        """Full success path: create, export, share via HTTP."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 200
+        assert data["ok"] is True
+        assert "gcs_uri" not in data
+        assert "shared_at" in data
+        assert data["bundle_hash"]
+        assert "redaction_summary" in data
+        assert isinstance(data["redaction_summary"]["total_redactions"], int)
+        assert isinstance(data["redaction_summary"]["by_type"], dict)
+
+    def test_share_success_clears_cached_upload_token(self, server, monkeypatch):
+        """Successful upload should clear the cached single-use token."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        config = _share_config()
+        saved = {}
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: config)
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: saved.update(updated))
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 200
+        assert data["ok"] is True
+        assert "verified_email_token" not in saved
+        assert "verified_email_token_expires_at" not in saved
+
+    def test_share_rate_limiting(self, server, monkeypatch):
+        """Two shares within cooldown → second gets 429."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 200
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 429
+        assert "Rate limited" in data["error"]
+
+    def test_share_duplicate_prevention(self, server, monkeypatch):
+        """Already-shared bundle → 409 (unless force=true)."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        mock_urlopen = _mock_urlopen_factory()
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            status, _ = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 200
+
+        WorkbenchHandler._last_share_time = 0.0
+        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 409
+        assert "already uploaded" in data["error"]
+
+        WorkbenchHandler._last_share_time = 0.0
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", {"force": True})
+        assert status == 200
+        assert data["ok"] is True
+
+    def test_share_http_error(self, server, monkeypatch):
+        """HTTP error from ingest → daemon returns 502."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        error_resp = BytesIO(json.dumps({"error": "Internal server error"}).encode())
+        http_error = urllib.error.HTTPError(
+            url="http://test/upload", code=500, msg="Internal Server Error",
+            hdrs={}, fp=error_resp,  # type: ignore[arg-type]
+        )
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 502
+        assert "error" in data
+
+    def test_share_cf_409_treated_as_success(self, server, monkeypatch):
+        """Cloud Function 409 (already in GCS) → daemon treats as success."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        error_resp = BytesIO(json.dumps({"error": "Share already uploaded"}).encode())
+        http_error = urllib.error.HTTPError(
+            url="http://test/upload", code=409, msg="Conflict",
+            hdrs={}, fp=error_resp,  # type: ignore[arg-type]
+        )
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 200
+        assert data["ok"] is True
+        assert "gcs_uri" not in data
+        assert data["shared_at"]
+
+    def test_share_network_failure(self, server, monkeypatch):
+        """Network failure → daemon returns 502 with friendly message."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=urllib.error.URLError("Connection refused"))):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 502
+        assert "Could not reach upload service" in data["error"]
+
+    def test_share_verification_error_passthrough(self, server, monkeypatch):
+        """Verification failures from the ingest service should remain 403."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        error_resp = BytesIO(json.dumps({"error": "Invalid or expired upload token"}).encode())
+        http_error = urllib.error.HTTPError(
+            url="http://test/upload", code=403, msg="Forbidden",
+            hdrs={}, fp=error_resp,  # type: ignore[arg-type]
+        )
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 403
+        assert data["error"] == "Invalid or expired upload token"
+
+    def test_share_verification_error_clears_cached_upload_token(self, server, monkeypatch):
+        """Invalid token responses should clear the cached token locally."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        config = _share_config()
+        saved = {}
+
+        error_resp = BytesIO(json.dumps({"error": "Invalid or expired upload token"}).encode())
+        http_error = urllib.error.HTTPError(
+            url="http://test/upload", code=403, msg="Forbidden",
+            hdrs={}, fp=error_resp,  # type: ignore[arg-type]
+        )
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: config)
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: saved.update(updated))
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 403
+        assert data["error"] == "Invalid or expired upload token"
+        assert "verified_email_token" not in saved
+        assert "verified_email_token_expires_at" not in saved
+
+    def test_share_requires_verified_email_token(self, server, monkeypatch):
+        """Config has email but no token → 403."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {
+            "verified_email": "test@university.edu",
+        })
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 403
+        assert "needs to be refreshed" in data["error"]
+
+    def test_share_fails_with_expired_token(self, server, monkeypatch):
+        """Expired upload token → 403 with re-verification message."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config(
+            verified_email_token_expires_at=int(time.time()) - 100,
+        ))
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        assert status == 403
+        assert "expired" in data["error"].lower()
+
+    def test_share_upload_sends_only_upload_token(self, server, monkeypatch):
+        """Upload form should contain upload_token but NOT verified_email or device_id."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        def assert_upload_fields(req):
+            body = req.data.decode("utf-8", errors="replace")
+            assert 'name="upload_token"' in body
+            assert "test-upload-token" in body
+            # These must NOT be sent as form fields
+            assert 'name="verified_email"' not in body
+            assert 'name="device_id"' not in body
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_assert=assert_upload_fields),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 200
+        assert data["ok"] is True
+
+    def test_download_preserves_shared_status(self, server):
+        """Downloading an already-shared archive must not downgrade it to exported."""
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0", "sess-1"],
+            "note": "Status preservation test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        conn = open_index()
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+            ("2025-01-05T00:00:00+00:00", share_id),
+        )
+        conn.commit()
+        conn.close()
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+        assert body
+
+        conn = open_index()
+        row = conn.execute(
+            "SELECT status FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "shared"
+
+    def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"redact_strings": ["MySecretName"]},
+        )
+
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "download-redact",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "MySecretName appears in this trace", "tool_uses": []},
+                {"role": "assistant", "content": "Acknowledged, MySecretName.", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 1,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+        }])
+        conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["download-redact"],
+            "note": "Download redaction test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+
+        assert "MySecretName" not in sessions_content

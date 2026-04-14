@@ -1,0 +1,9 @@
+{
+  "name": "clawjournal",
+  "version": "0.1.12",
+  "description": "Review, curate, and share coding agent conversation traces. Bundles skills for setup, triage, and AI-assisted scoring.",
+  "author": {
+    "name": "kaiaiagent",
+    "url": "https://github.com/kaiaiagent"
+  }
+}

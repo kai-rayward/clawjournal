@@ -1,0 +1,230 @@
+import type {
+  Session,
+  SessionDetail,
+  Share,
+  SharePreview,
+  Policy,
+  Stats,
+  ProjectSummary,
+  DashboardData,
+  RedactionReport,
+  AllowlistEntry,
+  InsightsData,
+  AdvisorData,
+} from './types.ts';
+
+const BASE = '/api';
+
+class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, init);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+function qs(params: Record<string, string | number | null | undefined>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v != null && v !== '') p.set(k, String(v));
+  }
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
+
+export const api = {
+  sessions: {
+    list(params: {
+      status?: string | null;
+      source?: string | null;
+      project?: string | null;
+      task_type?: string | null;
+      q?: string | null;
+      sort?: string;
+      order?: string;
+      limit?: number;
+      offset?: number;
+    } = {}): Promise<Session[]> {
+      return request(`/sessions${qs(params)}`);
+    },
+
+    get(id: string): Promise<SessionDetail> {
+      return request(`/sessions/${encodeURIComponent(id)}`);
+    },
+
+    redacted(id: string): Promise<SessionDetail> {
+      return request(`/sessions/${encodeURIComponent(id)}/redacted`);
+    },
+
+    redactionReport(id: string, opts?: { aiPii?: boolean }): Promise<RedactionReport> {
+      const q = opts?.aiPii ? '?ai_pii=1' : '';
+      return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
+    },
+
+    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string }): Promise<{ ok: boolean }> {
+      return request(`/sessions/${encodeURIComponent(id)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+
+    score(id: string, body?: { backend?: string; model?: string }): Promise<{
+      ok: boolean;
+      ai_quality_score?: number;
+      reason?: string;
+      task_type?: string;
+      outcome?: string;
+      summary?: string;
+    }> {
+      return request(`/sessions/${encodeURIComponent(id)}/score`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body ?? {}),
+      });
+    },
+  },
+
+  search(q: string, limit = 50, offset = 0): Promise<Session[]> {
+    return request(`/search${qs({ q, limit, offset })}`);
+  },
+
+  stats(params: { start?: string; end?: string } = {}): Promise<Stats> {
+    return request(`/stats${qs(params)}`);
+  },
+
+  dashboard(params: { start?: string; end?: string } = {}): Promise<DashboardData> {
+    return request(`/dashboard${qs(params)}`);
+  },
+
+  projects(): Promise<ProjectSummary[]> {
+    return request('/projects');
+  },
+
+  shareReady(): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null }> }> {
+    return request('/share-ready');
+  },
+
+  quickShare(sessionIds: string[], note?: string): Promise<{
+    ok: boolean; share_id: string;
+    shared_at: string; session_count: number; bundle_hash: string;
+    redaction_summary: { total_redactions: number; by_type: Record<string, number> };
+  }> {
+    return request('/quick-share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_ids: sessionIds, note }),
+    });
+  },
+
+  scoringBackend(): Promise<{ backend: string | null; display_name: string | null }> {
+    return request('/scoring/backend');
+  },
+
+  shares: {
+    list(): Promise<Share[]> {
+      return request('/shares');
+    },
+
+    get(id: string): Promise<Share> {
+      return request(`/shares/${encodeURIComponent(id)}`);
+    },
+
+    create(sessionIds: string[], note?: string, attestation?: string): Promise<{ share_id: string }> {
+      return request('/shares', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: sessionIds, note, attestation }),
+      });
+    },
+
+    export(id: string, outputPath?: string): Promise<{ ok: boolean; export_path: string; session_count: number }> {
+      return request(`/shares/${encodeURIComponent(id)}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ output_path: outputPath }),
+      });
+    },
+
+    preview(id: string): Promise<SharePreview> {
+      return request(`/shares/${encodeURIComponent(id)}/preview`);
+    },
+
+    downloadUrl(id: string): string {
+      return `${BASE}/shares/${encodeURIComponent(id)}/download`;
+    },
+
+    download(id: string): void {
+      window.open(`${BASE}/shares/${encodeURIComponent(id)}/download`, '_blank');
+    },
+
+    upload(id: string, force?: boolean): Promise<{
+      ok: boolean; shared_at: string;
+      session_count: number; bundle_hash: string;
+      redaction_summary: { total_redactions: number; by_type: Record<string, number> };
+    }> {
+      return request(`/shares/${encodeURIComponent(id)}/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(force ? { force: true } : {}),
+      });
+    },
+  },
+
+  policies: {
+    list(): Promise<Policy[]> {
+      return request('/policies');
+    },
+
+    add(policyType: string, value: string, reason?: string): Promise<{ policy_id: string }> {
+      return request('/policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policy_type: policyType, value, reason }),
+      });
+    },
+
+    remove(id: string): Promise<{ ok: boolean }> {
+      return request(`/policies/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    },
+  },
+
+  allowlist: {
+    list(): Promise<AllowlistEntry[]> {
+      return request('/allowlist');
+    },
+
+    add(entry: { type: string; text?: string; regex?: string; match_type?: string; reason?: string }): Promise<{ ok: boolean; entry: AllowlistEntry }> {
+      return request('/allowlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(entry),
+      });
+    },
+
+    remove(id: string): Promise<{ ok: boolean }> {
+      return request(`/allowlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    },
+  },
+
+  insights(params: { start?: string; end?: string } = {}): Promise<InsightsData> {
+    return request(`/insights${qs(params)}`);
+  },
+
+  advisor(params: { days?: number } = {}): Promise<AdvisorData> {
+    return request(`/advisor${qs(params)}`);
+  },
+
+  scan(): Promise<{ ok: boolean; new_sessions: Record<string, number> }> {
+    return request('/scan', { method: 'POST' });
+  },
+};
