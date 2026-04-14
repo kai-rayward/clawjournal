@@ -42,8 +42,9 @@ function shortModel(model: string): string {
   return raw;
 }
 
-function BarRow({ label, value, max, total, color = colors.blue400, fmt }: {
+function BarRow({ label, title, value, max, total, color = colors.blue400, fmt }: {
   label: string;
+  title?: string;
   value: number;
   max: number;
   total?: number;
@@ -55,7 +56,7 @@ function BarRow({ label, value, max, total, color = colors.blue400, fmt }: {
   const display = fmt ? fmt(value) : formatNumber(value);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0' }}>
-      <div style={{ width: 180, fontSize: 13, color: colors.gray700, flexShrink: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={label}>
+      <div style={{ width: 180, fontSize: 13, color: colors.gray700, flexShrink: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={title ?? label}>
         {label}
       </div>
       <div style={{ flex: 1, background: colors.gray100, borderRadius: 3, height: 14 }}>
@@ -104,6 +105,23 @@ interface TriageStats {
 
 const SCORE_COLORS = ['', colors.red400, colors.yellow400, colors.gray400, colors.blue400, colors.green400];
 const SCORE_LABELS = ['', 'Noise', 'Minimal', 'Light', 'Solid', 'Major'];
+
+// Keep as many trailing dash-segments as fit in the label column; full id stays in the hover title.
+// Path separators and dashes-inside-folder-names look identical here, so we err on the side of
+// showing more context rather than collapsing to a generic leaf like "page" or "pipeline".
+const PROJECT_LABEL_BUDGET = 22;
+function displayProject(project: string): string {
+  const afterSource = project.includes(':') ? project.slice(project.indexOf(':') + 1) : project;
+  if (afterSource.length <= PROJECT_LABEL_BUDGET) return afterSource;
+  const segments = afterSource.split('-');
+  let acc = segments[segments.length - 1];
+  for (let i = segments.length - 2; i >= 0; i--) {
+    const next = segments[i] + '-' + acc;
+    if (next.length > PROJECT_LABEL_BUDGET) break;
+    acc = next;
+  }
+  return acc;
+}
 
 function formatCost(c: number | null | undefined): string {
   if (c == null || c === 0) return '$0';
@@ -414,10 +432,9 @@ export function Dashboard() {
             const maxCost = Math.max(...filtered.map(x => x.cost || 0), 0.01);
             return (
             <Section title="Cost by Project" subtitle="Which projects cost the most">
-              {filtered.map(c => {
-                const label = c.project.length > 20 ? c.project.slice(-20) : c.project;
-                return <BarRow key={c.project} label={label} value={c.cost || 0} max={maxCost} color={colors.yellow400} fmt={formatCost} />;
-              })}
+              {filtered.map(c => (
+                <BarRow key={c.project} label={displayProject(c.project)} title={c.project} value={c.cost || 0} max={maxCost} color={colors.yellow400} fmt={formatCost} />
+              ))}
             </Section>
             );
           })()}
