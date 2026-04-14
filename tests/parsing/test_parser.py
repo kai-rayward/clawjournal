@@ -1341,6 +1341,62 @@ class TestBuildCodexToolResultMap:
         assert "Successfully applied patch" in result["call-2"]["output"]["output"]
         assert result["call-2"]["output"]["duration_seconds"] == 0.5
 
+    def test_function_call_output_list_form(self, mock_anonymizer):
+        """Codex sessions may deliver output as a list of content blocks (e.g. images)."""
+        entries = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-img",
+                    "output": [
+                        {"type": "input_text", "text": "screenshot captured"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ],
+                },
+            }
+        ]
+        result = _build_codex_tool_result_map(entries, mock_anonymizer)
+        assert "call-img" in result
+        assert result["call-img"]["status"] == "success"
+        assert "screenshot captured" in result["call-img"]["output"]["output"]
+
+    def test_function_call_output_list_image_only(self, mock_anonymizer):
+        """List-form output with only images should not raise."""
+        entries = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-img2",
+                    "output": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                    ],
+                },
+            }
+        ]
+        result = _build_codex_tool_result_map(entries, mock_anonymizer)
+        assert "call-img2" in result
+        assert result["call-img2"]["status"] == "success"
+
+    def test_custom_tool_call_output_list_form(self, mock_anonymizer):
+        """Custom tool output may also arrive as a list of content blocks."""
+        entries = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-custom-list",
+                    "output": [
+                        {"type": "input_text", "text": "patch applied"},
+                    ],
+                },
+            }
+        ]
+        result = _build_codex_tool_result_map(entries, mock_anonymizer)
+        assert "call-custom-list" in result
+        assert "patch applied" in result["call-custom-list"]["output"]["output"]
+
     def test_non_response_item_ignored(self, mock_anonymizer):
         entries = [
             {

@@ -1554,6 +1554,26 @@ class _CodexParseState:
     tool_result_map: dict[str, dict] = dataclasses.field(default_factory=dict)
 
 
+def _coalesce_codex_output(raw: Any) -> str:
+    """Normalize a Codex tool `output` field to a string.
+
+    Codex may deliver output as a plain string or as a list of OpenAI-style
+    content blocks (``input_text``, ``input_image``). Only text is preserved;
+    non-text blocks are dropped.
+    """
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for block in raw:
+            if isinstance(block, dict) and block.get("type") == "input_text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
 def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
     """Pre-pass: build call_id -> {output, status} from function_call_output and custom_tool_call_output."""
     result: dict[str, dict] = {}
@@ -1567,44 +1587,53 @@ def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anon
             continue
 
         if pt == "function_call_output":
-            raw = p.get("output", "")
-            # Parse "Exit code: N\nWall time: ...\nOutput:\n..." format
+            raw_output = p.get("output", "")
             out: dict = {}
-            lines = raw.splitlines()
-            output_lines: list[str] = []
-            in_output = False
-            for line in lines:
-                if line.startswith("Exit code: "):
-                    try:
-                        out["exit_code"] = int(line[len("Exit code: "):].strip())
-                    except ValueError:
-                        out["exit_code"] = line[len("Exit code: "):].strip()
-                elif line.startswith("Wall time: "):
-                    out["wall_time"] = line[len("Wall time: "):].strip()
-                elif line == "Output:":
-                    in_output = True
-                elif in_output:
-                    output_lines.append(line)
-            if output_lines:
-                out["output"] = anonymizer.text("\n".join(output_lines).strip())
+            if isinstance(raw_output, str):
+                # Parse "Exit code: N\nWall time: ...\nOutput:\n..." format
+                output_lines: list[str] = []
+                in_output = False
+                for line in raw_output.splitlines():
+                    if line.startswith("Exit code: "):
+                        try:
+                            out["exit_code"] = int(line[len("Exit code: "):].strip())
+                        except ValueError:
+                            out["exit_code"] = line[len("Exit code: "):].strip()
+                    elif line.startswith("Wall time: "):
+                        out["wall_time"] = line[len("Wall time: "):].strip()
+                    elif line == "Output:":
+                        in_output = True
+                    elif in_output:
+                        output_lines.append(line)
+                if output_lines:
+                    out["output"] = anonymizer.text("\n".join(output_lines).strip())
+            else:
+                text = _coalesce_codex_output(raw_output)
+                if text:
+                    out["output"] = anonymizer.text(text)
             result[call_id] = {"output": out, "status": "success"}
 
         elif pt == "custom_tool_call_output":
-            raw = p.get("output", "")
+            raw_output = p.get("output", "")
             out = {}
-            try:
-                parsed = json.loads(raw)
-                text = parsed.get("output", "")
+            if isinstance(raw_output, str):
+                try:
+                    parsed = json.loads(raw_output)
+                    text = parsed.get("output", "")
+                    if text:
+                        out["output"] = anonymizer.text(str(text))
+                    meta = parsed.get("metadata", {})
+                    if "exit_code" in meta:
+                        out["exit_code"] = meta["exit_code"]
+                    if "duration_seconds" in meta:
+                        out["duration_seconds"] = meta["duration_seconds"]
+                except (json.JSONDecodeError, AttributeError):
+                    if raw_output:
+                        out["output"] = anonymizer.text(raw_output)
+            else:
+                text = _coalesce_codex_output(raw_output)
                 if text:
-                    out["output"] = anonymizer.text(str(text))
-                meta = parsed.get("metadata", {})
-                if "exit_code" in meta:
-                    out["exit_code"] = meta["exit_code"]
-                if "duration_seconds" in meta:
-                    out["duration_seconds"] = meta["duration_seconds"]
-            except (json.JSONDecodeError, AttributeError):
-                if raw:
-                    out["output"] = anonymizer.text(raw)
+                    out["output"] = anonymizer.text(text)
             result[call_id] = {"output": out, "status": "success"}
 
     return result
