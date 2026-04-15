@@ -21,18 +21,30 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-### Fastest first run (no install)
+### Install from PyPI (recommended)
 
-The quickest way to try ClawJournal is to let your coding agent do the setup for you. Paste this into any coding agent (Claude Code, Codex, Cursor, etc.):
+One line, no Node toolchain, no cloning — the published wheel includes the pre-built browser workbench.
+
+```bash
+pipx install clawjournal     # or: pip install clawjournal
+clawjournal scan             # Index local sessions from Claude Code, Codex, etc.
+clawjournal serve            # Open review UI at http://localhost:8384 (your machine only)
+```
+
+Requires Python 3.10+. `pipx` is preferred because it isolates the CLI in its own environment and puts `clawjournal` on your `PATH`.
+
+### Let your coding agent set it up
+
+Prefer to skip the terminal? Paste this into any coding agent (Claude Code, Codex, Cursor, etc.):
 
 ```
-Set up ClawJournal from https://github.com/kai-rayward/clawjournal in a virtual environment, build the frontend, run `clawjournal scan`, and start `clawjournal serve`.
+Install ClawJournal from PyPI (`pipx install clawjournal`), run `clawjournal scan`, and start `clawjournal serve`.
 Keep everything local unless I explicitly ask to share data.
 ```
 
-The agent will clone the repo, set up a venv, build the browser UI, scan your sessions, and open the workbench at `http://localhost:8384`. Nothing leaves your machine.
+The agent will install the package, scan your sessions, and open the workbench at `http://localhost:8384`. Nothing leaves your machine.
 
-### Recommended for repeat use (persistent skills)
+### Install as a skill for repeat use
 
 If you plan to use ClawJournal more than once, install it as a skill. Works with Claude Code, Codex, Cursor, Gemini CLI, OpenCode, and [many more](https://github.com/nicepkg/skills). Requires Node.js for the one-time `npx` command.
 
@@ -51,9 +63,9 @@ The setup skill installs ClawJournal on your machine, scans your local sessions,
 - **clawjournal** — review, triage, and share traces
 - **clawjournal-score** — AI-assisted quality scoring
 
-### Manual setup
+### Build from source (contributors)
 
-ClawJournal is currently installed from source. There is no PyPI release yet.
+You only need this path if you're developing ClawJournal itself — the PyPI wheel is the right choice for everyone else.
 
 > Commands below assume a POSIX shell (bash/zsh). On Windows, run them inside WSL or Git Bash. Native PowerShell users: replace `source .venv/bin/activate` with `.venv\Scripts\Activate.ps1`.
 
@@ -70,8 +82,8 @@ npm install
 npm run build
 cd ../../..
 
-clawjournal scan          # Index local sessions from Claude Code, Codex, etc.
-clawjournal serve         # Open review UI at http://localhost:8384 (your machine only)
+clawjournal scan
+clawjournal serve
 ```
 
 <details>
