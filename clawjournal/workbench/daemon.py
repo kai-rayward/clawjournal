@@ -1912,28 +1912,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         try:
             data = file_path.read_bytes()
-            # Inject the per-install API token into index.html bootstrap
-            # so same-origin frontend fetches can reach `/api/*` without
-            # the user having to handle it. The token is loopback-only
-            # and the HTML is served over the same connection, so this
-            # never leaves the local machine. JS code reads the value
-            # via `window.__CLAWJOURNAL_API_TOKEN__`.
-            if content_type == "text/html" and b"__CLAWJOURNAL_API_TOKEN__" not in data:
-                try:
-                    from pathlib import Path as _Path
-                    from ..paths import ensure_api_token
-                    from .index import INDEX_DB as _INDEX_DB
-                    token = ensure_api_token(_Path(str(_INDEX_DB)).parent)
-                    safe = token.replace("\\", "\\\\").replace('"', '\\"')
-                    injection = (
-                        f'<script>window.__CLAWJOURNAL_API_TOKEN__="{safe}";</script>'
-                    ).encode()
-                    if b"</head>" in data:
-                        data = data.replace(b"</head>", injection + b"</head>", 1)
-                    else:
-                        data = injection + data
-                except Exception:
-                    logger.exception("Failed to inject API token into index.html")
+            if content_type == "text/html":
+                data = self._inject_api_token(data)
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
@@ -1941,6 +1921,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except OSError:
             self.send_error(404)
+
+    def _inject_api_token(self, data: bytes) -> bytes:
+        # Inject the per-install API token so same-origin frontend fetches
+        # can reach `/api/*` without the user handling it. Loopback-only, so
+        # it never leaves the local machine. JS reads `window.__CLAWJOURNAL_API_TOKEN__`.
+        if b"__CLAWJOURNAL_API_TOKEN__" in data:
+            return data
+        try:
+            from pathlib import Path as _Path
+            from ..paths import ensure_api_token
+            from .index import INDEX_DB as _INDEX_DB
+            token = ensure_api_token(_Path(str(_INDEX_DB)).parent)
+            safe = token.replace("\\", "\\\\").replace('"', '\\"')
+            injection = (
+                f'<script>window.__CLAWJOURNAL_API_TOKEN__="{safe}";</script>'
+            ).encode()
+            if b"</head>" in data:
+                return data.replace(b"</head>", injection + b"</head>", 1)
+            return injection + data
+        except Exception:
+            logger.exception("Failed to inject API token into index.html")
+            return data
 
     def _serve_placeholder(self) -> None:
         """Serve a minimal HTML page when the frontend isn't built yet."""
@@ -1972,7 +1974,7 @@ npm run build</pre>
 </ul>
 </body>
 </html>"""
-        data = html.encode("utf-8")
+        data = self._inject_api_token(html.encode("utf-8"))
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(data)))
