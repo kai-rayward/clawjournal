@@ -155,8 +155,9 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null }> }> {
-    return request('/share-ready');
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
+    const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
+    return request(`/share-ready${q}`);
   },
 
   quickShare(sessionIds: string[], note?: string): Promise<{
@@ -208,8 +209,29 @@ export const api = {
       return `${BASE}/shares/${encodeURIComponent(id)}/download`;
     },
 
-    download(id: string): void {
-      window.open(`${BASE}/shares/${encodeURIComponent(id)}/download`, '_blank');
+    async download(id: string): Promise<void> {
+      // `window.open` can't attach the Bearer auth header the daemon
+      // requires, so fetch the zip through the same auth'd path as every
+      // other API call and hand the browser a blob URL to save.
+      const res = await fetch(`${BASE}/shares/${encodeURIComponent(id)}/download`, {
+        headers: authHeader(),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+      }
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const match = /filename="?([^";]+)"?/.exec(disposition);
+      const filename = match ? match[1] : `share-${id}.zip`;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
     },
 
     upload(id: string, force?: boolean): Promise<{

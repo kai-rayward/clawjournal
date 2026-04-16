@@ -70,13 +70,24 @@ def anonymize_text(text: str, username: str) -> str:
 
 
 class Anonymizer:
-    """Stateful anonymizer that consistently replaces usernames and paths."""
+    """Stateful anonymizer that consistently replaces usernames and paths.
 
-    def __init__(self, extra_usernames: list[str] | None = None):
+    `enabled=False` makes `text()` and `path()` pass-through. Ingest uses the
+    disabled variant so raw content sits in local blobs (local views show
+    real paths); egress paths (share export, AI scoring) construct an
+    enabled instance at the boundary.
+    """
+
+    def __init__(
+        self,
+        extra_usernames: list[str] | None = None,
+        *,
+        enabled: bool = True,
+    ):
         self.home, self.username = _detect_home_dir()
         self.username_hash = _USERNAME_PLACEHOLDER  # kept for API compat
+        self.enabled = enabled
 
-        # Additional usernames to anonymize (GitHub handles, Discord names, etc.)
         self._extra: list[str] = []
         for name in (extra_usernames or []):
             name = name.strip()
@@ -84,6 +95,8 @@ class Anonymizer:
                 self._extra.append(name)
 
     def path(self, file_path: str) -> str:
+        if not self.enabled:
+            return file_path
         result = anonymize_path(file_path, self.username, self.home)
         result = anonymize_text(result, self.username)
         for name in self._extra:
@@ -91,6 +104,8 @@ class Anonymizer:
         return result
 
     def text(self, content: str) -> str:
+        if not self.enabled:
+            return content
         result = anonymize_text(content, self.username)
         for name in self._extra:
             result = _replace_username(result, name)

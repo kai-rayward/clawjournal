@@ -11,7 +11,12 @@ ClawJournal is designed to be usable without uploading anything.
 
 ## Automatic redaction
 
-Before export or bundle creation, ClawJournal redacts several classes of sensitive data:
+Local session views (the workbench UI at `localhost:8384`) show session content as it was recorded, including your own home-directory paths and username. Redaction runs at the points where data leaves your machine or goes into an LLM prompt:
+
+- the Share **Redact** step (step 2) and any bundle/export command
+- the AI scoring pipeline, before the judge is called
+
+At those boundaries, ClawJournal redacts several classes of sensitive data:
 
 | Type | Result |
 |------|--------|

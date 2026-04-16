@@ -65,12 +65,18 @@ def _settled_session(session_id, content=None):
 
 
 class TestReleaseGate:
-    def test_default_auto_redacted_is_blocked(self, conn):
+    def test_default_auto_redacted_is_shareable(self, conn):
         upsert_sessions(conn, [_settled_session("a"), _settled_session("b")])
         conn.commit()
-        blockers = release_gate_blockers(conn, ["a", "b"])
-        assert {b["session_id"] for b in blockers} == {"a", "b"}
-        assert all(b["hold_state"] == "auto_redacted" for b in blockers)
+        assert release_gate_blockers(conn, ["a", "b"]) == []
+
+    def test_pending_review_blocks(self, conn):
+        upsert_sessions(conn, [_settled_session("a")])
+        conn.commit()
+        set_hold_state(conn, "a", "pending_review", changed_by="user")
+        blockers = release_gate_blockers(conn, ["a"])
+        assert len(blockers) == 1
+        assert blockers[0]["hold_state"] == "pending_review"
 
     def test_released_passes(self, conn):
         upsert_sessions(conn, [_settled_session("a")])

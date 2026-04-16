@@ -54,11 +54,15 @@ Generate a concise display title (under 60 characters) that summarizes what the 
 
 ## Summary
 
-Write a 1-3 sentence summary of what happened in the session and the outcome. This is the most valuable field for users scanning their trace library. Focus on *what was done* and *what resulted*, not on scoring justification.
+Write a **2-3 sentence, 100-word-max hard cap** summary of what happened in the session and the outcome. Users scan this in a side panel, so keep it tight. Focus on *what was done* and *what resulted*, not on scoring justification. Do not restate metrics (step counts, tool failures) — those are shown elsewhere.
 
-Example: "Fixed three flaky integration tests in the CI pipeline by replacing sleep-based waits with event-driven synchronization. All tests now pass consistently."
+Example: "Fixed three flaky integration tests by replacing sleep-based waits with event-driven synchronization. All tests now pass."
 
 For trivial sessions: "User switched model configuration. No task performed."
+
+## Reasoning
+
+Keep `reasoning` to **one sentence** explaining the score. Do not summarize the session again — that is what `summary` is for. Cite the single most load-bearing fact (e.g. "Clean execution: read, edit, test, user confirmed" or "Zero tool calls on a task needing codebase exploration").
 
 ## Effort Estimate
 

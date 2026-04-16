@@ -1615,16 +1615,19 @@ def get_hold_history(
     return [dict(r) for r in rows]
 
 
+SHAREABLE_HOLD_STATES = frozenset({"auto_redacted", "released"})
+
+
 def release_gate_blockers(
     conn: sqlite3.Connection, session_ids: list[str],
     *, now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Return sessions whose effective hold_state blocks hosted upload.
 
-    A session is blocked unless its effective hold_state is `released`
-    (Decision 24). Auto-expired embargoes pass through via
-    `effective_hold_state`. Returns `[]` when every session clears.
-    Callers surface the result as a share-time error.
+    Default-shareable: `auto_redacted` and `released` pass. Only explicit
+    holds (`pending_review`, active `embargoed`) block. Auto-expired
+    embargoes pass through via `effective_hold_state`. Returns `[]` when
+    every session clears. Callers surface the result as a share-time error.
     """
     if not session_ids:
         return []
@@ -1642,7 +1645,7 @@ def release_gate_blockers(
             blockers.append({"session_id": sid, "hold_state": "missing"})
             continue
         effective = effective_hold_state(row["hold_state"], row["embargo_until"], now=now)
-        if effective != "released":
+        if effective not in SHAREABLE_HOLD_STATES:
             blockers.append({
                 "session_id": sid,
                 "hold_state": effective,
@@ -2401,20 +2404,26 @@ def get_share_ready_stats(
     conn: sqlite3.Connection,
     *,
     excluded_projects: list[str] | None = None,
+    include_unapproved: bool = False,
 ) -> dict[str, Any]:
-    """Return approved sessions that have not been shared before.
+    """Return sessions that have not been shared before.
 
-    Sessions are ordered by recency, and the first 10 become the default
-    recommendation for the Share tab.
+    By default returns only `review_status='approved'` sessions; pass
+    `include_unapproved=True` to widen the pool so the Preview UI can
+    offer non-approved sessions for selection (Package will auto-approve
+    them on the way through). Approved sessions are listed first; within
+    each tier, ordered by recency. The first 10 approved sessions become
+    the default recommendation.
     """
+    where_status = "" if include_unapproved else " WHERE review_status = 'approved'"
     rows = conn.execute(
         "SELECT session_id, project, model, source, display_title,"
         " ai_quality_score, user_messages, assistant_messages, tool_uses,"
         " input_tokens, outcome_badge, client_origin, runtime_channel,"
-        " start_time"
+        " start_time, review_status"
         " FROM sessions"
-        " WHERE review_status = 'approved'"
-        " AND session_id NOT IN ("
+        f"{where_status}"
+        f"{' AND' if where_status else ' WHERE'} session_id NOT IN ("
         "   SELECT DISTINCT session_id FROM ("
         "     SELECT s.session_id AS session_id"
         "     FROM sessions s"
@@ -2427,12 +2436,13 @@ def get_share_ready_stats(
         "     WHERE b.shared_at IS NOT NULL"
         "   )"
         " )"
-        " ORDER BY start_time DESC, ai_quality_score DESC"
+        " ORDER BY (review_status = 'approved') DESC,"
+        " start_time DESC, ai_quality_score DESC"
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
             "ai_quality_score", "user_messages", "assistant_messages",
             "tool_uses", "input_tokens", "outcome_badge",
-            "client_origin", "runtime_channel", "start_time"]
+            "client_origin", "runtime_channel", "start_time", "review_status"]
     sessions = [dict(zip(cols, r)) for r in rows]
     if excluded_projects:
         sessions = [
@@ -2446,6 +2456,7 @@ def get_share_ready_stats(
             projects.add(s["project"])
         if s.get("model"):
             models.add(s["model"])
+    approved_sessions = [s for s in sessions if s.get("review_status") == "approved"]
     return {
         "count": len(sessions),
         "total_approved": conn.execute(
@@ -2453,7 +2464,7 @@ def get_share_ready_stats(
         ).fetchone()[0],
         "projects": sorted(projects),
         "models": sorted(models),
-        "recommended_session_ids": [s["session_id"] for s in sessions[:10]],
+        "recommended_session_ids": [s["session_id"] for s in approved_sessions[:10]],
         "sessions": sessions,
     }
 

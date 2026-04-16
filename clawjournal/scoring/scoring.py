@@ -877,6 +877,61 @@ def _validate_judge_result(result: dict) -> dict:
 # Top-level: score_session
 # ---------------------------------------------------------------------------
 
+def _anonymize_for_scoring(
+    detail: dict[str, Any], messages: list[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Scrub home-dir paths and usernames from a session before it is sent
+    to the judge. Returns a fresh detail dict and the scrubbed message list
+    so callers can't accidentally mutate the DB-backed copy."""
+    from ..config import load_config
+    from ..redaction.anonymizer import Anonymizer
+
+    try:
+        config = load_config()
+        extra = config.get("redact_usernames", []) if isinstance(config, dict) else []
+    except Exception:
+        extra = []
+
+    anonymizer = Anonymizer(extra_usernames=extra)
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, str):
+            return anonymizer.text(value)
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        if isinstance(value, dict):
+            return {k: scrub(v) for k, v in value.items()}
+        return value
+
+    new_detail = dict(detail)
+    for field in ("display_title", "project", "git_branch"):
+        val = new_detail.get(field)
+        if isinstance(val, str):
+            new_detail[field] = anonymizer.text(val)
+
+    new_messages: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            new_messages.append(msg)
+            continue
+        m = dict(msg)
+        for text_field in ("content", "thinking"):
+            v = m.get(text_field)
+            if isinstance(v, str):
+                m[text_field] = anonymizer.text(v)
+        if isinstance(m.get("tool_uses"), list):
+            m["tool_uses"] = [
+                {**tu, **{f: scrub(tu.get(f)) for f in ("input", "output") if f in tu}}
+                if isinstance(tu, dict)
+                else tu
+                for tu in m["tool_uses"]
+            ]
+        new_messages.append(m)
+
+    new_detail["messages"] = new_messages
+    return new_detail, new_messages
+
+
 def score_session(
     conn: Any,
     session_id: str,
@@ -922,6 +977,11 @@ def score_session(
             )
         messages = raw_messages
         detail["messages"] = messages
+
+    # Blobs hold raw content since the security refactor. Anonymize
+    # home-dir paths and usernames before handing anything to the judge —
+    # the judge may be a cloud backend (Anthropic API / Codex / etc.).
+    detail, messages = _anonymize_for_scoring(detail, messages)
 
     # Format: parse into turns
     segments = segment_session(messages)

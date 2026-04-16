@@ -7,7 +7,6 @@ import { Share } from './views/Share.tsx';
 import { Policies } from './views/Policies.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
-import { FindingsAllowlist } from './views/FindingsAllowlist.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { colors, fontFamily } from './theme.ts';
 import { api } from './api.ts';
@@ -45,7 +44,6 @@ function Sidebar() {
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
     { to: '/share', label: 'Share', badge: counts.approved > 0 ? counts.approved : null },
-    { to: '/findings/allowlist', label: 'Allowlist', badge: null },
   ];
 
   return (
@@ -141,7 +139,6 @@ export default function App() {
               <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
               <Route path="/share" element={<Share />} />
               <Route path="/share/rules" element={<Policies />} />
-              <Route path="/findings/allowlist" element={<FindingsAllowlist />} />
             </Routes>
           </main>
         </div>

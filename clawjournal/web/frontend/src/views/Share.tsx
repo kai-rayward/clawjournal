@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import type { Session, Share as ShareType, ToolUse } from '../types.ts';
 import { api } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { EmptyState } from '../components/Spinner.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
+import { RedactedText } from '../components/RedactedText.tsx';
 import { RedactionReportPanel } from '../components/RedactionReportPanel.tsx';
+import { SessionDrawer } from '../components/SessionDrawer.tsx';
+import { ToolUseCard } from '../components/ToolUseCard.tsx';
 import { ShareTabs } from '../components/ShareTabs.tsx';
 import { Stepper } from '../components/Stepper.tsx';
 import { TraceCard } from '../components/TraceCard.tsx';
@@ -32,26 +35,6 @@ function sourceFullLabel(s: { source: string; client_origin?: string | null; run
 function SourceBadge({ s }: { s: { source: string; client_origin?: string | null; runtime_channel?: string | null } }) {
   const { label, color } = sourceFullLabel(s);
   return <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: hexAlpha(color, 0.10), color, marginRight: 3 }}>{label}</span>;
-}
-
-/** Render text with [REDACTED_*] spans highlighted. */
-function RedactedText({ text }: { text: string }) {
-  const parts = text.split(/(\[REDACTED[^\]]*\])/g);
-  return (
-    <>
-      {parts.map((part, i) =>
-        part.startsWith('[REDACTED') ? (
-          <span key={i} style={{
-            background: colors.red100, color: colors.red700,
-            borderRadius: 3, padding: '0 3px', fontWeight: 600,
-            fontSize: '0.9em',
-          }}>{part}</span>
-        ) : (
-          <span key={i}>{part}</span>
-        ),
-      )}
-    </>
-  );
 }
 
 function ThinkingBlock({ text }: { text: string }) {
@@ -94,99 +77,6 @@ function ThinkingBlock({ text }: { text: string }) {
   );
 }
 
-function ToolUseCard({ tu }: { tu: ToolUse }) {
-  const [open, setOpen] = useState(false);
-  const statusColor =
-    tu.status === 'success' || tu.status === 'ok'
-      ? colors.green700
-      : tu.status === 'error'
-        ? colors.red700
-        : colors.gray500;
-  const statusBg =
-    tu.status === 'success' || tu.status === 'ok'
-      ? colors.green100
-      : tu.status === 'error'
-        ? colors.red100
-        : colors.gray100;
-
-  const renderBlock = (data: Record<string, unknown> | string) => {
-    const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-    return (
-      <pre
-        style={{
-          background: colors.gray50,
-          border: `1px solid ${colors.gray200}`,
-          borderRadius: 4,
-          padding: 8,
-          fontSize: 12,
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
-          maxHeight: 250,
-          overflow: 'auto',
-          margin: '4px 0',
-        }}
-      >
-        <RedactedText text={text} />
-      </pre>
-    );
-  };
-
-  return (
-    <div
-      style={{
-        border: `1px solid ${colors.gray200}`,
-        borderRadius: 6,
-        margin: '6px 0',
-        overflow: 'hidden',
-      }}
-    >
-      <div
-        onClick={() => setOpen(!open)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '6px 10px',
-          cursor: 'pointer',
-          background: colors.gray50,
-          fontSize: 14,
-        }}
-      >
-        <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{tu.tool}</span>
-        <span
-          style={{
-            fontSize: 11,
-            padding: '1px 6px',
-            borderRadius: 9999,
-            background: statusBg,
-            color: statusColor,
-            fontWeight: 500,
-          }}
-        >
-          {tu.status}
-        </span>
-        <span style={{ marginLeft: 'auto', color: colors.gray400, fontSize: 12 }}>
-          {open ? '\u25B2' : '\u25BC'}
-        </span>
-      </div>
-      {open && (
-        <div style={{ padding: '8px 10px' }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray500, marginBottom: 2 }}>
-            Input
-          </div>
-          {renderBlock(tu.input)}
-          <div
-            style={{ fontSize: 11, fontWeight: 600, color: colors.gray500, marginBottom: 2, marginTop: 8 }}
-          >
-            Output
-          </div>
-          {renderBlock(tu.output)}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // 5-step flow
 type StepKey = 'preview' | 'redact' | 'review' | 'package' | 'download';
 
@@ -213,6 +103,7 @@ interface ReadySession {
   client_origin?: string | null;
   runtime_channel?: string | null;
   start_time?: string | null;
+  review_status?: string;
 }
 
 interface ShareReadyStats {
@@ -290,13 +181,27 @@ const formatTokens = (t: number) => t >= 1_000_000 ? `${(t / 1_000_000).toFixed(
 
 export function Share() {
   const { toast } = useToast();
-  const [activeStep, setActiveStep] = useState<StepKey>('preview');
-  const [completedKeys, setCompletedKeys] = useState<Set<string>>(new Set());
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [activeStep, setActiveStep] = useState<StepKey>(
+    () => (searchParams.get('step') as StepKey) || 'preview',
+  );
+  const [completedKeys, setCompletedKeys] = useState<Set<string>>(() => {
+    const step = (searchParams.get('step') as StepKey) || 'preview';
+    const idx = STEPS.findIndex((s) => s.key === step);
+    return new Set(STEPS.slice(0, Math.max(0, idx)).map((s) => s.key));
+  });
   const [readyStats, setReadyStats] = useState<ShareReadyStats | null>(null);
   const [shares, setShares] = useState<ShareType[]>([]);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [selectionInitialized, setSelectionInitialized] = useState(false);
-  const [note, setNote] = useState('');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
+    const csv = searchParams.get('ids');
+    return new Set(csv ? csv.split(',').filter(Boolean) : []);
+  });
+  const [selectionInitialized, setSelectionInitialized] = useState(
+    () => !!searchParams.get('ids'),
+  );
+  const [note, setNote] = useState(() => searchParams.get('note') || '');
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [sourceFilter, setSourceFilter] = useState('');
   const [projectFilter, setProjectFilter] = useState('');
@@ -315,7 +220,9 @@ export function Share() {
   const [confirmPackage, setConfirmPackage] = useState(false);
 
   // Package / Download state
-  const [packagedShareId, setPackagedShareId] = useState<string | null>(null);
+  const [packagedShareId, setPackagedShareId] = useState<string | null>(
+    () => searchParams.get('share'),
+  );
   const [packaging, setPackaging] = useState(false);
   const [uploading, setUploading] = useState(false);
 
@@ -325,7 +232,7 @@ export function Share() {
 
   useEffect(() => {
     Promise.all([
-      api.shareReady(),
+      api.shareReady({ includeUnapproved: true }),
       api.shares.list(),
       api.scoringBackend().catch(() => ({ backend: null, display_name: null })),
     ]).then(([stats, shareList, backend]) => {
@@ -352,8 +259,37 @@ export function Share() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Mirror wizard state to URL so reload / back-forward navigation resumes here.
+  // `redactedSessions` stays in memory; on URL-restore the Redact step refills
+  // any missing entries lazily.
+  useEffect(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (activeStep === 'preview') next.delete('step'); else next.set('step', activeStep);
+      const csv = Array.from(selectedIds).join(',');
+      if (csv) next.set('ids', csv); else next.delete('ids');
+      if (note) next.set('note', note); else next.delete('note');
+      if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
+      return next;
+    }, { replace: true });
+  }, [activeStep, selectedIds, note, packagedShareId, setSearchParams]);
+
+  // When selection changes after redaction has run, drop cached redacted data
+  // for sessions no longer selected so Review never shows stale entries.
+  useEffect(() => {
+    setRedactedSessions((prev) => {
+      let changed = false;
+      const next: Record<string, RedactedSessionData> = {};
+      for (const [sid, data] of Object.entries(prev)) {
+        if (selectedIds.has(sid)) next[sid] = data;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [selectedIds]);
+
   const reload = () => {
-    api.shareReady().then((stats) => {
+    api.shareReady({ includeUnapproved: true }).then((stats) => {
       setReadyStats(stats);
       if (stats.sessions.length === 0) {
         api.sessions.list({ status: 'new', sort: 'ai_quality_score', order: 'desc', limit: 10 })
@@ -370,16 +306,24 @@ export function Share() {
     ? readyStats.sessions.filter(s => selectedIds.has(s.session_id))
     : [];
 
+  const startFreshShare = useCallback(() => {
+    setSelectedIds(new Set());
+    setCompletedKeys(new Set());
+    setPackagedShareId(null);
+    setNote('');
+    setRedactedSessions({});
+    setActiveStep('preview');
+  }, []);
+
   const onStepClick = (key: string) => {
     const k = key as StepKey;
     if (k === activeStep) return;
     if (k === 'preview') {
       if (activeStep === 'download') {
-        // Download -> preview resets selection + completedKeys for a fresh flow
-        setSelectedIds(new Set());
-        setCompletedKeys(new Set());
-        setPackagedShareId(null);
-        setNote('');
+        // Confirm before clearing the just-finished share — accidental
+        // backstep on Download wiped the previous selection silently.
+        setConfirmReset(true);
+        return;
       }
       setActiveStep('preview');
       return;
@@ -401,10 +345,24 @@ export function Share() {
       return next;
     });
     setActiveStep('redact');
-    setRedactedSessions({});
-    setRedactionProgress({ done: 0, total: sessions.length, currentTitle: '' });
 
-    const results: Record<string, RedactedSessionData> = {};
+    // Incremental: only redact sessions not already cached. Going back to
+    // Preview, tweaking selection, and returning shouldn't re-run work for
+    // unchanged sessions.
+    const cached = redactedSessions;
+    const missing = sessions.filter((s) => !cached[s.session_id]);
+    if (missing.length === 0) {
+      setCompletedKeys((prev) => {
+        const next = new Set(prev);
+        next.add('preview'); next.add('redact');
+        return next;
+      });
+      setActiveStep('review');
+      return;
+    }
+    setRedactionProgress({ done: 0, total: missing.length, currentTitle: '' });
+
+    const results: Record<string, RedactedSessionData> = { ...cached };
     let doneCount = 0;
 
     const processOne = async (s: ReadySession) => {
@@ -427,15 +385,15 @@ export function Share() {
         results[s.session_id] = { messages: [{ role: 'system', content: '(unable to load redacted content)' }], loading: false, redactionCount: 0, aiCoverage: 'rules_only' };
       }
       doneCount++;
-      setRedactionProgress({ done: doneCount, total: sessions.length, currentTitle: s.display_title || 'Untitled' });
+      setRedactionProgress({ done: doneCount, total: missing.length, currentTitle: s.display_title || 'Untitled' });
       setRedactedSessions({ ...results });
     };
 
-    for (let i = 0; i < sessions.length; i += REDACTION_CONCURRENCY) {
-      const batch = sessions.slice(i, i + REDACTION_CONCURRENCY);
+    for (let i = 0; i < missing.length; i += REDACTION_CONCURRENCY) {
+      const batch = missing.slice(i, i + REDACTION_CONCURRENCY);
       await Promise.all(batch.map(processOne));
     }
-    setRedactionProgress({ done: sessions.length, total: sessions.length, currentTitle: '' });
+    setRedactionProgress({ done: missing.length, total: missing.length, currentTitle: '' });
     setCompletedKeys((prev) => {
       const next = new Set(prev);
       next.add('preview');
@@ -443,7 +401,7 @@ export function Share() {
       return next;
     });
     setActiveStep('review');
-  }, [selectedSessions]);
+  }, [selectedSessions, redactedSessions]);
 
   const handlePackage = async () => {
     setConfirmPackage(false);
@@ -459,6 +417,18 @@ export function Share() {
     setActiveStep('package');
     try {
       const ids = selectedSessions.map(s => s.session_id);
+      // Auto-approve any unapproved sessions in the selection — the user
+      // explicitly added them via the Preview list, so opt them into the
+      // approved set before packaging. Failures are non-fatal: the share
+      // create call is the source of truth.
+      const needApproval = selectedSessions.filter((s) => s.review_status && s.review_status !== 'approved');
+      if (needApproval.length > 0) {
+        await Promise.all(
+          needApproval.map((s) =>
+            api.sessions.update(s.session_id, { status: 'approved' }).catch(() => undefined),
+          ),
+        );
+      }
       const { share_id } = await api.shares.create(ids, note || undefined);
       setPackagedShareId(share_id);
       // Export on server so subsequent download/upload work.
@@ -480,10 +450,14 @@ export function Share() {
     }
   };
 
-  const handleDownloadZip = () => {
+  const handleDownloadZip = async () => {
     if (!packagedShareId) return;
-    window.open(api.shares.downloadUrl(packagedShareId), '_blank');
-    toast('Download started', 'success');
+    try {
+      await api.shares.download(packagedShareId);
+      toast('Download started', 'success');
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Download failed', 'error');
+    }
   };
 
   const handleUploadHosted = async () => {
@@ -592,6 +566,7 @@ export function Share() {
         {readyStats?.recommended_session_ids?.length ? (
           <p style={{ margin: '0 0 14px', fontSize: '13px', color: colors.gray500, lineHeight: 1.5 }}>
             Preselected: the 10 most recent approved traces that have not been shared before.
+            Unapproved traces are also listed below — selecting one auto-approves it on package.
           </p>
         ) : null}
 
@@ -674,6 +649,18 @@ export function Share() {
                       {scoreBadge(s.ai_quality_score)}
                     </span>
                     <SourceBadge s={s} />
+                    {s.review_status && s.review_status !== 'approved' && (
+                      <span
+                        title="Not yet approved — will be auto-approved when packaged"
+                        style={{
+                          fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4,
+                          background: hexAlpha('#9ca3af', 0.18), color: '#4b5563',
+                          marginRight: 3, flexShrink: 0,
+                        }}
+                      >
+                        {s.review_status}
+                      </span>
+                    )}
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 500, color: colors.gray900, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {s.display_title || 'Untitled'}
@@ -685,6 +672,18 @@ export function Share() {
                         {s.outcome_badge ? ` · ${outcomeBadge(s.outcome_badge)}` : ''}
                       </div>
                     </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setDrawerSessionId(s.session_id); }}
+                      title="Preview this trace without changing your selection"
+                      style={{
+                        flexShrink: 0, padding: '3px 10px', fontSize: 11,
+                        background: colors.white, color: colors.gray600,
+                        border: `1px solid ${colors.gray300}`, borderRadius: 4,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Preview
+                    </button>
                   </div>
                 );
               })}
@@ -810,7 +809,17 @@ export function Share() {
                     </div>
                   </div>
                   <div style={{ display: 'flex', gap: '6px' }}>
-                    <button onClick={() => window.open(api.shares.downloadUrl(share.share_id), '_blank')} style={btnSecondary}>
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.shares.download(share.share_id);
+                          toast('Download started', 'success');
+                        } catch (err: unknown) {
+                          toast(err instanceof Error ? err.message : 'Download failed', 'error');
+                        }
+                      }}
+                      style={btnSecondary}
+                    >
                       Download zip
                     </button>
                   </div>
@@ -819,6 +828,10 @@ export function Share() {
             ))}
           </div>
         )}
+        <SessionDrawer
+          sessionId={drawerSessionId}
+          onClose={() => setDrawerSessionId(null)}
+        />
       </div>
     );
   }
@@ -1323,20 +1336,21 @@ export function Share() {
 
           <div>
             <button
-              onClick={() => {
-                setSelectedIds(new Set());
-                setCompletedKeys(new Set());
-                setPackagedShareId(null);
-                setNote('');
-                setActiveStep('preview');
-                reload();
-              }}
+              onClick={() => { startFreshShare(); reload(); }}
               style={btnSecondary}
             >
               Start a new share
             </button>
           </div>
         </div>
+        <ConfirmDialog
+          open={confirmReset}
+          title="Start a new share?"
+          message="Going back to Preview from here clears the selection, note, and packaged share. Continue?"
+          confirmLabel="Start fresh"
+          onConfirm={() => { setConfirmReset(false); startFreshShare(); reload(); }}
+          onCancel={() => setConfirmReset(false)}
+        />
       </div>
     );
   }

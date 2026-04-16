@@ -5,10 +5,8 @@ import type { SessionDetail as SessionDetailType, Message, ToolUse } from '../ty
 import { BadgeChip } from '../components/BadgeChip.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { useToast } from '../components/Toast.tsx';
-import { RedactionReportPanel } from '../components/RedactionReportPanel.tsx';
-import { FindingsReviewPanel } from '../components/FindingsReviewPanel.tsx';
-import { HoldStateBanner } from '../components/HoldStateBanner.tsx';
-import { HoldHistoryTimeline } from '../components/HoldHistoryTimeline.tsx';
+import { RedactedText } from '../components/RedactedText.tsx';
+import { ToolUseCard } from '../components/ToolUseCard.tsx';
 import { colors, btnGhost } from '../theme.ts';
 
 /* ------------------------------------------------------------------ */
@@ -67,39 +65,12 @@ function truncate(text: string, max: number): string {
 }
 
 /** Render text with [REDACTED] spans highlighted. */
-function RedactedText({ text }: { text: string | null | undefined }) {
-  if (!text) return null;
-  const parts = text.split(/(\[REDACTED\])/g);
-  return (
-    <>
-      {parts.map((part, i) =>
-        part === '[REDACTED]' ? (
-          <span
-            key={i}
-            style={{
-              background: colors.red100,
-              color: colors.red700,
-              borderRadius: 3,
-              padding: '0 3px',
-              fontWeight: 600,
-            }}
-          >
-            [REDACTED]
-          </span>
-        ) : (
-          <span key={i}>{part}</span>
-        ),
-      )}
-    </>
-  );
-}
-
 /* ------------------------------------------------------------------ */
 /*  Sub-components                                                    */
 /* ------------------------------------------------------------------ */
 
 function ThinkingBlock({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   return (
     <div style={{ margin: '6px 0' }}>
       <button
@@ -133,99 +104,6 @@ function ThinkingBlock({ text }: { text: string }) {
         >
           {text}
         </pre>
-      )}
-    </div>
-  );
-}
-
-function ToolUseCard({ tu }: { tu: ToolUse }) {
-  const [open, setOpen] = useState(false);
-  const statusColor =
-    tu.status === 'success' || tu.status === 'ok'
-      ? colors.green700
-      : tu.status === 'error'
-        ? colors.red700
-        : colors.gray500;
-  const statusBg =
-    tu.status === 'success' || tu.status === 'ok'
-      ? colors.green100
-      : tu.status === 'error'
-        ? colors.red100
-        : colors.gray100;
-
-  const renderBlock = (data: Record<string, unknown> | string) => {
-    const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-    return (
-      <pre
-        style={{
-          background: colors.gray50,
-          border: `1px solid ${colors.gray200}`,
-          borderRadius: 4,
-          padding: 8,
-          fontSize: 12,
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
-          maxHeight: 250,
-          overflow: 'auto',
-          margin: '4px 0',
-        }}
-      >
-        <RedactedText text={text} />
-      </pre>
-    );
-  };
-
-  return (
-    <div
-      style={{
-        border: `1px solid ${colors.gray200}`,
-        borderRadius: 6,
-        margin: '6px 0',
-        overflow: 'hidden',
-      }}
-    >
-      <div
-        onClick={() => setOpen(!open)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '6px 10px',
-          cursor: 'pointer',
-          background: colors.gray50,
-          fontSize: 14,
-        }}
-      >
-        <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{tu.tool}</span>
-        <span
-          style={{
-            fontSize: 11,
-            padding: '1px 6px',
-            borderRadius: 9999,
-            background: statusBg,
-            color: statusColor,
-            fontWeight: 500,
-          }}
-        >
-          {tu.status}
-        </span>
-        <span style={{ marginLeft: 'auto', color: colors.gray400, fontSize: 12 }}>
-          {open ? '\u25B2' : '\u25BC'}
-        </span>
-      </div>
-      {open && (
-        <div style={{ padding: '8px 10px' }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray500, marginBottom: 2 }}>
-            Input
-          </div>
-          {renderBlock(tu.input)}
-          <div
-            style={{ fontSize: 11, fontWeight: 600, color: colors.gray500, marginBottom: 2, marginTop: 8 }}
-          >
-            Output
-          </div>
-          {renderBlock(tu.output)}
-        </div>
       )}
     </div>
   );
@@ -313,9 +191,6 @@ export default function SessionDetail() {
 
   const [userRating, setUserRating] = useState<number | null>(null);
   const [scoring, setScoring] = useState(false);
-
-  // Bumped after hold-state transitions so HoldHistoryTimeline re-fetches.
-  const [holdRefreshKey, setHoldRefreshKey] = useState(0);
 
   // Refs for scroll targets
   const msgRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -677,31 +552,6 @@ export default function SessionDetail() {
               );
             })}
           </div>
-        </Section>
-
-        <Section title="Hold state">
-          <HoldStateBanner
-            session={{
-              session_id: session.session_id,
-              hold_state: session.hold_state,
-              embargo_until: session.embargo_until,
-            }}
-            onChange={() => {
-              setHoldRefreshKey((k) => k + 1);
-              if (id) {
-                api.sessions.get(id).then(setSession).catch((e) => setError(e.message));
-              }
-            }}
-          />
-          <HoldHistoryTimeline sessionId={id!} refreshKey={holdRefreshKey} />
-        </Section>
-
-        <Section title="Findings">
-          <FindingsReviewPanel sessionId={id!} />
-        </Section>
-
-        <Section title="Redaction Report">
-          <RedactionReportPanel sessionId={id!} onScrollToMessage={scrollToMessage} />
         </Section>
 
       </div>

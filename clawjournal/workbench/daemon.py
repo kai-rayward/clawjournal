@@ -136,8 +136,9 @@ class Scanner:
         conn = open_index()
         try:
             config = load_config()
-            extra_usernames = config.get("redact_usernames", [])
-            anonymizer = Anonymizer(extra_usernames=extra_usernames)
+            # Ingest stores raw content; anonymization happens at egress
+            # (apply_share_redactions, score_session).
+            anonymizer = Anonymizer(enabled=False)
 
             # Drain any sessions flagged by the security-refactor migration
             # before running the normal parse/scan loop. Per-row updates so
@@ -845,7 +846,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path == "/api/projects":
             self._handle_projects()
         elif path == "/api/share-ready":
-            self._handle_share_ready()
+            self._handle_share_ready(params)
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
         elif path == "/api/bundles":
@@ -1475,14 +1476,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "display_name": display_names.get(backend, backend),
         })
 
-    def _handle_share_ready(self) -> None:
-        """Return stats for approved sessions ready to share."""
+    def _handle_share_ready(self, params: dict[str, list[str]]) -> None:
+        """Return stats for sessions ready to share.
+
+        By default only `review_status='approved'` sessions are returned.
+        Pass `?include_unapproved=1` to also return non-approved sessions
+        so the Share Preview can offer a broader pool to pick from.
+        """
+        include_unapproved = params.get("include_unapproved", [""])[0] == "1"
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
             stats = get_share_ready_stats(
                 conn,
                 excluded_projects=settings["excluded_projects"],
+                include_unapproved=include_unapproved,
             )
             _json_response(self, stats)
         finally:
