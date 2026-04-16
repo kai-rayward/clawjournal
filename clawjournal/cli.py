@@ -2971,6 +2971,66 @@ def main() -> None:
     scan_parser = sub.add_parser("scan", help="One-shot index sessions into local workbench DB")
     scan_parser.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None,
                              help="Only scan this source")
+    scan_parser.add_argument("--force", action="store_true",
+                             help="Force-rebuild findings, bypassing settle + revision checks")
+    scan_parser.add_argument("--all", action="store_true",
+                             help="With --force: rebuild findings for every session")
+    scan_parser.add_argument("session_ids", nargs="*",
+                             help="With --force: rebuild findings for these session IDs")
+
+    # Hold-state lifecycle
+    hold_p = sub.add_parser("hold", help="Move session to pending_review hold")
+    hold_p.add_argument("session_id")
+    hold_p.add_argument("--reason", type=str, default=None)
+
+    release_p = sub.add_parser("release", help="Release a session for hosted share")
+    release_p.add_argument("session_id")
+    release_p.add_argument("--reason", type=str, default=None)
+
+    embargo_p = sub.add_parser("embargo", help="Embargo a session until a future date")
+    embargo_p.add_argument("session_id")
+    embargo_p.add_argument("--until", required=True,
+                           help="Embargo-until date (YYYY-MM-DD or ISO 8601, must be future)")
+    embargo_p.add_argument("--reason", type=str, default=None)
+
+    hh_p = sub.add_parser("hold-history", help="Print the full hold-state timeline for a session")
+    hh_p.add_argument("session_id")
+
+    # Findings review
+    fnd_p = sub.add_parser("findings", help="List or decide findings for a session")
+    fnd_p.add_argument("session_id")
+    fnd_p.add_argument("--all", action="store_true", help="Show already-decided findings too")
+    fnd_p.add_argument("--accept", action="append", metavar="REF",
+                       help="Accept finding(s) by finding_id or entity_hash prefix")
+    fnd_p.add_argument("--ignore", action="append", metavar="REF",
+                       help="Ignore finding(s) by finding_id or entity_hash prefix")
+    fnd_p.add_argument("--accept-all", action="store_true",
+                       help="Accept every open finding in the session")
+    fnd_p.add_argument("--ignore-all", action="store_true",
+                       help="Ignore every open finding in the session")
+    fnd_p.add_argument("--accept-engine", metavar="NAME",
+                       help="Accept all open findings from a specific engine (e.g. regex_secrets)")
+    fnd_p.add_argument("--ignore-engine", metavar="NAME",
+                       help="Ignore all open findings from a specific engine")
+    fnd_p.add_argument("--reason", type=str, default=None)
+    fnd_p.add_argument("--global", dest="global_", action="store_true",
+                       help="With --ignore: also add the entity to the cross-session allowlist")
+
+    # Allowlist
+    al_p = sub.add_parser("allowlist", help="Manage the cross-session findings allowlist")
+    al_sub = al_p.add_subparsers(dest="op")
+    al_sub.add_parser("list", help="Show every allowlist entry")
+    al_add = al_sub.add_parser("add", help="Allowlist an entity (hashed locally, plaintext discarded)")
+    al_add.add_argument("entity_text")
+    al_add.add_argument("--type", dest="type", default=None,
+                        help="Entity type (jwt, email, etc.); NULL matches any type")
+    al_add.add_argument("--label", default=None, help="Short non-sensitive mnemonic")
+    al_add.add_argument("--reason", default=None)
+    al_rm = al_sub.add_parser("remove", help="Remove allowlist entry and revert/reassign findings")
+    al_rm.add_argument("allowlist_id", nargs="?", default=None)
+    al_rm.add_argument("--by-text", default=None, help="Hash plaintext locally and remove matching entries")
+    al_rm.add_argument("--type", dest="type", default=None,
+                       help="With --by-text: filter by entity_type")
 
     inbox_parser = sub.add_parser("inbox", help="List indexed sessions in terminal")
     inbox_parser.add_argument("--status", choices=["new", "shortlisted", "approved", "blocked"],
@@ -3169,7 +3229,41 @@ def main() -> None:
         return
 
     if command == "scan":
+        if args.force or args.all or args.session_ids:
+            from .cli_security import run_scan_force
+            run_scan_force(args)
+            return
         _run_scan(source_filter=args.source)
+        return
+
+    if command == "hold":
+        from .cli_security import run_hold
+        run_hold(args)
+        return
+
+    if command == "release":
+        from .cli_security import run_release
+        run_release(args)
+        return
+
+    if command == "embargo":
+        from .cli_security import run_embargo
+        run_embargo(args)
+        return
+
+    if command == "hold-history":
+        from .cli_security import run_hold_history
+        run_hold_history(args)
+        return
+
+    if command == "findings":
+        from .cli_security import run_findings
+        run_findings(args)
+        return
+
+    if command == "allowlist":
+        from .cli_security import run_allowlist
+        run_allowlist(args)
         return
 
     if command == "inbox":
@@ -3232,10 +3326,14 @@ def main() -> None:
         return
 
     if command == "pii-review":
+        from .cli_security import emit_legacy_pii_notice
+        emit_legacy_pii_notice()
         _run_pii_review(args)
         return
 
     if command == "pii-apply":
+        from .cli_security import emit_legacy_pii_notice
+        emit_legacy_pii_notice()
         _run_pii_apply(args)
         return
 

@@ -66,25 +66,65 @@ def server(index_setup):
     srv.shutdown()
 
 
-def _get(port, path):
+def _api_auth_headers() -> dict[str, str]:
+    """Read the per-install API token from ~/.clawjournal/api_token.
+
+    The test fixture monkeypatches `INDEX_DB` to the tmp path, and
+    `open_index()` bootstraps the token file there. We read it
+    directly — same path the daemon's auth check uses.
+    """
+    from pathlib import Path
+    from clawjournal.paths import API_TOKEN_FILENAME
+    from clawjournal.workbench.index import INDEX_DB
+    token_path = Path(str(INDEX_DB)).parent / API_TOKEN_FILENAME
+    return {"Authorization": f"Bearer {token_path.read_text().strip()}"}
+
+
+def _get(port, path, *, skip_auth=False):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
-    conn.request("GET", path)
+    headers = {} if skip_auth else _api_auth_headers()
+    conn.request("GET", path, headers=headers)
     resp = conn.getresponse()
     body = resp.read().decode()
     return resp.status, json.loads(body) if resp.getheader("Content-Type", "").startswith("application/json") else body
 
 
-def _get_raw(port, path):
+def _get_raw(port, path, *, skip_auth=False):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
-    conn.request("GET", path)
+    headers = {} if skip_auth else _api_auth_headers()
+    conn.request("GET", path, headers=headers)
     resp = conn.getresponse()
     return resp.status, resp.getheader("Content-Type", ""), resp.read()
 
 
-def _post(port, path, data=None):
+def _post(port, path, data=None, *, skip_auth=False):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(data or {}).encode()
-    conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if not skip_auth:
+        headers.update(_api_auth_headers())
+    conn.request("POST", path, body=body, headers=headers)
+    resp = conn.getresponse()
+    resp_body = resp.read().decode()
+    return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+def _patch(port, path, data=None, *, skip_auth=False):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(data or {}).encode()
+    headers = {"Content-Type": "application/json"}
+    if not skip_auth:
+        headers.update(_api_auth_headers())
+    conn.request("PATCH", path, body=body, headers=headers)
+    resp = conn.getresponse()
+    resp_body = resp.read().decode()
+    return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+def _delete(port, path, *, skip_auth=False):
+    conn = HTTPConnection("127.0.0.1", port, timeout=5)
+    headers = {} if skip_auth else _api_auth_headers()
+    conn.request("DELETE", path, headers=headers)
     resp = conn.getresponse()
     resp_body = resp.read().decode()
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
@@ -487,7 +527,21 @@ class TestShareAPI:
     """Tests for the share-to-GCS HTTP upload flow."""
 
     def _create_and_export_share(self, port):
-        """Helper: create a share and export it, return share_id."""
+        """Helper: create a share and export it, return share_id.
+
+        Releases the underlying sessions (`hold_state='released'`) so
+        the centralized upload gate in `upload_share` lets the share
+        through. Hosted upload requires released sessions since the
+        security refactor.
+        """
+        from clawjournal.workbench.index import open_index, set_hold_state
+        conn = open_index()
+        try:
+            for sid in ("sess-0", "sess-1"):
+                set_hold_state(conn, sid, "released", changed_by="user", reason="test")
+        finally:
+            conn.close()
+
         status, data = _post(port, "/api/shares", {
             "session_ids": ["sess-0", "sess-1"],
             "note": "Share test",

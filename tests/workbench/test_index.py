@@ -179,6 +179,19 @@ class TestUpsertSessions:
         assert row["outcome_badge"] is not None
         assert row["task_type"] is not None
 
+    def test_display_title_redacts_secrets(self, index_conn):
+        # The sessions row is a plaintext surface (API list views,
+        # search results). A user prompt that happens to contain a
+        # token must not leak verbatim into `display_title`.
+        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEF0123"
+        session = _make_session(content=f"deploy key: {token}")
+        upsert_sessions(index_conn, [session])
+        row = index_conn.execute(
+            "SELECT display_title FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert token not in row["display_title"]
+        assert "[REDACTED" in row["display_title"]
+
     def test_provenance_fields_stored(self, index_conn):
         session = _make_session()
         session["raw_source_path"] = "/path/to/session.jsonl"

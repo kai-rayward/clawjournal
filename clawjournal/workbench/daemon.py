@@ -26,6 +26,10 @@ from .. import __version__
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..config import CONFIG_DIR, load_config, save_config
+from .findings_pipeline import (
+    drain_findings_backfill,
+    run_findings_pipeline,
+)
 from .index import (
     add_policy,
     apply_share_redactions,
@@ -135,6 +139,11 @@ class Scanner:
             extra_usernames = config.get("redact_usernames", [])
             anonymizer = Anonymizer(extra_usernames=extra_usernames)
 
+            # Drain any sessions flagged by the security-refactor migration
+            # before running the normal parse/scan loop. Per-row updates so
+            # a crash mid-drain leaves remaining rows for the next tick.
+            drain_findings_backfill(conn, config=config)
+
             results: dict[str, int] = {}
             projects = discover_projects(source_filter=self.source_filter)
 
@@ -156,6 +165,18 @@ class Scanner:
                     if sessions:
                         new_count = upsert_sessions(conn, sessions)
                         results[source] = results.get(source, 0) + new_count
+                        # Drive each freshly-upserted session through the
+                        # findings pipeline. Settle-threshold + revision
+                        # check inside the driver keep this cheap on steady
+                        # state; errors per session don't abort the loop.
+                        for session in sessions:
+                            sid = session.get("session_id")
+                            if not sid:
+                                continue
+                            try:
+                                run_findings_pipeline(conn, sid, session, config=config)
+                            except Exception:
+                                logger.exception("Findings pipeline failed for %s", sid)
                 except Exception:
                     logger.exception("Error parsing project %s", project["dir_name"])
 
@@ -548,6 +569,20 @@ def upload_share(
             "status": 409,
         }
 
+    # Centralized release gate — every hosted-upload path reaches this
+    # helper, so CLI, quick-share, and direct upload endpoints cannot
+    # diverge (Decision 24). Non-`released` sessions are refused with
+    # a structured list of offending IDs and their effective state.
+    from .index import release_gate_blockers
+    session_ids = [s["session_id"] for s in share.get("sessions") or []]
+    blockers = release_gate_blockers(conn, session_ids)
+    if blockers:
+        return {
+            "error": "Share contains sessions that are not released",
+            "blockers": blockers,
+            "status": 409,
+        }
+
     # Re-export to ensure latest field filtering and secret redaction
     export_dir, manifest = export_share_to_disk(
         conn,
@@ -706,23 +741,74 @@ def upload_share(
 
 
 class WorkbenchHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the workbench API + static files."""
+    """HTTP request handler for the workbench API + static files.
+
+    Auth: every `/api/*` request requires an `Authorization: Bearer <token>`
+    header where `<token>` matches `~/.clawjournal/api_token`. Missing or
+    wrong tokens get a 401 with an empty body — no hint about what was
+    wrong. Non-`/api/*` paths (static files, health checks) bypass auth.
+    See docs/security-refactor.md §Daemon API surface.
+
+    Access logs go to `logger.debug` and receive only the format string
+    plus the request line; bodies, query strings, and the `Authorization`
+    header are never passed to the logger. If we ever need to log them
+    for debugging, scrub them first.
+    """
 
     _last_share_time: float = 0.0
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(format, *args)
 
+    def _check_api_auth(self) -> bool:
+        """Return True if the request is authorized for the API.
+
+        Non-`/api/*` routes bypass the check entirely (static files,
+        SPA fallback). Otherwise compare the bearer token against the
+        per-install `api_token`. Uses `secrets.compare_digest` to keep
+        the comparison constant-time.
+        """
+        from pathlib import Path as _Path
+        import secrets as _secrets
+
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            return True
+
+        try:
+            from ..paths import ensure_api_token
+            from .index import INDEX_DB as _INDEX_DB
+            expected = ensure_api_token(_Path(str(_INDEX_DB)).parent)
+        except Exception:
+            logger.exception("Could not resolve api_token for auth check")
+            return False
+
+        header = self.headers.get("Authorization") or ""
+        if not header.startswith("Bearer "):
+            return False
+        supplied = header[len("Bearer "):].strip()
+        return _secrets.compare_digest(supplied, expected)
+
+    def _reject_unauthenticated(self) -> None:
+        """Send a 401 with no body — never reveal what the auth state is."""
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_OPTIONS(self) -> None:
         self.send_response(200)
         origin = _cors_origin(self)
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._check_api_auth():
+            self._reject_unauthenticated()
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
@@ -734,6 +820,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             session_id = path[len("/api/sessions/"):-len("/redaction-report")]
             ai_pii = params.get("ai_pii", [""])[0] == "1"
             self._handle_redaction_report(session_id, ai_pii=ai_pii)
+        elif path.startswith("/api/sessions/") and path.endswith("/findings"):
+            session_id = path[len("/api/sessions/"):-len("/findings")]
+            self._handle_list_session_findings(session_id, params)
+        elif path.startswith("/api/sessions/") and path.endswith("/hold-history"):
+            session_id = path[len("/api/sessions/"):-len("/hold-history")]
+            self._handle_hold_history(session_id)
         elif path.startswith("/api/sessions/") and path.endswith("/redacted"):
             session_id = path[len("/api/sessions/"):-len("/redacted")]
             self._handle_session_redacted(session_id)
@@ -782,16 +874,25 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_policies()
         elif path == "/api/allowlist":
             self._handle_list_allowlist()
+        elif path == "/api/findings/allowlist":
+            self._handle_list_findings_allowlist()
         else:
             self._serve_static(parsed.path)
 
     def do_POST(self) -> None:
+        if not self._check_api_auth():
+            self._reject_unauthenticated()
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
         if path.startswith("/api/sessions/") and path.endswith("/score"):
             session_id = path[len("/api/sessions/"):-len("/score")]
             self._handle_score_session(session_id)
+        elif path.startswith("/api/sessions/") and path.endswith("/scan"):
+            session_id = path[len("/api/sessions/"):-len("/scan")]
+            self._handle_force_scan_session(session_id)
         elif path.startswith("/api/sessions/"):
             session_id = path[len("/api/sessions/"):]
             self._handle_update_session(session_id)
@@ -820,18 +921,40 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_add_policy()
         elif path == "/api/allowlist":
             self._handle_add_allowlist()
+        elif path == "/api/findings/allowlist":
+            self._handle_add_findings_allowlist()
         elif path == "/api/scan":
-            self._handle_trigger_scan()
+            force = parse_qs(parsed.query).get("force", [""])[0] in ("1", "true")
+            self._handle_trigger_scan(force=force)
+        else:
+            _json_response(self, {"error": "Not found"}, 404)
+
+    def do_PATCH(self) -> None:
+        if not self._check_api_auth():
+            self._reject_unauthenticated()
+            return
+
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        if path == "/api/findings":
+            self._handle_patch_findings()
         else:
             _json_response(self, {"error": "Not found"}, 404)
 
     def do_DELETE(self) -> None:
+        if not self._check_api_auth():
+            self._reject_unauthenticated()
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
         if path.startswith("/api/policies/"):
             policy_id = path[len("/api/policies/"):]
             self._handle_remove_policy(policy_id)
+        elif path.startswith("/api/findings/allowlist/"):
+            allowlist_id = path[len("/api/findings/allowlist/"):]
+            self._handle_remove_findings_allowlist(allowlist_id)
         elif path.startswith("/api/allowlist/"):
             entry_id = path[len("/api/allowlist/"):]
             self._handle_remove_allowlist(entry_id)
@@ -891,10 +1014,201 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 ai_value_badges=json.dumps(body["ai_value_badges"]) if isinstance(body.get("ai_value_badges"), list) else body.get("ai_value_badges"),
                 ai_risk_badges=json.dumps(body["ai_risk_badges"]) if isinstance(body.get("ai_risk_badges"), list) else body.get("ai_risk_badges"),
             )
+            # Hold-state transitions are separate from review-status updates
+            # — they pass through `set_hold_state` so the audit log and
+            # validation stay in one place.
+            hold_state = body.get("hold_state")
+            if hold_state is not None:
+                from .index import set_hold_state
+                try:
+                    ok = set_hold_state(
+                        conn, session_id, hold_state,
+                        changed_by="user",
+                        reason=body.get("reason"),
+                        embargo_until=body.get("embargo_until"),
+                    ) and ok
+                except ValueError as exc:
+                    _json_response(self, {"error": str(exc)}, 400)
+                    return
             if ok:
                 _json_response(self, {"ok": True})
             else:
                 _json_response(self, {"error": "Session not found"}, 404)
+        finally:
+            conn.close()
+
+    # --- Findings endpoints ---
+
+    def _handle_list_session_findings(self, session_id: str, params: dict) -> None:
+        from ..findings import (
+            dedupe_findings_by_entity,
+            derive_preview,
+            load_findings_from_db,
+        )
+        from .index import read_blob
+
+        group_by = params.get("group_by", [""])[0] == "entity"
+        status_filter_raw = params.get("status", [""])[0]
+        status_filter = {status_filter_raw} if status_filter_raw else None
+
+        conn = open_index()
+        try:
+            findings = load_findings_from_db(conn, session_id, status_filter=status_filter)
+            blob = read_blob(session_id)
+            if group_by:
+                groups = dedupe_findings_by_entity(findings)
+                # Attach a masked preview per group, derived from the blob —
+                # never persisted, never carries the matched text.
+                for group in groups:
+                    sample_id = group["finding_ids"][0] if group["finding_ids"] else None
+                    sample_finding = next(
+                        (f for f in findings if f.finding_id == sample_id),
+                        None,
+                    )
+                    if blob is not None and sample_finding is not None:
+                        group["sample_preview"] = derive_preview(blob, sample_finding)
+                    else:
+                        group["sample_preview"] = {
+                            "before": "", "after": "", "match_placeholder": "[...]",
+                        }
+                _json_response(self, {"total": len(groups), "entities": groups})
+                return
+
+            out: list[dict[str, Any]] = []
+            for finding in findings:
+                entry = {
+                    "finding_id": finding.finding_id,
+                    "engine": finding.engine,
+                    "rule": finding.rule,
+                    "entity_type": finding.entity_type,
+                    "entity_hash": finding.entity_hash,
+                    "entity_length": finding.entity_length,
+                    "field": finding.field,
+                    "message_index": finding.message_index,
+                    "tool_field": finding.tool_field,
+                    "offset": finding.offset,
+                    "length": finding.length,
+                    "confidence": finding.confidence,
+                    "status": finding.status,
+                    "decided_by": finding.decided_by,
+                    "decided_at": finding.decided_at,
+                    "decision_reason": finding.decision_reason,
+                }
+                if blob is not None:
+                    entry["preview"] = derive_preview(blob, finding)
+                out.append(entry)
+            _json_response(self, {"total": len(out), "findings": out})
+        finally:
+            conn.close()
+
+    def _handle_patch_findings(self) -> None:
+        from ..findings import set_finding_status
+
+        body = _read_body(self) or {}
+        finding_ids = body.get("finding_ids") or []
+        status = body.get("status")
+        if status not in ("accepted", "ignored"):
+            _json_response(self, {"error": "status must be 'accepted' or 'ignored'"}, 400)
+            return
+        if not isinstance(finding_ids, list) or not finding_ids:
+            _json_response(self, {"error": "finding_ids must be a non-empty list"}, 400)
+            return
+
+        reason = body.get("reason")
+        make_global = bool(body.get("global", False)) and status == "ignored"
+
+        conn = open_index()
+        try:
+            updated = set_finding_status(
+                conn, finding_ids, status,
+                reason=reason, also_allowlist=make_global,
+            )
+            conn.commit()
+            _json_response(self, {"updated": updated, "allowlisted": bool(make_global)})
+        finally:
+            conn.close()
+
+    def _handle_hold_history(self, session_id: str) -> None:
+        from .index import get_hold_history
+
+        conn = open_index()
+        try:
+            history = get_hold_history(conn, session_id)
+            _json_response(self, {"total": len(history), "history": history})
+        finally:
+            conn.close()
+
+    def _handle_force_scan_session(self, session_id: str) -> None:
+        from ..config import load_config
+        from .findings_pipeline import run_findings_pipeline
+        from .index import read_blob
+
+        blob = read_blob(session_id)
+        if blob is None:
+            _json_response(self, {"error": "Session blob not available"}, 404)
+            return
+        conn = open_index()
+        try:
+            result = run_findings_pipeline(
+                conn, session_id, blob, config=dict(load_config()), force=True,
+            )
+            _json_response(self, result)
+        finally:
+            conn.close()
+
+    # --- Findings allowlist endpoints ---
+
+    def _handle_list_findings_allowlist(self) -> None:
+        from ..findings import allowlist_list
+
+        conn = open_index()
+        try:
+            entries = list(allowlist_list(conn))
+            _json_response(self, {"total": len(entries), "entries": entries})
+        finally:
+            conn.close()
+
+    def _handle_add_findings_allowlist(self) -> None:
+        from ..findings import allowlist_add
+
+        body = _read_body(self) or {}
+        entity_text = body.get("entity_text")
+        if not isinstance(entity_text, str) or not entity_text:
+            _json_response(self, {"error": "entity_text is required"}, 400)
+            return
+        conn = open_index()
+        try:
+            entry, retro, retro_sessions = allowlist_add(
+                conn,
+                entity_text=entity_text,
+                entity_type=body.get("entity_type"),
+                entity_label=body.get("entity_label"),
+                reason=body.get("reason"),
+            )
+            conn.commit()
+            _json_response(self, {
+                "entry": dict(entry),
+                "retroactive_updates": retro,
+                "retroactive_sessions": retro_sessions,
+            })
+        finally:
+            conn.close()
+
+    def _handle_remove_findings_allowlist(self, allowlist_id: str) -> None:
+        from ..findings import allowlist_remove
+
+        conn = open_index()
+        try:
+            removed, reverted, reassigned = allowlist_remove(conn, allowlist_id)
+            if not removed:
+                _json_response(self, {"error": "allowlist entry not found"}, 404)
+                return
+            conn.commit()
+            _json_response(self, {
+                "removed": True,
+                "reverted": reverted,
+                "reassigned": reassigned,
+            })
         finally:
             conn.close()
 
@@ -1515,13 +1829,43 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _handle_trigger_scan(self) -> None:
-        """Trigger an immediate scan (used by the UI refresh button)."""
+    def _handle_trigger_scan(self, *, force: bool = False) -> None:
+        """Trigger an immediate scan (used by the UI refresh button).
+
+        With `force=true`, rebuilds findings for every session in the DB
+        after the normal scan pass. Functionally equivalent to
+        `clawjournal scan --force --all` — useful when the frontend needs
+        to pick up an engine/allowlist change without shelling out.
+        """
         scanner = getattr(self.server, "_scanner", None)
         if scanner:
             results = scanner.scan_once()
             scanner.trigger_auto_score()
-            _json_response(self, {"ok": True, "new_sessions": results})
+            payload: dict[str, Any] = {"ok": True, "new_sessions": results}
+            if force:
+                from ..config import load_config as _load_config
+                from .findings_pipeline import run_findings_pipeline
+                from .index import read_blob
+                conn = open_index()
+                processed = 0
+                errored: list[dict[str, Any]] = []
+                try:
+                    rows = conn.execute("SELECT session_id FROM sessions").fetchall()
+                    cfg = dict(_load_config())
+                    for row in rows:
+                        sid = row["session_id"]
+                        blob = read_blob(sid)
+                        if blob is None:
+                            continue
+                        try:
+                            run_findings_pipeline(conn, sid, blob, config=cfg, force=True)
+                            processed += 1
+                        except Exception as exc:  # noqa: BLE001
+                            errored.append({"session_id": sid, "error": str(exc)})
+                finally:
+                    conn.close()
+                payload["force_rescan"] = {"processed": processed, "errored": errored}
+            _json_response(self, payload)
         else:
             _json_response(self, {"error": "Scanner not available"}, 503)
 
@@ -1568,6 +1912,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         try:
             data = file_path.read_bytes()
+            # Inject the per-install API token into index.html bootstrap
+            # so same-origin frontend fetches can reach `/api/*` without
+            # the user having to handle it. The token is loopback-only
+            # and the HTML is served over the same connection, so this
+            # never leaves the local machine. JS code reads the value
+            # via `window.__CLAWJOURNAL_API_TOKEN__`.
+            if content_type == "text/html" and b"__CLAWJOURNAL_API_TOKEN__" not in data:
+                try:
+                    from pathlib import Path as _Path
+                    from ..paths import ensure_api_token
+                    from .index import INDEX_DB as _INDEX_DB
+                    token = ensure_api_token(_Path(str(_INDEX_DB)).parent)
+                    safe = token.replace("\\", "\\\\").replace('"', '\\"')
+                    injection = (
+                        f'<script>window.__CLAWJOURNAL_API_TOKEN__="{safe}";</script>'
+                    ).encode()
+                    if b"</head>" in data:
+                        data = data.replace(b"</head>", injection + b"</head>", 1)
+                    else:
+                        data = injection + data
+                except Exception:
+                    logger.exception("Failed to inject API token into index.html")
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))

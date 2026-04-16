@@ -1,8 +1,27 @@
-"""Detect and redact secrets in conversation data."""
+"""Detect and redact secrets in conversation data.
+
+Two surfaces coexist:
+
+1. **Legacy mutate-in-place API** (`scan_text`, `redact_session`, etc.).
+   Still used by the parse path and by `apply_share_redactions` during
+   the transition. Works on session dicts directly, returns the
+   redacted copy plus a metadata-only log.
+
+2. **DB-backed findings API** (`scan_session_for_findings`,
+   `apply_findings_to_blob`). Emits `RawFinding` records keyed on
+   offsets into anonymized field content so the Scanner can persist
+   salted hashes and the share-time apply shim can re-scan, consult
+   per-entity status, and produce byte-equivalent output to the
+   legacy path when every decision is open/accepted.
+"""
 
 import math
 import re
+import sqlite3
+from collections.abc import Iterable
 from typing import Any
+
+from ..findings import RawFinding, hash_entity
 
 REDACTED = "[REDACTED]"
 
@@ -612,3 +631,240 @@ def redact_session(
             break  # Verification pass found nothing new
 
     return session, total, all_log
+
+
+# ---------------------------------------------------------------------------
+# DB-backed findings: scan → RawFinding records, apply via DB status lookup.
+# ---------------------------------------------------------------------------
+
+SECRETS_ENGINE_ID = "regex_secrets"
+
+
+def _iter_text_locations(
+    session: dict,
+) -> Iterable[tuple[str, str, int | None, str | None, str, str]]:
+    """Yield every (text, field, message_index, tool_field, parent_path, parent_key).
+
+    `parent_path`/`parent_key` let apply_findings_to_blob write the
+    redacted value back into the right slot — either None (meaning
+    replace the top-level scalar `session[field]`) or a path locating
+    the leaf inside a `tool_uses[i]` dict/list.
+
+    Field-name convention matches `derive_preview`'s parser in
+    findings.py: top-level fields use their own name (`display_title`,
+    `project`, `git_branch`); per-message string fields use `content`
+    or `thinking`; tool_use strings use `tool_uses[<idx>].<branch>` or
+    `tool_uses[<idx>].<branch>.<key>` when nested under a dict.
+    """
+    # (text, field, message_index, tool_field)
+    # parent_path / parent_key indicate how to write back; emitted as
+    # (text, field, message_index, tool_field, "write_kind", "write_key")
+    # where write_kind ∈ {"top", "msg", "tool_str", "tool_dict"}.
+    for field in ("display_title", "project", "git_branch"):
+        val = session.get(field)
+        if isinstance(val, str) and val:
+            yield val, field, None, None, "top", field
+
+    for msg_idx, msg in enumerate(session.get("messages", []) or []):
+        if not isinstance(msg, dict):
+            continue
+        for field in ("content", "thinking"):
+            val = msg.get(field)
+            if isinstance(val, str) and val:
+                yield val, field, msg_idx, None, "msg", field
+        for tool_idx, tool_use in enumerate(msg.get("tool_uses", []) or []):
+            if not isinstance(tool_use, dict):
+                continue
+            for branch in ("input", "output"):
+                val = tool_use.get(branch)
+                if isinstance(val, str) and val:
+                    yield (
+                        val,
+                        f"tool_uses[{tool_idx}].{branch}",
+                        msg_idx,
+                        branch,
+                        "tool_str",
+                        f"{tool_idx}:{branch}",
+                    )
+                elif isinstance(val, dict):
+                    for key, nested in val.items():
+                        if isinstance(nested, str) and nested:
+                            yield (
+                                nested,
+                                f"tool_uses[{tool_idx}].{branch}.{key}",
+                                msg_idx,
+                                branch,
+                                "tool_dict",
+                                f"{tool_idx}:{branch}:{key}",
+                            )
+
+
+def _dedupe_overlapping_matches(matches: list[dict]) -> list[dict]:
+    """Keep the longest/highest-confidence match per overlapping region.
+
+    Mirrors `redact_text`'s "descending start + non-overlap" dedupe, but
+    runs at scan time so each text region emits one finding. This keeps
+    entity-level decisions coherent: ignoring a JWT also suppresses the
+    overlapping `jwt_partial` that shares the same bytes.
+    """
+    if not matches:
+        return []
+    ordered = sorted(
+        matches,
+        key=lambda m: (-(m["end"] - m["start"]), -m["confidence"], m["start"]),
+    )
+    kept: list[dict] = []
+    for candidate in ordered:
+        overlaps = any(
+            candidate["start"] < existing["end"] and candidate["end"] > existing["start"]
+            for existing in kept
+        )
+        if not overlaps:
+            kept.append(candidate)
+    kept.sort(key=lambda m: m["start"])
+    return kept
+
+
+def scan_session_for_findings(
+    session: dict,
+    *,
+    user_allowlist: list[dict] | None = None,
+) -> list[RawFinding]:
+    """Deterministic-engine scan that returns `RawFinding` records.
+
+    Same pattern/allowlist semantics as `scan_text`; the caller
+    (Scanner) hashes each match and persists the hash via
+    `write_findings_to_db`. Offsets are into the anonymized field
+    content as a Python `str` (code points), matching
+    `derive_preview`'s expectation. Per-text overlapping matches
+    collapse to one finding so entity-level decisions stay coherent.
+    """
+    findings: list[RawFinding] = []
+    for text, field, msg_idx, tool_field, _write_kind, _write_key in _iter_text_locations(session):
+        raw_matches = scan_text(text, user_allowlist=user_allowlist)
+        for match in _dedupe_overlapping_matches(raw_matches):
+            findings.append(RawFinding(
+                engine=SECRETS_ENGINE_ID,
+                rule=match["type"],
+                entity_type=match["type"],
+                entity_text=match["match"],
+                field=field,
+                offset=match["start"],
+                length=match["end"] - match["start"],
+                confidence=match["confidence"],
+                message_index=msg_idx,
+                tool_field=tool_field,
+            ))
+    return findings
+
+
+def _secret_map_from_text_decisions(
+    text: str,
+    decisions: dict[str, str],
+    user_allowlist: list[dict] | None,
+) -> dict[str, str]:
+    """Build a replace-map for one text value, skipping ignored hashes.
+
+    `decisions` maps `entity_hash → status`; `scan_text` findings whose
+    hash lands in `ignored` are dropped. Capture-group-style patterns
+    (env_secret, etc.) keep their inner-group expansion so byte-
+    equivalent output to `_build_redaction_set` is preserved when all
+    statuses are open/accepted.
+    """
+    secret_map: dict[str, str] = {}
+    raw_matches = scan_text(text, user_allowlist=user_allowlist)
+    # Same dedupe the scan path uses — keeps entity-level decisions
+    # coherent: if a user ignored the longer match, the overlapping
+    # shorter one can't be picked up by the redact-for-safety path.
+    for finding in _dedupe_overlapping_matches(raw_matches):
+        matched = finding["match"]
+        entity_hash = hash_entity(matched)
+        status = decisions.get(entity_hash)
+        if status == "ignored":
+            continue
+        placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
+        secret_map.setdefault(matched, placeholder)
+        for _name, pattern in SECRET_PATTERNS:
+            if _name == finding["type"]:
+                inner = pattern.search(text[finding["start"]:finding["end"]])
+                if inner and inner.lastindex:
+                    secret_map.setdefault(inner.group(inner.lastindex), placeholder)
+                break
+    return secret_map
+
+
+def apply_findings_to_blob(
+    blob: dict,
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    user_allowlist: list[dict] | None = None,
+    max_passes: int = 3,
+) -> tuple[dict, int]:
+    """Re-scan the blob, apply decisions from the `findings` table.
+
+    For each match, compute salted hash and look up status in
+    `findings` by `(session_id, entity_hash)`. `ignored` → leave alone;
+    `open`/`accepted` → replace with the engine placeholder. Both the
+    `regex_secrets` and `regex_pii` engines are applied; their replace
+    maps merge before the actual substitution pass. Passes sweep the
+    full blob repeatedly (bounded by `max_passes`) to catch secrets
+    revealed by earlier replacements. Byte-equivalent to `redact_session`
+    when only secrets are present and every decision is open/accepted.
+    """
+    # Decisions are engine-agnostic at the apply step — same hash, same
+    # answer. The pipeline guarantees that hashes are unique per
+    # (session, entity), so collapsing to a single dict is safe.
+    decision_rows = conn.execute(
+        "SELECT entity_hash, status FROM findings WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    decisions: dict[str, str] = {row["entity_hash"]: row["status"] for row in decision_rows}
+
+    # Lazy import to avoid pii.py → secrets.py import cycle.
+    from .pii import pii_secret_map_from_text_decisions
+
+    total = 0
+    for pass_num in range(max_passes):
+        # Build a global replace map from every text location's current state.
+        secret_map: dict[str, str] = {}
+        for text, _f, _m, _tf, _wk, _wkey in _iter_text_locations(blob):
+            secret_map.update(
+                _secret_map_from_text_decisions(text, decisions, user_allowlist)
+            )
+            secret_map.update(
+                pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
+            )
+        if not secret_map:
+            break
+
+        pass_count = 0
+        for field in ("display_title", "project", "git_branch"):
+            val = blob.get(field)
+            if isinstance(val, str) and val:
+                blob[field], n = _apply_redaction_set(val, secret_map)
+                pass_count += n
+
+        for msg in blob.get("messages", []) or []:
+            if not isinstance(msg, dict):
+                continue
+            for field in ("content", "thinking"):
+                val = msg.get(field)
+                if isinstance(val, str) and val:
+                    msg[field], n = _apply_redaction_set(val, secret_map)
+                    pass_count += n
+            for tool_use in msg.get("tool_uses", []) or []:
+                if not isinstance(tool_use, dict):
+                    continue
+                for branch in ("input", "output"):
+                    val = tool_use.get(branch)
+                    if val is None:
+                        continue
+                    tool_use[branch], n = _apply_to_value(val, secret_map)
+                    pass_count += n
+
+        total += pass_count
+        if pass_count == 0 and pass_num > 0:
+            break
+
+    return blob, total

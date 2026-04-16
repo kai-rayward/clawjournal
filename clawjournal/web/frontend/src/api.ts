@@ -11,6 +11,12 @@ import type {
   AllowlistEntry,
   InsightsData,
   AdvisorData,
+  Finding,
+  FindingEntityGroup,
+  FindingStatus,
+  FindingsAllowlistEntry,
+  HoldHistoryEntry,
+  HoldState,
 } from './types.ts';
 
 const BASE = '/api';
@@ -23,8 +29,32 @@ class ApiError extends Error {
   }
 }
 
+declare global {
+  interface Window {
+    __CLAWJOURNAL_API_TOKEN__?: string;
+  }
+}
+
+function authHeader(): Record<string, string> {
+  // The daemon injects the per-install API token into index.html at
+  // serve time; same-origin fetches pick it up here. No token → no
+  // header → 401 (expected on non-daemon-hosted dev setups).
+  const token = typeof window !== 'undefined' ? window.__CLAWJOURNAL_API_TOKEN__ : '';
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
+  const headers: Record<string, string> = { ...authHeader() };
+  if (init?.headers) {
+    const extra = init.headers as Record<string, string>;
+    for (const key of Object.keys(extra)) {
+      headers[key] = extra[key];
+    }
+  }
+  const res = await fetch(`${BASE}${path}`, { ...init, headers });
+  if (res.status === 204) {
+    return undefined as T;
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
@@ -70,12 +100,27 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
     },
 
-    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string }): Promise<{ ok: boolean }> {
+    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
       return request(`/sessions/${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+    },
+
+    findings(id: string, opts: { groupBy?: 'entity'; status?: FindingStatus } = {}): Promise<{ total: number; entities?: FindingEntityGroup[]; findings?: Finding[] }> {
+      const params: Record<string, string> = {};
+      if (opts.groupBy) params.group_by = opts.groupBy;
+      if (opts.status) params.status = opts.status;
+      return request(`/sessions/${encodeURIComponent(id)}/findings${qs(params)}`);
+    },
+
+    holdHistory(id: string): Promise<{ total: number; history: HoldHistoryEntry[] }> {
+      return request(`/sessions/${encodeURIComponent(id)}/hold-history`);
+    },
+
+    forceScan(id: string): Promise<{ status: string; revision?: string; count?: number }> {
+      return request(`/sessions/${encodeURIComponent(id)}/scan`, { method: 'POST' });
     },
 
     score(id: string, body?: { backend?: string; model?: string }): Promise<{
@@ -224,7 +269,45 @@ export const api = {
     return request(`/advisor${qs(params)}`);
   },
 
-  scan(): Promise<{ ok: boolean; new_sessions: Record<string, number> }> {
-    return request('/scan', { method: 'POST' });
+  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; new_sessions: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
+    const path = opts.force ? '/scan?force=true' : '/scan';
+    return request(path, { method: 'POST' });
+  },
+
+  findings: {
+    patch(findingIds: string[], status: 'accepted' | 'ignored', opts: { reason?: string; global?: boolean } = {}): Promise<{ updated: number; allowlisted: boolean }> {
+      return request('/findings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          finding_ids: findingIds,
+          status,
+          reason: opts.reason,
+          global: opts.global,
+        }),
+      });
+    },
+
+    allowlist: {
+      list(): Promise<{ total: number; entries: FindingsAllowlistEntry[] }> {
+        return request('/findings/allowlist');
+      },
+
+      add(body: { entity_text: string; entity_type?: string | null; entity_label?: string | null; reason?: string | null }): Promise<{
+        entry: FindingsAllowlistEntry;
+        retroactive_updates: number;
+        retroactive_sessions: number;
+      }> {
+        return request('/findings/allowlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      },
+
+      remove(id: string): Promise<{ removed: boolean; reverted: number; reassigned: number }> {
+        return request(`/findings/allowlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      },
+    },
   },
 };

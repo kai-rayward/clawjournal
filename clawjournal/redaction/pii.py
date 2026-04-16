@@ -1,4 +1,12 @@
-"""PII review/apply helpers for exported ClawJournal JSONL files."""
+"""LLM-assisted and rule-based PII review for exported ClawJournal bundles.
+
+The file-based `PIIFinding` substrate (type, placeholders, load/write
+helpers, apply functions) lives in `clawjournal.findings` and is
+re-exported below for back-compat. Only the LLM-review + rule-scan
+machinery still lives in this module — it predates the DB-backed
+findings flow and remains the path for `pii-review` / `pii-apply`
+until LLM-PII gets a no-plaintext deterministic apply design.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +16,22 @@ import tempfile
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
+from ..findings import (
+    ALLOWED_ENTITY_TYPES,
+    PIIFinding,
+    PLACEHOLDER_BY_TYPE,
+    RawFinding,
+    apply_findings_to_session,
+    apply_findings_to_text,
+    hash_entity,
+    load_findings,
+    merge_findings,
+    normalize_finding,
+    replacement_for_type,
+    write_findings,
+)
 from ..scoring.backends import (
     BACKEND_CHOICES,
     PROMPTS_DIR,
@@ -17,45 +39,28 @@ from ..scoring.backends import (
     run_default_agent_task,
 )
 
+__all__ = [
+    "ALLOWED_ENTITY_TYPES",
+    "PII_ENGINE_ID",
+    "PIIFinding",
+    "PLACEHOLDER_BY_TYPE",
+    "apply_findings_to_session",
+    "apply_findings_to_text",
+    "load_findings",
+    "load_jsonl_sessions",
+    "merge_findings",
+    "normalize_finding",
+    "replacement_for_type",
+    "review_session_pii",
+    "review_session_pii_hybrid",
+    "review_session_pii_with_agent",
+    "scan_session_for_pii_findings",
+    "scan_text_for_pii",
+    "write_findings",
+    "write_jsonl_sessions",
+]
 
 MAX_LLM_TEXT_CHARS = 12000
-
-
-class PIIFinding(TypedDict, total=False):
-    session_id: str
-    message_index: int
-    field: str
-    entity_text: str
-    entity_type: str
-    confidence: float
-    reason: str
-    replacement: str
-    source: str
-
-
-PLACEHOLDER_BY_TYPE: dict[str, str] = {
-    "person_name": "[REDACTED_NAME]",
-    "email": "[REDACTED_EMAIL]",
-    "phone": "[REDACTED_PHONE]",
-    "username": "[REDACTED_USERNAME]",
-    "user_id": "[REDACTED_USER_ID]",
-    "org_name": "[REDACTED_ORG]",
-    "project_name": "[REDACTED_PROJECT]",
-    "private_url": "[REDACTED_URL]",
-    "domain": "[REDACTED_DOMAIN]",
-    "address": "[REDACTED_ADDRESS]",
-    "location": "[REDACTED_LOCATION]",
-    "bot_name": "[REDACTED_BOT]",
-    "device_id": "[REDACTED_DEVICE_ID]",
-    "path": "[REDACTED_PATH]",
-    "custom_sensitive": "[REDACTED]",
-}
-
-ALLOWED_ENTITY_TYPES = set(PLACEHOLDER_BY_TYPE) | {"custom_sensitive"}
-
-
-def replacement_for_type(entity_type: str) -> str:
-    return PLACEHOLDER_BY_TYPE.get(entity_type, "[REDACTED]")
 
 
 def load_jsonl_sessions(path: Path) -> list[dict[str, Any]]:
@@ -73,147 +78,6 @@ def write_jsonl_sessions(path: Path, sessions: Iterable[dict[str, Any]]) -> None
     with open(path, "w", encoding="utf-8") as f:
         for session in sessions:
             f.write(json.dumps(session, ensure_ascii=False) + "\n")
-
-
-def load_findings(path: Path) -> list[PIIFinding]:
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict) and "findings" in data:
-        raw = data["findings"]
-    else:
-        raw = data
-    if not isinstance(raw, list):
-        raise ValueError("Findings file must contain a list or an object with a 'findings' list.")
-    return [normalize_finding(item) for item in raw]
-
-
-def write_findings(path: Path, findings: list[PIIFinding], meta: dict[str, Any] | None = None) -> None:
-    payload: dict[str, Any] = {"findings": findings}
-    if meta:
-        payload.update(meta)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def normalize_finding(finding: dict[str, Any]) -> PIIFinding:
-    entity_type = str(finding.get("entity_type") or "custom_sensitive")
-    entity_text = str(finding.get("entity_text") or "")
-    replacement = str(finding.get("replacement") or replacement_for_type(entity_type))
-    confidence = finding.get("confidence", 1.0)
-    try:
-        confidence = float(confidence)
-    except (TypeError, ValueError):
-        confidence = 1.0
-    return PIIFinding(
-        session_id=str(finding.get("session_id") or ""),
-        message_index=int(finding.get("message_index") or 0),
-        field=str(finding.get("field") or "content"),
-        entity_text=entity_text,
-        entity_type=entity_type,
-        confidence=max(0.0, min(1.0, confidence)),
-        reason=str(finding.get("reason") or ""),
-        replacement=replacement,
-        source=str(finding.get("source") or "rule"),
-    )
-
-
-def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> list[PIIFinding]:
-    filtered = [f for f in findings if f.get("entity_text") and float(f.get("confidence", 0.0)) >= min_confidence]
-    grouped: dict[tuple[str, int, str], list[PIIFinding]] = {}
-    for finding in filtered:
-        key = (finding.get("session_id", ""), int(finding.get("message_index", 0)), finding.get("field", "content"))
-        grouped.setdefault(key, []).append(finding)
-
-    merged: list[PIIFinding] = []
-    for items in grouped.values():
-        items.sort(key=lambda f: (-len(f.get("entity_text", "")), -float(f.get("confidence", 0.0)), f.get("entity_type", "")))
-        chosen: list[PIIFinding] = []
-        for item in items:
-            text = item.get("entity_text", "")
-            text_lower = text.lower()
-            if any(text_lower == existing.get("entity_text", "").lower() for existing in chosen):
-                continue
-            if any(text_lower in existing.get("entity_text", "").lower() for existing in chosen):
-                continue
-            chosen.append(item)
-        merged.extend(chosen)
-    return sorted(merged, key=lambda f: (f.get("session_id", ""), int(f.get("message_index", 0)), f.get("field", "content"), -len(f.get("entity_text", ""))))
-
-
-def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, int]:
-    if not text or not findings:
-        return text, 0
-    ordered = sorted(
-        [f for f in findings if f.get("entity_text")],
-        key=lambda f: (-len(f.get("entity_text", "")), -float(f.get("confidence", 0.0))),
-    )
-    count = 0
-    result = text
-    for finding in ordered:
-        target = finding.get("entity_text", "")
-        replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
-        if len(target) < 3:
-            continue
-        escaped = re.escape(target)
-        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
-        result, n = pattern.subn(replacement, result)
-        count += n
-    return result, count
-
-
-def apply_findings_to_session(session: dict[str, Any], findings: list[PIIFinding], min_confidence: float = 0.0) -> tuple[dict[str, Any], int]:
-    total = 0
-    session_id = str(session.get("session_id") or "")
-
-    # Collect all unique entity findings for this session (across all fields)
-    session_findings = [
-        f for f in merge_findings(findings, min_confidence=min_confidence)
-        if f.get("session_id") == session_id
-    ]
-    if not session_findings:
-        return session, 0
-
-    # Apply every finding to every text field in the session, not just the
-    # specific field where it was detected.  PII entities (usernames, names,
-    # tokens) typically appear across multiple fields.
-
-    # Apply to top-level metadata fields
-    for meta_field in ("project", "git_branch", "display_title"):
-        value = session.get(meta_field)
-        if isinstance(value, str):
-            new_value, n = apply_findings_to_text(value, session_findings)
-            session[meta_field] = new_value
-            total += n
-
-    messages = session.get("messages", [])
-    if not isinstance(messages, list):
-        return session, 0
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        for field in ("content", "thinking"):
-            value = msg.get(field)
-            if isinstance(value, str):
-                new_value, n = apply_findings_to_text(value, session_findings)
-                msg[field] = new_value
-                total += n
-        for tool_use in msg.get("tool_uses", []):
-            if not isinstance(tool_use, dict):
-                continue
-            for branch in ("input", "output"):
-                value = tool_use.get(branch)
-                if isinstance(value, dict):
-                    for key in list(value.keys()):
-                        if isinstance(value[key], str):
-                            new_value, n = apply_findings_to_text(value[key], session_findings)
-                            value[key] = new_value
-                            total += n
-                elif isinstance(value, str):
-                    new_value, n = apply_findings_to_text(value, session_findings)
-                    tool_use[branch] = new_value
-                    total += n
-    return session, total
 
 
 def _truncate_for_llm(text: str, max_chars: int = MAX_LLM_TEXT_CHARS) -> str:
@@ -702,3 +566,195 @@ def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
                     field = f"tool_uses[{tool_index}].{branch}"
                     findings.extend(_scan_text_for_pii(session_id, i, field, value))
     return merge_findings(findings)
+
+
+# ---------------------------------------------------------------------------
+# DB-backed findings adapter (regex_pii engine)
+#
+# Mirrors `clawjournal.redaction.secrets.scan_session_for_findings` so the
+# findings pipeline can persist hashed PII matches and the share-time apply
+# path can rebuild redactions deterministically from per-entity decisions.
+# ---------------------------------------------------------------------------
+
+PII_ENGINE_ID = "regex_pii"
+
+
+# (rule_name, compiled_pattern, entity_type, confidence, capture_group, kind)
+# `kind` drives the GitHub-orgs skiplist; it is opaque to the substrate.
+_PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, int, str]] = [
+    ("github_url_username", re.compile(r"github\.com/([A-Za-z0-9_.-]{2,})"), "username", 0.85, 1, "github"),
+    ("github_raw_url_username", re.compile(r"raw\.githubusercontent\.com/([A-Za-z0-9_.-]{2,})"), "username", 0.85, 1, "github"),
+    ("email", re.compile(r"([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"), "email", 0.90, 1, "plain"),
+    ("email_truncated", re.compile(r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)"), "email", 0.75, 1, "plain"),
+    ("telegram_bot_token", re.compile(r"(\d{8,}:[A-Za-z0-9_-]{30,})"), "custom_sensitive", 0.95, 1, "plain"),
+    ("personal_hostname", re.compile(r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b"), "device_id", 0.80, 1, "plain"),
+    ("home_dir_path", re.compile(r"(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})"), "path", 0.85, 1, "plain"),
+    ("private_ip_10", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
+    ("private_ip_172", re.compile(r"\b(172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
+    ("private_ip_192", re.compile(r"\b(192\.168\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
+]
+
+_PII_METADATA_Q = r'\\?"'
+_PII_METADATA_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float]] = [
+    ("meta_username", re.compile(rf'{_PII_METADATA_Q}username{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "username", 0.98),
+    ("meta_sender_id", re.compile(rf'{_PII_METADATA_Q}sender_id{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "user_id", 0.98),
+    ("meta_user_chat_id", re.compile(rf'{_PII_METADATA_Q}(?:user_id|chat_id|account_id|sender_id|from_id){_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "user_id", 0.95),
+    ("meta_numeric_id", re.compile(rf'{_PII_METADATA_Q}id{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}(\d{{5,}}){_PII_METADATA_Q}'), "user_id", 0.75),
+    ("meta_name", re.compile(rf'{_PII_METADATA_Q}name{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "person_name", 0.82),
+    ("meta_sender", re.compile(rf'{_PII_METADATA_Q}sender{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "person_name", 0.82),
+    ("meta_label", re.compile(rf'{_PII_METADATA_Q}label{_PII_METADATA_Q}\s*:\s*{_PII_METADATA_Q}([^"\\]{{3,}}){_PII_METADATA_Q}'), "person_name", 0.75),
+]
+
+
+def _pii_should_skip(entity_text: str, entity_type: str, kind: str) -> bool:
+    if not entity_text or len(entity_text) < 3:
+        return True
+    if entity_text.startswith("[") and entity_text.endswith("]"):
+        return True
+    if kind == "github" and entity_text.lower() in _GITHUB_URL_PUBLIC_ORGS:
+        return True
+    if entity_type == "email" and entity_text.lower().startswith(("noreply@", "no-reply@")):
+        return True
+    return False
+
+
+def _pii_user_allowlist_skip(matched_text: str, entity_type: str,
+                             user_allowlist: list[dict] | None) -> bool:
+    """Same shape as secrets._check_user_allowlist; kept local to avoid
+    cross-imports."""
+    if not user_allowlist:
+        return False
+    for entry in user_allowlist:
+        etype = entry.get("type", "exact")
+        if etype == "exact" and entry.get("text") == matched_text:
+            return True
+        if etype == "category" and entry.get("match_type") == entity_type:
+            return True
+        if etype == "pattern":
+            regex = entry.get("regex", "")
+            if regex:
+                try:
+                    if re.search(regex, matched_text):
+                        return True
+                except re.error:
+                    pass
+    return False
+
+
+def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
+    """Find PII matches in `text`. Same return shape as `secrets.scan_text`:
+    `[{type, rule, match, start, end, confidence}, ...]`. Offsets are
+    Python codepoint indices into `text` (matches `derive_preview`)."""
+    if not text:
+        return []
+
+    matches: list[dict] = []
+    for rule_name, pattern, entity_type, confidence, group, kind in _PII_CONTENT_PATTERNS_COMPILED:
+        for m in pattern.finditer(text):
+            try:
+                entity_text = m.group(group)
+            except IndexError:
+                continue
+            if entity_text is None:
+                continue
+            if _pii_should_skip(entity_text, entity_type, kind):
+                continue
+            if _pii_user_allowlist_skip(entity_text, entity_type, user_allowlist):
+                continue
+            matches.append({
+                "type": entity_type,
+                "rule": rule_name,
+                "match": entity_text,
+                "start": m.start(group),
+                "end": m.end(group),
+                "confidence": confidence,
+            })
+
+    for rule_name, pattern, entity_type, confidence in _PII_METADATA_PATTERNS_COMPILED:
+        for m in pattern.finditer(text):
+            try:
+                entity_text = m.group(1)
+            except IndexError:
+                continue
+            if entity_text is None:
+                continue
+            if _pii_should_skip(entity_text, entity_type, "plain"):
+                continue
+            if _pii_user_allowlist_skip(entity_text, entity_type, user_allowlist):
+                continue
+            matches.append({
+                "type": entity_type,
+                "rule": rule_name,
+                "match": entity_text,
+                "start": m.start(1),
+                "end": m.end(1),
+                "confidence": confidence,
+            })
+
+    return matches
+
+
+def _dedupe_overlapping_pii(matches: list[dict]) -> list[dict]:
+    """Same span-overlap dedupe as secrets._dedupe_overlapping_matches.
+    Multiple PII patterns can match the same span (e.g. `email` and
+    `email_truncated`); the longest/highest-confidence match wins."""
+    if not matches:
+        return []
+    ordered = sorted(
+        matches,
+        key=lambda m: (-(m["end"] - m["start"]), -m["confidence"], m["start"]),
+    )
+    kept: list[dict] = []
+    for cand in ordered:
+        if any(cand["start"] < ex["end"] and cand["end"] > ex["start"] for ex in kept):
+            continue
+        kept.append(cand)
+    kept.sort(key=lambda m: m["start"])
+    return kept
+
+
+def scan_session_for_pii_findings(
+    session: dict,
+    *,
+    user_allowlist: list[dict] | None = None,
+) -> list[RawFinding]:
+    """Mirror of `secrets.scan_session_for_findings` for the regex_pii
+    engine. Iterates the same `_iter_text_locations` (imported lazily to
+    avoid a circular import) so field/offset semantics line up across
+    engines."""
+    from .secrets import _iter_text_locations  # local — secrets already imports findings
+
+    findings: list[RawFinding] = []
+    for text, field, msg_idx, tool_field, _wk, _wkey in _iter_text_locations(session):
+        raw = scan_text_for_pii(text, user_allowlist=user_allowlist)
+        for match in _dedupe_overlapping_pii(raw):
+            findings.append(RawFinding(
+                engine=PII_ENGINE_ID,
+                rule=match["rule"],
+                entity_type=match["type"],
+                entity_text=match["match"],
+                field=field,
+                offset=match["start"],
+                length=match["end"] - match["start"],
+                confidence=match["confidence"],
+                message_index=msg_idx,
+                tool_field=tool_field,
+            ))
+    return findings
+
+
+def pii_secret_map_from_text_decisions(
+    text: str,
+    decisions: dict[str, str],
+    user_allowlist: list[dict] | None,
+) -> dict[str, str]:
+    """Return a `plaintext -> placeholder` map for one text value, dropping
+    matches whose hashed entity is `ignored` in `decisions`. Used by
+    `apply_findings_to_blob` to merge engines into a single replace pass."""
+    out: dict[str, str] = {}
+    for match in _dedupe_overlapping_pii(scan_text_for_pii(text, user_allowlist=user_allowlist)):
+        matched = match["match"]
+        if decisions.get(hash_entity(matched)) == "ignored":
+            continue
+        out.setdefault(matched, replacement_for_type(match["type"]))
+    return out

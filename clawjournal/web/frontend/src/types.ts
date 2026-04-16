@@ -1,3 +1,5 @@
+export type HoldState = 'auto_redacted' | 'pending_review' | 'released' | 'embargoed';
+
 export interface Session {
   session_id: string;
   project: string;
@@ -40,6 +42,84 @@ export interface Session {
   parent_session_id: string | null;
   subagent_session_ids: string | null;
   user_interrupts: number | null;
+  hold_state: HoldState | null;
+  embargo_until: string | null;
+  findings_revision: string | null;
+}
+
+export type FindingStatus = 'open' | 'accepted' | 'ignored';
+
+export interface FindingPreview {
+  before: string;
+  after: string;
+  match_placeholder: string;
+  field?: string;
+  message_index?: number;
+}
+
+/** A single persisted finding row. Never carries raw match text — only the salted hash. */
+export interface Finding {
+  finding_id: string;
+  engine: string;
+  rule: string | null;
+  entity_type: string | null;
+  entity_hash: string;
+  entity_length: number;
+  field: string;
+  /** Diagnostic offsets only. DO NOT index content by these — Python code points
+   * and JS UTF-16 do not agree on astral characters. Use `preview` strings. */
+  message_index: number | null;
+  tool_field: string | null;
+  offset: number;
+  length: number;
+  confidence: number;
+  status: FindingStatus;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_reason: string | null;
+  preview?: FindingPreview;
+}
+
+/** Grouped finding — one row per distinct `(engine, entity_type, entity_hash)`. */
+export interface FindingEntityGroup {
+  engine: string;
+  rule: string | null;
+  entity_type: string | null;
+  entity_hash: string;
+  entity_length: number;
+  occurrences: number;
+  finding_ids: string[];
+  max_confidence: number;
+  status: FindingStatus;
+  sample: {
+    field: string;
+    message_index: number | null;
+    tool_field: string | null;
+    offset: number;
+    length: number;
+  };
+  sample_preview?: FindingPreview;
+}
+
+export interface FindingsAllowlistEntry {
+  allowlist_id: string;
+  entity_type: string | null;
+  entity_label: string | null;
+  scope: string;
+  reason: string | null;
+  added_by: string;
+  added_at: string;
+}
+
+export interface HoldHistoryEntry {
+  history_id: string;
+  session_id: string;
+  from_state: HoldState | null;
+  to_state: HoldState;
+  embargo_until: string | null;
+  changed_by: 'auto' | 'user' | 'migration';
+  changed_at: string;
+  reason: string | null;
 }
 
 export interface SessionDetail extends Session {

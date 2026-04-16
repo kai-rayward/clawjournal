@@ -12,12 +12,21 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+from ..redaction.secrets import redact_text
 from ..scoring.badges import compute_all_badges
 from ..config import CONFIG_DIR, load_config, normalize_excluded_project_names
+from ..paths import ensure_install_files
 from ..pricing import estimate_cost
 
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
+
+# Schema version sentinel. Bumped once for the security refactor (findings,
+# allowlist, hold-state history, per-session security columns). The prior
+# bundles→shares migration uses version 1; the security migration advances
+# PRAGMA user_version to 2 and is gated atomically on that comparison.
+SECURITY_SCHEMA_VERSION = 2
+BACKFILL_WINDOW = 100
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -89,6 +98,63 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time);
 CREATE INDEX IF NOT EXISTS idx_share_sessions_session_id ON share_sessions(session_id);
+
+CREATE TABLE IF NOT EXISTS findings (
+    finding_id         TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    engine             TEXT NOT NULL,
+    rule               TEXT,
+    entity_type        TEXT,
+    entity_hash        TEXT NOT NULL,
+    entity_length      INTEGER,
+    field              TEXT NOT NULL,
+    message_index      INTEGER,
+    tool_field         TEXT,
+    offset             INTEGER NOT NULL,
+    length             INTEGER NOT NULL,
+    confidence         REAL,
+    status             TEXT DEFAULT 'open',
+    decided_by         TEXT,
+    decision_source_id TEXT,
+    decided_at         TEXT,
+    decision_reason    TEXT,
+    revision           TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_findings_session ON findings(session_id);
+CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+CREATE INDEX IF NOT EXISTS idx_findings_revision ON findings(session_id, revision);
+CREATE INDEX IF NOT EXISTS idx_findings_entity_hash ON findings(session_id, entity_hash);
+
+CREATE TABLE IF NOT EXISTS findings_allowlist (
+    allowlist_id   TEXT PRIMARY KEY,
+    entity_type    TEXT,
+    entity_hash    TEXT NOT NULL,
+    entity_label   TEXT,
+    scope          TEXT NOT NULL DEFAULT 'global',
+    reason         TEXT,
+    added_by       TEXT NOT NULL,
+    added_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_findings_allowlist_hash ON findings_allowlist(entity_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_allowlist_typed
+    ON findings_allowlist(entity_type, entity_hash, scope)
+    WHERE entity_type IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_allowlist_any_type
+    ON findings_allowlist(entity_hash, scope)
+    WHERE entity_type IS NULL;
+
+CREATE TABLE IF NOT EXISTS session_hold_history (
+    history_id     TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    from_state     TEXT,
+    to_state       TEXT NOT NULL,
+    embargo_until  TEXT,
+    changed_by     TEXT NOT NULL,
+    changed_at     TEXT NOT NULL,
+    reason         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hold_history_session ON session_hold_history(session_id, changed_at);
 """
 
 FTS_SCHEMA_SQL = """
@@ -121,6 +187,12 @@ def open_index() -> sqlite3.Connection:
     """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     BLOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Bootstrap per-install salt and API token before any DB-backed code
+    # runs so every hash computed against this DB is salted consistently.
+    # Files land next to the DB so test-time monkeypatching of INDEX_DB
+    # keeps them isolated to the test directory.
+    ensure_install_files(Path(str(INDEX_DB)).parent)
 
     conn = sqlite3.connect(str(INDEX_DB), timeout=30)
     conn.row_factory = sqlite3.Row
@@ -190,7 +262,86 @@ def open_index() -> sqlite3.Connection:
             if "duplicate column" not in str(e):
                 raise
 
+    _migrate_security_refactor(conn)
+
     return conn
+
+
+def _migrate_security_refactor(conn: sqlite3.Connection) -> None:
+    """Add findings/hold-state columns + bounded backfill flagging.
+
+    Advances PRAGMA user_version 1 → 2. Runs once: adds
+    `hold_state`, `embargo_until`, `findings_revision`,
+    `findings_backfill_needed` to `sessions`; backfills
+    `hold_state` from `review_status`; inserts an origin
+    `session_hold_history` row per existing session; flags the
+    `BACKFILL_WINDOW` most-recently-active sessions for the
+    Scanner to pick up. Everything runs inside one transaction —
+    partial migration rolls back, so re-running reruns the full
+    step cleanly (see Decision 13).
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= SECURITY_SCHEMA_VERSION:
+        return
+
+    now = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for col, col_type in [
+            ("hold_state", "TEXT DEFAULT 'auto_redacted'"),
+            ("embargo_until", "TEXT"),
+            ("findings_revision", "TEXT"),
+            ("findings_backfill_needed", "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+
+        # Backfill hold_state from review_status for rows that existed
+        # before the column was added. The column default handles
+        # future inserts; here we map the one semantic transition we
+        # can recover (approved → released).
+        conn.execute(
+            "UPDATE sessions SET hold_state = 'released' "
+            "WHERE review_status = 'approved' AND (hold_state IS NULL OR hold_state = 'auto_redacted')"
+        )
+        conn.execute(
+            "UPDATE sessions SET hold_state = 'auto_redacted' WHERE hold_state IS NULL"
+        )
+
+        # One origin history row per existing session.
+        rows = conn.execute(
+            "SELECT session_id, hold_state FROM sessions"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "INSERT INTO session_hold_history "
+                "(history_id, session_id, from_state, to_state, embargo_until, "
+                " changed_by, changed_at, reason) "
+                "VALUES (?, ?, NULL, ?, NULL, 'migration', ?, 'schema migration backfill')",
+                (str(uuid.uuid4()), row["session_id"], row["hold_state"], now),
+            )
+
+        # Flag the most-recently-active sessions for the Scanner to
+        # backfill. Older sessions remain unflagged — users invoke
+        # `scan --force` to pick them up explicitly.
+        conn.execute(
+            "UPDATE sessions SET findings_backfill_needed = 1 "
+            "WHERE session_id IN ("
+            "  SELECT session_id FROM sessions "
+            "  ORDER BY COALESCE(end_time, '') DESC LIMIT ?"
+            ")",
+            (BACKFILL_WINDOW,),
+        )
+
+        conn.execute(f"PRAGMA user_version = {SECURITY_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
@@ -785,6 +936,24 @@ def _write_blob(session_id: str, session: dict[str, Any]) -> Path:
     return blob_path
 
 
+def read_blob(session_id: str) -> dict[str, Any] | None:
+    """Return the stored session blob as a dict, or None if missing/unreadable.
+
+    Used by the findings backfill drain and share-time apply — they
+    need the already-anonymized blob text to re-scan or re-apply
+    without re-parsing from the source.
+    """
+    blob_path = BLOBS_DIR / f"{session_id}.json"
+    if not blob_path.exists():
+        return None
+    try:
+        with open(blob_path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read blob for session %s", session_id)
+        return None
+
+
 def _resolve_estimated_cost(
     existing: sqlite3.Row | None,
     *,
@@ -854,6 +1023,12 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         if display_title.startswith("/") and " " not in display_title.strip():
             continue
 
+        # The sessions row is a plaintext surface — list views, search,
+        # API responses all return `display_title` directly. Strip any
+        # regex_secrets match before persisting so the body of a prompt
+        # that happens to contain `ghp_...` doesn't leak into the DB.
+        display_title, _, _ = redact_text(display_title)
+
         # Check if session already exists and capture fields we need to preserve
         existing = conn.execute(
             "SELECT session_id, review_status, reviewed_at, "
@@ -917,8 +1092,16 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
             cache_creation_tokens=cache_create,
         )
 
+        # Non-destructive upsert. INSERT OR REPLACE would delete the
+        # existing row first, which cascades through findings and
+        # session_hold_history via ON DELETE CASCADE. ON CONFLICT DO
+        # UPDATE changes the columns we want refreshed without
+        # touching the row identity, leaving cascading children
+        # intact. Fields we want preserved on update (review state,
+        # AI metadata, linkage, hold state, findings_revision, etc.)
+        # are simply absent from the SET clause.
         conn.execute(
-            """INSERT OR REPLACE INTO sessions (
+            """INSERT INTO sessions (
                 session_id, project, source, model,
                 start_time, end_time, duration_seconds,
                 git_branch,
@@ -942,7 +1125,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 segment_reason,
                 client_origin, runtime_channel, outer_session_id,
                 estimated_cost_usd,
-                tool_counts, user_interrupts
+                tool_counts, user_interrupts,
+                hold_state
             ) VALUES (
                 ?, ?, ?, ?,
                 ?, ?, ?,
@@ -967,8 +1151,45 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 ?,
                 ?, ?, ?,
                 ?,
-                ?, ?
-            )""",
+                ?, ?,
+                'auto_redacted'
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                project = excluded.project,
+                source = excluded.source,
+                model = excluded.model,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                duration_seconds = excluded.duration_seconds,
+                git_branch = excluded.git_branch,
+                user_messages = excluded.user_messages,
+                assistant_messages = excluded.assistant_messages,
+                tool_uses = excluded.tool_uses,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                display_title = excluded.display_title,
+                outcome_badge = excluded.outcome_badge,
+                value_badges = excluded.value_badges,
+                risk_badges = excluded.risk_badges,
+                sensitivity_score = excluded.sensitivity_score,
+                task_type = excluded.task_type,
+                files_touched = excluded.files_touched,
+                commands_run = excluded.commands_run,
+                blob_path = excluded.blob_path,
+                raw_source_path = excluded.raw_source_path,
+                updated_at = excluded.updated_at,
+                parent_session_id = COALESCE(excluded.parent_session_id, parent_session_id),
+                segment_index = excluded.segment_index,
+                segment_start_message = excluded.segment_start_message,
+                segment_end_message = excluded.segment_end_message,
+                segment_reason = excluded.segment_reason,
+                client_origin = excluded.client_origin,
+                runtime_channel = excluded.runtime_channel,
+                outer_session_id = excluded.outer_session_id,
+                estimated_cost_usd = excluded.estimated_cost_usd,
+                tool_counts = excluded.tool_counts,
+                user_interrupts = excluded.user_interrupts
+            """,
             (
                 session_id, project, source, session.get("model"),
                 session.get("start_time"), session.get("end_time"), duration,
@@ -1019,6 +1240,19 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 stats.get("user_interrupts", 0),
             ),
         )
+
+        # For brand-new sessions, stamp an origin hold-history row
+        # in the same implicit transaction so every session is
+        # guaranteed to have a timeline row from the moment it
+        # exists (see Decision 18 + §session_hold_history).
+        if is_new:
+            conn.execute(
+                "INSERT INTO session_hold_history "
+                "(history_id, session_id, from_state, to_state, embargo_until, "
+                " changed_by, changed_at, reason) "
+                "VALUES (?, ?, NULL, 'auto_redacted', NULL, 'auto', ?, NULL)",
+                (str(uuid.uuid4()), session_id, now),
+            )
 
         # Insert FTS entry
         if has_fts:
@@ -1293,6 +1527,202 @@ def update_session(
     )
     conn.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Hold-state lifecycle
+# ---------------------------------------------------------------------------
+
+HOLD_STATES = frozenset({"auto_redacted", "pending_review", "released", "embargoed"})
+
+
+def set_hold_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+    to_state: str,
+    *,
+    changed_by: str,
+    reason: str | None = None,
+    embargo_until: str | None = None,
+) -> bool:
+    """Transition a session's hold_state, appending a history row.
+
+    Validates the target state and its required fields (`embargoed`
+    requires `embargo_until` in the future). `sessions.hold_state` and
+    the `session_hold_history` insert happen inside one transaction
+    so the denormalized cache and the audit log never disagree.
+
+    Returns True on success, False if the session is missing. Invalid
+    state transitions raise `ValueError`.
+    """
+    if to_state not in HOLD_STATES:
+        raise ValueError(f"invalid hold_state: {to_state!r}")
+    if to_state == "embargoed":
+        if not embargo_until:
+            raise ValueError("embargoed requires embargo_until (ISO 8601)")
+        try:
+            parsed = datetime.fromisoformat(embargo_until)
+        except ValueError as exc:
+            raise ValueError(f"embargo_until is not ISO 8601: {embargo_until!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if parsed <= datetime.now(timezone.utc):
+            raise ValueError("embargo_until must be in the future; use release instead")
+    else:
+        embargo_until = None
+
+    row = conn.execute(
+        "SELECT hold_state, embargo_until FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return False
+
+    now = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE sessions SET hold_state = ?, embargo_until = ?, updated_at = ? "
+            "WHERE session_id = ?",
+            (to_state, embargo_until, now, session_id),
+        )
+        conn.execute(
+            "INSERT INTO session_hold_history "
+            "(history_id, session_id, from_state, to_state, embargo_until, "
+            " changed_by, changed_at, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), session_id, row["hold_state"], to_state,
+             embargo_until, changed_by, now, reason),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
+def get_hold_history(
+    conn: sqlite3.Connection, session_id: str,
+) -> list[dict[str, Any]]:
+    """Return the full hold-state timeline for a session, oldest first."""
+    rows = conn.execute(
+        "SELECT history_id, session_id, from_state, to_state, embargo_until, "
+        "       changed_by, changed_at, reason "
+        "FROM session_hold_history WHERE session_id = ? "
+        "ORDER BY changed_at ASC",
+        (session_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def release_gate_blockers(
+    conn: sqlite3.Connection, session_ids: list[str],
+    *, now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return sessions whose effective hold_state blocks hosted upload.
+
+    A session is blocked unless its effective hold_state is `released`
+    (Decision 24). Auto-expired embargoes pass through via
+    `effective_hold_state`. Returns `[]` when every session clears.
+    Callers surface the result as a share-time error.
+    """
+    if not session_ids:
+        return []
+    placeholders = ",".join("?" * len(session_ids))
+    rows = conn.execute(
+        f"SELECT session_id, hold_state, embargo_until FROM sessions "
+        f"WHERE session_id IN ({placeholders})",
+        session_ids,
+    ).fetchall()
+    seen = {r["session_id"]: r for r in rows}
+    blockers: list[dict[str, Any]] = []
+    for sid in session_ids:
+        row = seen.get(sid)
+        if row is None:
+            blockers.append({"session_id": sid, "hold_state": "missing"})
+            continue
+        effective = effective_hold_state(row["hold_state"], row["embargo_until"], now=now)
+        if effective != "released":
+            blockers.append({
+                "session_id": sid,
+                "hold_state": effective,
+                "embargo_until": row["embargo_until"],
+            })
+    return blockers
+
+
+def build_session_redactions_summary(
+    conn: sqlite3.Connection, session_id: str,
+) -> dict[str, Any]:
+    """Aggregate findings counts per engine/rule/type for the share manifest.
+
+    Produces the `redactions` block defined in docs/security-refactor.md
+    §Bundle manifest provenance — aggregated counts only, no hashes,
+    plaintext, or offsets. `applied` covers rows the share-time apply
+    shim will redact (`open` or `accepted`); `ignored` covers rows
+    skipped (`decided_by='allowlist'` gets the explicit `via: allowlist`
+    tag so downstream reviewers can tell user-authored skips apart).
+    """
+    rev_row = conn.execute(
+        "SELECT findings_revision FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    findings_revision = rev_row["findings_revision"] if rev_row else None
+
+    rows = conn.execute(
+        "SELECT engine, rule, entity_type, status, decided_by, COUNT(*) AS n "
+        "FROM findings WHERE session_id = ? "
+        "GROUP BY engine, rule, entity_type, status, decided_by",
+        (session_id,),
+    ).fetchall()
+
+    applied: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    for row in rows:
+        entry = {
+            "engine": row["engine"],
+            "rule": row["rule"],
+            "entity_type": row["entity_type"],
+            "count": row["n"],
+        }
+        if row["status"] == "ignored":
+            if row["decided_by"] == "allowlist":
+                entry["via"] = "allowlist"
+            else:
+                entry["via"] = "user"
+            ignored.append(entry)
+        else:
+            applied.append(entry)
+
+    return {
+        "findings_revision": findings_revision,
+        "applied": applied,
+        "ignored": ignored,
+    }
+
+
+def effective_hold_state(
+    hold_state: str | None, embargo_until: str | None,
+    *, now: datetime | None = None,
+) -> str:
+    """Return the operational hold_state, accounting for embargo expiry.
+
+    An embargoed session whose `embargo_until <= now` is treated as
+    `released` at share time without any DB mutation (Decision 3).
+    Callers that gate on the effective state (share/upload) should use
+    this; UI/audit surfaces read the raw column directly.
+    """
+    state = hold_state or "auto_redacted"
+    if state != "embargoed" or not embargo_until:
+        return state
+    try:
+        parsed = datetime.fromisoformat(embargo_until)
+    except ValueError:
+        return state
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return "released" if parsed <= current else state
 
 
 def query_unscored_sessions(
@@ -2157,6 +2587,11 @@ def export_share_to_disk(
                         "project": s.get("project"),
                         "source": s.get("source"),
                         "model": s.get("model"),
+                        # Aggregated counts per §Bundle manifest provenance —
+                        # no hashes, plaintext, or offsets.
+                        "redactions": build_session_redactions_summary(
+                            conn, s["session_id"],
+                        ),
                     })
         os.replace(tmp_sessions_file, sessions_file)
     except BaseException:

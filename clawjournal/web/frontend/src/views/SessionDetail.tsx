@@ -6,6 +6,9 @@ import { BadgeChip } from '../components/BadgeChip.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { RedactionReportPanel } from '../components/RedactionReportPanel.tsx';
+import { FindingsReviewPanel } from '../components/FindingsReviewPanel.tsx';
+import { HoldStateBanner } from '../components/HoldStateBanner.tsx';
+import { HoldHistoryTimeline } from '../components/HoldHistoryTimeline.tsx';
 import { colors, btnGhost } from '../theme.ts';
 
 /* ------------------------------------------------------------------ */
@@ -310,6 +313,9 @@ export default function SessionDetail() {
 
   const [userRating, setUserRating] = useState<number | null>(null);
   const [scoring, setScoring] = useState(false);
+
+  // Bumped after hold-state transitions so HoldHistoryTimeline re-fetches.
+  const [holdRefreshKey, setHoldRefreshKey] = useState(0);
 
   // Refs for scroll targets
   const msgRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -671,6 +677,27 @@ export default function SessionDetail() {
               );
             })}
           </div>
+        </Section>
+
+        <Section title="Hold state">
+          <HoldStateBanner
+            session={{
+              session_id: session.session_id,
+              hold_state: session.hold_state,
+              embargo_until: session.embargo_until,
+            }}
+            onChange={() => {
+              setHoldRefreshKey((k) => k + 1);
+              if (id) {
+                api.sessions.get(id).then(setSession).catch((e) => setError(e.message));
+              }
+            }}
+          />
+          <HoldHistoryTimeline sessionId={id!} refreshKey={holdRefreshKey} />
+        </Section>
+
+        <Section title="Findings">
+          <FindingsReviewPanel sessionId={id!} />
         </Section>
 
         <Section title="Redaction Report">
