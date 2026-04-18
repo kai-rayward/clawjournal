@@ -459,18 +459,35 @@ class TestShares:
         assert share["session_count"] == 0
 
     def test_share_history_and_share_ready_recommendations(self, index_conn):
+        # Recommendations require 5-star quality in the last 7 days. Use
+        # `datetime.now()` so the window is always satisfied; the existing
+        # in-memory DB has no clock dependency otherwise.
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
         upsert_sessions(index_conn, [
-            _make_session("s1", start_time="2025-01-01T00:00:00+00:00"),
-            _make_session("s2", start_time="2025-01-02T00:00:00+00:00"),
-            _make_session("s3", start_time="2025-01-03T00:00:00+00:00"),
+            _make_session(
+                "s1",
+                start_time=(now - timedelta(days=3)).isoformat(),
+                end_time=(now - timedelta(days=3, minutes=-10)).isoformat(),
+            ),
+            _make_session(
+                "s2",
+                start_time=(now - timedelta(days=2)).isoformat(),
+                end_time=(now - timedelta(days=2, minutes=-10)).isoformat(),
+            ),
+            _make_session(
+                "s3",
+                start_time=(now - timedelta(days=1)).isoformat(),
+                end_time=(now - timedelta(days=1, minutes=-10)).isoformat(),
+            ),
         ])
         for sid in ("s1", "s2", "s3"):
-            update_session(index_conn, sid, status="approved")
+            update_session(index_conn, sid, status="approved", ai_quality_score=5)
 
         shared_share_id = create_share(index_conn, ["s1"])
         index_conn.execute(
             "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
-            ("2025-01-04T00:00:00+00:00", shared_share_id),
+            (now.isoformat(), shared_share_id),
         )
         newer_share_id = create_share(index_conn, ["s1", "s2"])
         index_conn.commit()
@@ -483,15 +500,24 @@ class TestShares:
 
         stats = get_share_ready_stats(index_conn)
         assert [s["session_id"] for s in stats["sessions"]] == ["s3", "s2"]
+        # Recommendation is the same ordered list (recent 5-star, capped 5).
         assert stats["recommended_session_ids"] == ["s3", "s2"]
 
     def test_share_ready_respects_excluded_project_rules(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
         upsert_sessions(index_conn, [
-            _make_session("private", project="claude:private-repo", start_time="2025-01-02T00:00:00+00:00"),
-            _make_session("public", project="claude:public-repo", start_time="2025-01-03T00:00:00+00:00"),
+            _make_session(
+                "private", project="claude:private-repo",
+                start_time=(now - timedelta(days=2)).isoformat(),
+            ),
+            _make_session(
+                "public", project="claude:public-repo",
+                start_time=(now - timedelta(days=1)).isoformat(),
+            ),
         ])
-        update_session(index_conn, "private", status="approved")
-        update_session(index_conn, "public", status="approved")
+        update_session(index_conn, "private", status="approved", ai_quality_score=5)
+        update_session(index_conn, "public", status="approved", ai_quality_score=5)
         add_policy(index_conn, "exclude_project", "private-repo")
 
         settings = get_effective_share_settings(index_conn, {"excluded_projects": []})

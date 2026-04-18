@@ -592,6 +592,72 @@ _PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, i
     ("private_ip_10", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
     ("private_ip_172", re.compile(r"\b(172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
     ("private_ip_192", re.compile(r"\b(192\.168\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
+
+    # -----------------------------------------------------------------
+    # Added rules — promoted from the AI layer because they show up
+    # repeatedly across the user's traces (project names, private URLs,
+    # cloud resource ids, personal identifiers that resist name-entity
+    # recognition but have distinctive shape).
+    # -----------------------------------------------------------------
+
+    # MAC address, colon or hyphen separated.
+    ("mac_address", re.compile(r"\b((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})\b"), "device_id", 0.95, 1, "plain"),
+
+    # US SSN. Excludes obvious placeholders (000-xx-xxxx, 666-xx-xxxx,
+    # 9xx-xx-xxxx, xx-00-xxxx, xx-xx-0000).
+    ("ssn_us", re.compile(r"\b((?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4})\b"), "custom_sensitive", 0.90, 1, "plain"),
+
+    # E.164-style phone number. Low confidence — false-positive prone
+    # against long version numbers, so keep it below the review
+    # threshold; the aggregate summary still surfaces the count.
+    ("phone_e164", re.compile(r"(?<!\d)(\+\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{2,4}[-.\s]?\d{3,9})(?!\d)"), "custom_sensitive", 0.55, 1, "plain"),
+
+    # Hostnames ending in common private TLDs: `.local`, `.internal`,
+    # `.corp`, `.lan`, `.intranet`, `.localnet`. Covers intranet hosts
+    # that escape the private-IP rules.
+    ("internal_tld_host", re.compile(r"\b([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.(?:local|internal|corp|lan|intranet|localnet))\b", re.IGNORECASE), "private_url", 0.80, 1, "plain"),
+
+    # URLs pointing at RFC1918 addresses (full URL, preserves path /
+    # query so the user sees the whole private endpoint redacted).
+    ("private_ip_url", re.compile(r"(https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d{2,5})?(?:/[^\s\"'`<>]*)?)"), "private_url", 0.90, 1, "plain"),
+
+    # `localhost` URLs — often carry auth tokens or internal paths that
+    # shouldn't leak. Kept separate from the RFC1918 rule for clarity.
+    ("localhost_url", re.compile(r"(https?://(?:localhost|127\.0\.0\.1)(?::\d{2,5})?(?:/[^\s\"'`<>]*)?)"), "private_url", 0.85, 1, "plain"),
+
+    # npm-style scoped package: `@scope/pkg`.
+    ("npm_scoped_package", re.compile(r"(?<![A-Za-z0-9])(@[a-z0-9][a-z0-9-]{1,38}/[a-z0-9][a-z0-9._-]{1,63})\b"), "project_name", 0.70, 1, "plain"),
+
+    # `name@semver` — catches the `project@1.2.3` shape. Requires a
+    # proper 3-part semver to minimise false positives against email
+    # addresses and timestamps.
+    ("package_at_version", re.compile(r"(?<![A-Za-z0-9@])([a-z][a-z0-9-]{2,}(?:/[a-z][a-z0-9-]+)?@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b"), "project_name", 0.65, 1, "plain"),
+
+    # GitHub `owner/repo` slug. The existing github_url_username rule
+    # catches the owner; this rule captures owner-and-repo so the
+    # project name is redacted as a unit.
+    ("github_repo_slug", re.compile(r"github\.com/([A-Za-z0-9._-]{2,39}/[A-Za-z0-9._-]{1,100})(?![A-Za-z0-9])"), "project_name", 0.80, 1, "github"),
+
+    # Same for GitLab and Bitbucket.
+    ("gitlab_repo_slug", re.compile(r"gitlab\.com/([A-Za-z0-9._-]{2,39}(?:/[A-Za-z0-9._-]+){1,4})(?![A-Za-z0-9])"), "project_name", 0.80, 1, "plain"),
+    ("bitbucket_repo_slug", re.compile(r"bitbucket\.org/([A-Za-z0-9._-]{2,39}/[A-Za-z0-9._-]+)(?![A-Za-z0-9])"), "project_name", 0.80, 1, "plain"),
+
+    # AWS resource ARN — always contains a 12-digit account id plus a
+    # resource path; both are identifying.
+    ("aws_arn", re.compile(r"(arn:aws:[a-z0-9-]+:[a-z0-9-]*:\d{12}:[^\s\"'`<>]+)"), "custom_sensitive", 0.95, 1, "plain"),
+
+    # AWS account id embedded in an ECR registry hostname.
+    ("aws_account_ecr", re.compile(r"\b(\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com)\b"), "custom_sensitive", 0.95, 1, "plain"),
+
+    # GCP project id in the `projects/xxx` form (CLI output, IAM refs,
+    # bucket/topic URLs).
+    ("gcp_project_id", re.compile(r"projects/([a-z][a-z0-9-]{4,28}[a-z0-9])(?![A-Za-z0-9])"), "project_name", 0.80, 1, "plain"),
+
+    # Credit-card-shaped PANs (13–19 digits, optional space or hyphen
+    # separators). No Luhn check — set low confidence to keep it below
+    # the review threshold, but redact aggressively since the cost of
+    # leaking a real number outweighs a false positive.
+    ("credit_card", re.compile(r"(?<!\d)((?:\d[ -]?){12,18}\d)(?!\d)"), "custom_sensitive", 0.60, 1, "plain"),
 ]
 
 _PII_METADATA_Q = r'\\?"'
