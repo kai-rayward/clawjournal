@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import type { Policy } from '../types.ts';
 import { api } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import { Spinner } from '../components/Spinner.tsx';
-import { ShareTabs } from '../components/ShareTabs.tsx';
 import { colors, inputStyle as baseInputStyle } from '../theme.ts';
 
 const POLICY_TYPE_OPTIONS: { label: string; value: string }[] = [
@@ -85,7 +85,9 @@ export function Policies() {
 
   return (
     <div style={{ padding: '24px', maxWidth: '960px', margin: '0 auto' }}>
-      <ShareTabs />
+      <div style={{ marginBottom: 16 }}>
+        <Link to="/share" style={{ fontSize: 12.5, color: colors.gray500, textDecoration: 'none' }}>&larr; Back to share</Link>
+      </div>
       <h2 style={{ margin: '0 0 4px', fontSize: '20px', fontWeight: 600, color: colors.gray900 }}>Redaction rules</h2>
       <p style={{ fontSize: 14, color: colors.gray500, margin: '0 0 20px 0' }}>Configure redaction and exclusion filters for shared traces</p>
 

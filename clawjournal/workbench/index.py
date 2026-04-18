@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -2457,6 +2457,32 @@ def get_share_ready_stats(
         if s.get("model"):
             models.add(s["model"])
     approved_sessions = [s for s in sessions if s.get("review_status") == "approved"]
+
+    # Default recommendation: 5 five-star approved traces, prioritising the
+    # last 7 days but falling back to older 5-star traces if the recent
+    # window is thin. Never mix in <5-star — quality matters more than
+    # recency here. The sessions list is already sorted start_time DESC so
+    # iterating preserves recency within each tier.
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+
+    def _is_recent(start_time: str | None) -> bool:
+        if not start_time:
+            return False
+        try:
+            ts = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts >= recent_cutoff
+
+    five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
+    five_star_recent = [s for s in five_star if _is_recent(s.get("start_time"))]
+    five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
+    # Recent first, then older 5-star to top up; never pad below 5 stars.
+    recommended_pool = five_star_recent + five_star_older
+    recommended_ids = [s["session_id"] for s in recommended_pool[:5]]
+
     return {
         "count": len(sessions),
         "total_approved": conn.execute(
@@ -2464,7 +2490,7 @@ def get_share_ready_stats(
         ).fetchone()[0],
         "projects": sorted(projects),
         "models": sorted(models),
-        "recommended_session_ids": [s["session_id"] for s in approved_sessions[:10]],
+        "recommended_session_ids": recommended_ids,
         "sessions": sessions,
     }
 

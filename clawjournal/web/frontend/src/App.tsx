@@ -43,7 +43,7 @@ function Sidebar() {
     { to: '/insights', label: 'Insights', badge: null },
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
-    { to: '/share', label: 'Share', badge: counts.approved > 0 ? counts.approved : null },
+    { to: '/share', label: 'Share', badge: null },
   ];
 
   return (
