@@ -17,10 +17,54 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..config import CONFIG_DIR
-
 SCHEMA_VERSION = 1
-NOTES_DIR = CONFIG_DIR / "notes"
+
+
+def _notes_dir() -> Path:
+    """Resolve the notes directory from the current `BLOBS_DIR` location.
+
+    `BLOBS_DIR` in `clawjournal.workbench.index` is the canonical "where
+    clawjournal keeps per-session state" pointer, and every existing test
+    that cares already monkeypatches it to a tmp_path. Deriving notes/
+    from it at call time (not module-import time) means test pollution
+    is impossible: if a test has redirected `BLOBS_DIR`, the scoring-path
+    auto-create hook automatically writes under that redirected root.
+
+    Production: `BLOBS_DIR = ~/.clawjournal/blobs`, so notes/ is
+    `~/.clawjournal/notes` — identical to the hardcoded form.
+    """
+    from .index import BLOBS_DIR
+    return Path(BLOBS_DIR).parent / "notes"
+
+
+# Back-compat shim for tests that explicitly monkeypatched
+# `clawjournal.workbench.trace_note.NOTES_DIR`. Reading this attribute
+# still returns the correct path for the current BLOBS_DIR; assigning to
+# it in a fixture still works but is no longer necessary.
+class _NotesDirProxy:
+    def __truediv__(self, other):
+        return _notes_dir() / other
+
+    def __str__(self):
+        return str(_notes_dir())
+
+    def __repr__(self):
+        return f"_NotesDirProxy({_notes_dir()!r})"
+
+    def mkdir(self, *args, **kwargs):
+        return _notes_dir().mkdir(*args, **kwargs)
+
+    def glob(self, pattern):
+        return _notes_dir().glob(pattern)
+
+    def exists(self):
+        return _notes_dir().exists()
+
+    def __fspath__(self):
+        return str(_notes_dir())
+
+
+NOTES_DIR = _NotesDirProxy()
 
 _RENDERED_UPDATED_AT_RE = re.compile(
     r"<!--\s*rendered_updated_at:\s*(\S+?)\s*-->"
@@ -31,7 +75,7 @@ _NEXT_HEADING_RE = re.compile(r"^## \S", re.MULTILINE)
 
 def trace_note_path(session_id: str) -> Path:
     """Deterministic path — no DB lookup, no `trace_note_path` column."""
-    return NOTES_DIR / f"{session_id}.md"
+    return _notes_dir() / f"{session_id}.md"
 
 
 def _normalize_notes(s: str | None) -> str:

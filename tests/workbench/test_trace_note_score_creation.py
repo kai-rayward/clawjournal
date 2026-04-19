@@ -32,9 +32,6 @@ def env(tmp_path, monkeypatch):
         "clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs"
     )
     notes_dir = tmp_path / "notes"
-    monkeypatch.setattr(
-        "clawjournal.workbench.trace_note.NOTES_DIR", notes_dir
-    )
     conn = open_index()
     yield conn, notes_dir
     conn.close()
