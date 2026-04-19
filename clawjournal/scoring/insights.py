@@ -44,14 +44,17 @@ def collect_advisor_stats(
     result["total_input_tokens"] = row["input_tokens"] or 0
     result["total_output_tokens"] = row["output_tokens"] or 0
 
-    # By model
+    # By model. Exclude parser-fallback `<synthetic>` sessions — they
+    # have no real model/cost and would trivially win Most Efficient
+    # (cost/session = 0) and can sneak into Highest Quality too. The
+    # export path already filters them at `cli.py:479`; mirror that here.
     rows = conn.execute(
         "SELECT model, COUNT(*) as sessions, "
         "SUM(estimated_cost_usd) as cost, "
         "AVG(ai_quality_score) as avg_score, "
         "SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
-        "AND model IS NOT NULL "
+        "AND model IS NOT NULL AND model != '<synthetic>' "
         "GROUP BY model ORDER BY cost DESC",
         (start_str, end_str),
     ).fetchall()

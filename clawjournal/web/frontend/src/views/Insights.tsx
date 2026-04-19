@@ -1,6 +1,15 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { AdvisorData, InsightsData, InsightsTrendRow, InsightsDurationVsScoreRow } from '../types.ts';
+import { Link } from 'react-router-dom';
+import type {
+  AdvisorData,
+  HighlightItem,
+  HighlightsData,
+  InsightsData,
+  InsightsTrendRow,
+  InsightsDurationVsScoreRow,
+} from '../types.ts';
 import { api } from '../api.ts';
+import { LABELS } from '../components/BadgeChip.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { colors } from '../theme.ts';
@@ -191,6 +200,138 @@ function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
   );
 }
 
+/* ---------- Highlights helpers ---------- */
+
+function shortDuration(seconds: number | null | undefined): string {
+  if (!seconds || seconds <= 0) return '—';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours && minutes) return `${hours}h ${minutes}m`;
+  if (hours) return `${hours}h`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
+function sourceLabel(source: string | null | undefined): string {
+  if (!source) return '';
+  return source.charAt(0).toUpperCase() + source.slice(1);
+}
+
+function outcomeColor(outcome: string | null | undefined): string {
+  if (!outcome) return colors.gray400;
+  const good = ['resolved', 'shipped', 'tests_passed', 'completed', 'success'];
+  const bad = ['failed', 'abandoned', 'build_failed', 'tests_failed', 'errored'];
+  if (good.includes(outcome)) return colors.green500;
+  if (bad.includes(outcome)) return colors.red400;
+  return colors.yellow400;
+}
+
+function displayProject(project: string): string {
+  // Strip the "source:" prefix so the bullet reads cleanly.
+  const idx = project.indexOf(':');
+  return idx >= 0 ? project.slice(idx + 1) : project;
+}
+
+function labelFor(outcome: string): string {
+  return LABELS[outcome] ?? outcome.replace(/_/g, ' ');
+}
+
+function HighlightCard({ item }: { item: HighlightItem }) {
+  const scoreColor = item.ai_quality_score && item.ai_quality_score >= 5
+    ? colors.green500
+    : item.ai_quality_score && item.ai_quality_score >= 4
+    ? colors.blue400
+    : colors.gray400;
+
+  return (
+    <Link
+      to={`/session/${item.session_id}`}
+      style={{
+        display: 'block',
+        textDecoration: 'none',
+        color: 'inherit',
+        border: `1px solid ${colors.gray200}`,
+        borderRadius: 8,
+        padding: 12,
+        background: '#fff',
+        minHeight: 156,
+        flex: '1 1 260px',
+        maxWidth: 360,
+        transition: 'border-color 0.15s, box-shadow 0.15s',
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.borderColor = colors.blue400;
+        e.currentTarget.style.boxShadow = '0 2px 6px rgba(0,0,0,0.06)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.borderColor = colors.gray200;
+        e.currentTarget.style.boxShadow = 'none';
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, marginBottom: 6 }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {item.ai_quality_score != null && (
+            <span style={{
+              fontSize: 11, fontWeight: 600, color: scoreColor,
+              background: `${scoreColor}18`, padding: '2px 7px', borderRadius: 10,
+            }}>
+              {item.ai_quality_score}/5
+            </span>
+          )}
+          {item.outcome && (
+            <span style={{
+              fontSize: 11, fontWeight: 500, color: outcomeColor(item.outcome),
+              background: `${outcomeColor(item.outcome)}15`, padding: '2px 7px', borderRadius: 10,
+            }}>
+              {labelFor(item.outcome)}
+            </span>
+          )}
+        </div>
+        {item.source && (
+          <span style={{
+            fontSize: 10, fontWeight: 600, color: colors.gray600,
+            textTransform: 'uppercase', letterSpacing: 0.3,
+          }}>
+            {sourceLabel(item.source)}
+          </span>
+        )}
+      </div>
+
+      <div style={{
+        fontSize: 13, fontWeight: 600, color: colors.gray900, marginBottom: 6,
+        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+        overflow: 'hidden', lineHeight: 1.3,
+      }}>
+        {item.title}
+      </div>
+
+      {item.summary_teaser && (
+        <div style={{
+          fontSize: 12, color: colors.gray700, marginBottom: 8, lineHeight: 1.45,
+          display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+        }}>
+          {item.summary_teaser}
+        </div>
+      )}
+
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        gap: 6, fontSize: 11, color: colors.gray500,
+      }}>
+        <span style={{
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
+        }} title={item.project ?? ''}>
+          {displayProject(item.project ?? '—')} · {shortDuration(item.duration_seconds)}
+        </span>
+        <span style={{ color: colors.gray500, fontStyle: 'italic', flexShrink: 0 }}>
+          {item.rationale}
+        </span>
+      </div>
+    </Link>
+  );
+}
+
 /* ---------- Section wrapper ---------- */
 
 function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
@@ -244,6 +385,7 @@ export function Insights() {
   const { toast } = useToast();
   const [advisor, setAdvisor] = useState<AdvisorData | null>(null);
   const [insights, setInsights] = useState<InsightsData | null>(null);
+  const [highlights, setHighlights] = useState<HighlightsData | null>(null);
   const [days, setDays] = useState(7);
   const [loading, setLoading] = useState(true);
 
@@ -251,12 +393,14 @@ export function Insights() {
     setLoading(true);
     try {
       const { start, end } = getDateRange(days);
-      const [adv, ins] = await Promise.all([
+      const [adv, ins, hl] = await Promise.all([
         api.advisor({ days }),
         api.insights({ start, end }),
+        api.highlights({ days, top: 3, min_quality: 4 }).catch(() => null),
       ]);
       setAdvisor(adv);
       setInsights(ins);
+      setHighlights(hl);
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed to load insights', 'error');
     } finally {
@@ -362,6 +506,28 @@ export function Insights() {
           </div>
         )}
       </div>
+
+      {/* Highlights — top 3 recent five-star sessions across different agents,
+          matched to the tab's `days` window. */}
+      {highlights && highlights.highlights.length > 0 && (
+        <Section
+          title="Highlights"
+          subtitle={`Top ${highlights.highlights.length} recent five-star sessions across agents`}
+        >
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {highlights.highlights.map((item) => (
+              <HighlightCard key={item.session_id} item={item} />
+            ))}
+          </div>
+        </Section>
+      )}
+      {highlights && highlights.highlights.length === 0 && (
+        <Section title="Highlights" subtitle={`No 4+ star sessions in the last ${highlights.window_days} days`}>
+          <div style={{ fontSize: 12, color: colors.gray500, padding: 8 }}>
+            Run <code style={{ background: colors.gray100, padding: '1px 5px', borderRadius: 3 }}>clawjournal score</code> on recent sessions to populate this panel.
+          </div>
+        </Section>
+      )}
 
       {/* Trends chart */}
       {insights && insights.trends.length >= 2 && (
