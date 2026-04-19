@@ -2917,6 +2917,226 @@ def _run_card(args: argparse.Namespace) -> None:
             print(card_result["card_text"])
 
 
+# ----------------------------------------------------------------------
+# Trace note subcommands
+# ----------------------------------------------------------------------
+
+def _load_session_row(conn, session_id: str) -> dict | None:
+    """Fetch a sessions row as a dict, without loading the blob."""
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _has_unsynced_edits(path, reviewer_notes) -> bool:
+    """Return True if the file's ## Notes differs from reviewer_notes under
+    the canonical normalizer."""
+    from .workbench.trace_note import (
+        _normalize_notes,
+        extract_trace_note_notes,
+    )
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    on_disk = extract_trace_note_notes(text)
+    if on_disk is None:
+        # Malformed file (no ## Notes heading). Treat as unsynced so the
+        # user has to pass --force — avoids silently fixing their file.
+        return True
+    return _normalize_notes(on_disk) != _normalize_notes(reviewer_notes)
+
+
+def _render_one_note(conn, session_id: str, *, force: bool) -> tuple[str, str | None]:
+    """Render a single session's note.
+
+    Returns (status, message). status ∈ {'rendered', 'skipped', 'missing'}.
+    """
+    from .workbench.trace_note import (
+        render_trace_note,
+        trace_note_path,
+        write_note_atomically,
+    )
+
+    session = _load_session_row(conn, session_id)
+    if session is None:
+        return ("missing", f"session not found: {session_id}")
+
+    path = trace_note_path(session_id)
+    reviewer_notes = session.get("reviewer_notes")
+    if not force and _has_unsynced_edits(path, reviewer_notes):
+        return (
+            "skipped",
+            f"unsynced edits in {path.name} — run `note sync {session_id}` first "
+            "or pass --force",
+        )
+
+    text = render_trace_note(session, reviewer_notes)
+    write_note_atomically(path, text)
+    return ("rendered", str(path))
+
+
+def _run_note(args: argparse.Namespace) -> None:
+    import sys
+
+    from .workbench.index import open_index
+    from .workbench.trace_note import (
+        NOTES_DIR,
+        extract_rendered_updated_at,
+        extract_trace_note_notes,
+        render_trace_note,
+        trace_note_path,
+        write_note_atomically,
+    )
+
+    op = getattr(args, "note_op", None)
+
+    if op == "path":
+        print(trace_note_path(args.session_id))
+        return
+
+    if op == "render":
+        modes = [bool(args.session_id), args.all_scored, args.stale]
+        if sum(1 for m in modes if m) != 1:
+            print(
+                "error: exactly one of <session_id>, --all-scored, or --stale "
+                "is required",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        conn = open_index()
+        try:
+            if args.session_id:
+                status, message = _render_one_note(
+                    conn, args.session_id, force=args.force
+                )
+                if status == "missing":
+                    print(f"error: {message}", file=sys.stderr)
+                    sys.exit(1)
+                if status == "skipped":
+                    print(f"skipped: {message}")
+                    sys.exit(1)
+                print(f"rendered: {message}")
+                return
+
+            if args.all_scored:
+                rows = conn.execute(
+                    "SELECT session_id FROM sessions "
+                    "WHERE ai_summary IS NOT NULL AND ai_summary != '' "
+                    "ORDER BY start_time DESC"
+                ).fetchall()
+                rendered = 0
+                skipped = 0
+                unchanged = 0
+                for row in rows:
+                    sid = row["session_id"]
+                    path = trace_note_path(sid)
+                    if path.exists() and not args.force:
+                        unchanged += 1
+                        continue
+                    status, _ = _render_one_note(conn, sid, force=args.force)
+                    if status == "rendered":
+                        rendered += 1
+                    elif status == "skipped":
+                        skipped += 1
+                print(
+                    f"{rendered} rendered, {skipped} skipped (unsynced edits), "
+                    f"{unchanged} unchanged"
+                )
+                return
+
+            # --stale
+            rendered = 0
+            skipped = 0
+            unchanged = 0
+            NOTES_DIR.mkdir(parents=True, exist_ok=True)
+            for note_file in sorted(NOTES_DIR.glob("*.md")):
+                sid = note_file.stem
+                row = conn.execute(
+                    "SELECT updated_at FROM sessions WHERE session_id = ?",
+                    (sid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                db_updated_at = row["updated_at"] or ""
+                try:
+                    text = note_file.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                stamp = extract_rendered_updated_at(text) or ""
+                if stamp >= db_updated_at:
+                    unchanged += 1
+                    continue
+                status, message = _render_one_note(
+                    conn, sid, force=args.force
+                )
+                if status == "rendered":
+                    rendered += 1
+                elif status == "skipped":
+                    skipped += 1
+                    print(f"skipped: {message}", file=sys.stderr)
+            print(
+                f"{rendered} refreshed, {skipped} skipped (unsynced edits), "
+                f"{unchanged} unchanged"
+            )
+            return
+        finally:
+            conn.close()
+
+    if op == "sync":
+        path = trace_note_path(args.session_id)
+        if not path.exists():
+            print(f"error: note file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+
+        text = path.read_text(encoding="utf-8")
+        block = extract_trace_note_notes(text)
+        if block is None:
+            print(
+                "error: file is missing a `## Notes` heading; refusing to sync",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Block is empty string (user cleared) or their text. Both paths
+        # route through update_session(notes=...) with an explicit
+        # non-None value so the column actually gets written (update_session
+        # skips `notes is None`).
+        conn = open_index()
+        try:
+            from .workbench.index import update_session
+            ok = update_session(conn, args.session_id, notes=block)
+            if not ok:
+                print(
+                    f"error: session not found: {args.session_id}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            # Best-effort re-render so `rendered_updated_at` matches the new
+            # sessions.updated_at. A crash between these two operations is
+            # recoverable via `note render --stale` (the next pass re-renders
+            # to byte-identical content with a fresh stamp).
+            session = _load_session_row(conn, args.session_id)
+            if session is None:
+                print(
+                    f"warning: session disappeared mid-sync: {args.session_id}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            new_text = render_trace_note(session, session.get("reviewer_notes"))
+            write_note_atomically(path, new_text)
+            print(f"synced: {path}")
+            return
+        finally:
+            conn.close()
+
+    # No subcommand given
+    print("error: note requires a subcommand (render, sync, path)", file=sys.stderr)
+    sys.exit(2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ClawJournal — coding agent conversation exporter")
     sub = parser.add_subparsers(dest="command")
@@ -3175,6 +3395,35 @@ def main() -> None:
                              default="summary", help="Content depth (default: summary)")
     card_parser.add_argument("--json", action="store_true", help="Output JSON for agent parsing")
 
+    # Trace note commands — DB-connected markdown summary per session.
+    # See docs/db-refactor.md.
+    note_p = sub.add_parser("note", help="Render / sync per-session markdown trace notes")
+    note_sub = note_p.add_subparsers(dest="note_op")
+
+    note_render = note_sub.add_parser(
+        "render",
+        help="Render trace note(s) from DB. One session id, or --all-scored, or --stale.",
+    )
+    note_render.add_argument("session_id", nargs="?", default=None)
+    note_render.add_argument("--all-scored", action="store_true",
+                             help="Create missing notes for every session with ai_summary")
+    note_render.add_argument("--stale", action="store_true",
+                             help="Re-render notes whose stamp is behind sessions.updated_at")
+    note_render.add_argument("--force", action="store_true",
+                             help="Overwrite files with unsynced ## Notes edits")
+
+    note_sync = note_sub.add_parser(
+        "sync",
+        help="Write the file's ## Notes back into sessions.reviewer_notes, then re-render",
+    )
+    note_sync.add_argument("session_id")
+
+    note_path_p = note_sub.add_parser(
+        "path",
+        help="Print the canonical note path for a session id",
+    )
+    note_path_p.add_argument("session_id")
+
     # Insights command
     ins = sub.add_parser("insights", help="Token efficiency advisor — analyze usage patterns")
     ins.add_argument("--days", type=int, default=7, help="Days to analyze (default: 7)")
@@ -3366,6 +3615,10 @@ def main() -> None:
 
     if command == "card":
         _run_card(args)
+        return
+
+    if command == "note":
+        _run_note(args)
         return
 
     if command == "prep":

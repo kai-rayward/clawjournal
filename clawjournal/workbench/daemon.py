@@ -108,6 +108,32 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
     )
 
 
+def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
+    """Create `notes/{session_id}.md` if it does not already exist.
+
+    Called from both score paths (auto-scoring in `score_unscored_once` and
+    manual scoring in `_handle_score_session`) after the DB is updated, so
+    the freshly-written `ai_summary` is what lands in the file. Strictly
+    create-if-missing — never overwrite existing notes in the scoring hook,
+    because they may carry unsynced user edits.
+
+    Errors are logged but never raised: note creation is a best-effort
+    side effect of scoring, not a requirement for scoring to succeed.
+    """
+    try:
+        from ..workbench.trace_note import create_note_if_missing
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return
+        created = create_note_if_missing(dict(row))
+        if created is not None:
+            logger.debug("created trace note at %s", created)
+    except Exception:
+        logger.exception("Failed to create trace note for %s", session_id)
+
+
 class Scanner:
     """Periodically scans source directories and indexes new sessions."""
 
@@ -225,6 +251,7 @@ class Scanner:
 
                     if _persist_scoring_result(conn, sid, result):
                         scored += 1
+                        _maybe_create_trace_note(conn, sid)
 
                 return scored
             finally:
@@ -1232,6 +1259,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             if not ok:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
+
+            _maybe_create_trace_note(conn, session_id)
 
             _json_response(self, {
                 "ok": True,
