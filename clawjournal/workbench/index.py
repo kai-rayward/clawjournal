@@ -1997,9 +1997,11 @@ def get_dashboard_analytics(
     ).fetchall()
     result["by_task_type"] = [dict(r) for r in rows]
 
-    # Model
+    # Model (excludes parser-fallback `<synthetic>` sessions — see
+    # clawjournal/scoring/insights.py:55 for rationale).
     model_where, model_params = _build_start_time_where(
-        start=start, end=end, base_clauses=["model IS NOT NULL"],
+        start=start, end=end,
+        base_clauses=["model IS NOT NULL", "model != '<synthetic>'"],
     )
     rows = conn.execute(
         "SELECT model, COUNT(*) as count FROM sessions "
@@ -2395,14 +2397,16 @@ def get_insights(
     ).fetchall()
     result["duration_vs_score"] = [dict(r) for r in rows]
 
-    # Model effectiveness
+    # Model effectiveness. Exclude parser-fallback `<synthetic>` sessions —
+    # same rationale as scoring/insights.py:55 and the cli.py:479 export
+    # filter. These sessions have no real model/cost and pollute the table.
     rows = conn.execute(
         f"SELECT model, COUNT(*) as sessions, "
         f"AVG(ai_quality_score) as avg_score, "
         f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"SUM(estimated_cost_usd) as total_cost "
-        f"FROM sessions {where} AND model IS NOT NULL "
+        f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
         f"GROUP BY model ORDER BY sessions DESC",
         params_base,
     ).fetchall()
@@ -2452,10 +2456,10 @@ def get_insights(
     ).fetchall()
     result["effort_distribution"] = [dict(r) for r in rows]
 
-    # Cost breakdown
+    # Cost breakdown (excludes `<synthetic>` — same rationale).
     rows = conn.execute(
         f"SELECT model, COALESCE(SUM(estimated_cost_usd), 0) as cost "
-        f"FROM sessions {where} AND model IS NOT NULL "
+        f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
         f"GROUP BY model ORDER BY cost DESC",
         params_base,
     ).fetchall()

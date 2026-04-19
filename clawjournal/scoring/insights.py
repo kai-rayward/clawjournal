@@ -175,7 +175,7 @@ def collect_advisor_stats(
         "SELECT model, AVG(CAST(user_interrupts AS REAL)) as avg_interrupts, "
         "COUNT(*) as sessions, SUM(tool_uses) as total_tool_uses "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
-        "AND user_interrupts > 0 AND model IS NOT NULL "
+        "AND user_interrupts > 0 AND model IS NOT NULL AND model != '<synthetic>' "
         "GROUP BY model ORDER BY avg_interrupts DESC",
         (start_str, end_str),
     ).fetchall()
