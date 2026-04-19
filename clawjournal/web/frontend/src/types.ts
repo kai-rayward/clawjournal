@@ -320,6 +320,29 @@ export interface InsightsDurationVsScoreRow {
   cost: number | null;
 }
 
+export interface HighlightItem {
+  session_id: string;
+  title: string;
+  project: string | null;
+  source: string | null;
+  model: string | null;
+  start_time: string | null;
+  end_time: string | null;
+  duration_seconds: number | null;
+  ai_quality_score: number | null;
+  ai_effort_estimate: number | null;
+  outcome: string | null;
+  summary_teaser: string;
+  rationale: string;
+}
+
+export interface HighlightsData {
+  highlights: HighlightItem[];
+  window_days: number;
+  min_quality: number;
+  candidate_count: number;
+}
+
 export interface InsightsData {
   heatmap: InsightsHeatmapCell[];
   focus: InsightsFocusRow[];

@@ -2066,6 +2066,131 @@ def get_dashboard_analytics(
     return result
 
 
+def get_highlights(
+    conn: sqlite3.Connection,
+    *,
+    days: int = 7,
+    top_n: int = 3,
+    min_quality: int = 4,
+) -> dict[str, Any]:
+    """Pick a small curated set of 'worth a look' sessions for the dashboard.
+
+    Selection recipe:
+    1. Candidates have `end_time` within the last `days`, are fully scored
+       (`ai_quality_score IS NOT NULL`), and meet `ai_quality_score >= min_quality`.
+    2. Order by `ai_quality_score DESC, end_time DESC`.
+    3. Diversify across `source` — prefer one from each distinct agent
+       (claude / codex / openclaw / etc.) before taking a second from any.
+    4. If fewer than `top_n` distinct sources have candidates, fill from the
+       remaining sorted list.
+
+    Each result carries enough metadata for the dashboard card plus a
+    one-line rationale string ("5-star · 3 days ago") so the UI doesn't
+    have to re-derive it.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_iso = cutoff.isoformat()
+
+    rows = conn.execute(
+        """
+        SELECT session_id, project, source, model,
+               start_time, end_time, duration_seconds,
+               display_title, ai_display_title, ai_summary,
+               ai_quality_score, ai_effort_estimate,
+               outcome_badge, ai_outcome_badge
+        FROM sessions
+        WHERE end_time IS NOT NULL
+          AND end_time >= ?
+          AND ai_quality_score IS NOT NULL
+          AND ai_quality_score >= ?
+        ORDER BY ai_quality_score DESC, end_time DESC
+        """,
+        (cutoff_iso, min_quality),
+    ).fetchall()
+
+    candidates = [dict(r) for r in rows]
+
+    # Diversify across source: first pass picks one per distinct source in
+    # the sorted order, second pass fills from remaining.
+    picked: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    leftovers: list[dict[str, Any]] = []
+
+    for c in candidates:
+        if len(picked) >= top_n:
+            break
+        src = c.get("source") or ""
+        if src not in seen_sources:
+            picked.append(c)
+            seen_sources.add(src)
+        else:
+            leftovers.append(c)
+
+    for c in leftovers:
+        if len(picked) >= top_n:
+            break
+        picked.append(c)
+
+    now = datetime.now(timezone.utc)
+
+    def _rationale(s: dict[str, Any]) -> str:
+        score = s.get("ai_quality_score")
+        end_time = s.get("end_time") or ""
+        try:
+            end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            delta = now - end_dt
+            if delta.total_seconds() < 3600:
+                when = "just now"
+            elif delta.days == 0:
+                hours = int(delta.total_seconds() // 3600)
+                when = f"{hours}h ago"
+            elif delta.days == 1:
+                when = "yesterday"
+            else:
+                when = f"{delta.days} days ago"
+        except (ValueError, AttributeError):
+            when = "recently"
+        score_label = f"{score}-star" if score else "scored"
+        return f"{score_label} · {when}"
+
+    def _truncate(text: str | None, limit: int = 200) -> str:
+        if not text:
+            return ""
+        clean = " ".join(text.split())
+        if len(clean) <= limit:
+            return clean
+        cut = clean[:limit].rsplit(" ", 1)[0]
+        return cut + "…"
+
+    highlights = []
+    for s in picked:
+        outcome = s.get("ai_outcome_badge") or s.get("outcome_badge") or None
+        highlights.append({
+            "session_id": s["session_id"],
+            "title": s.get("display_title") or s["session_id"],
+            "project": s.get("project"),
+            "source": s.get("source"),
+            "model": s.get("model"),
+            "start_time": s.get("start_time"),
+            "end_time": s.get("end_time"),
+            "duration_seconds": s.get("duration_seconds"),
+            "ai_quality_score": s.get("ai_quality_score"),
+            "ai_effort_estimate": s.get("ai_effort_estimate"),
+            "outcome": outcome,
+            "summary_teaser": _truncate(s.get("ai_summary")),
+            "rationale": _rationale(s),
+        })
+
+    return {
+        "highlights": highlights,
+        "window_days": days,
+        "min_quality": min_quality,
+        "candidate_count": len(candidates),
+    }
+
+
 def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
     """Detect and link parent-child session relationships.
 

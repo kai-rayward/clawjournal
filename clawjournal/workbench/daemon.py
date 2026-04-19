@@ -39,6 +39,7 @@ from .index import (
     get_share,
     get_shares,
     get_dashboard_analytics,
+    get_highlights,
     get_policies,
     get_session_detail,
     get_share_ready_stats,
@@ -866,6 +867,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_stats(params)
         elif path == "/api/dashboard":
             self._handle_dashboard(params)
+        elif path == "/api/dashboard/highlights":
+            self._handle_highlights(params)
         elif path == "/api/insights":
             self._handle_insights(params)
         elif path == "/api/advisor":
@@ -1306,6 +1309,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         conn = open_index()
         try:
             data = get_dashboard_analytics(conn, start=start, end=end)
+            _json_response(self, data)
+        finally:
+            conn.close()
+
+    def _handle_highlights(self, params: dict[str, list[str]]) -> None:
+        def _int_param(name: str, default: int, lo: int, hi: int) -> int:
+            raw = params.get(name, [str(default)])[0]
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, value))
+
+        days = _int_param("days", 7, 1, 90)
+        top_n = _int_param("top", 3, 1, 12)
+        min_quality = _int_param("min_quality", 4, 1, 5)
+
+        conn = open_index()
+        try:
+            data = get_highlights(
+                conn, days=days, top_n=top_n, min_quality=min_quality
+            )
             _json_response(self, data)
         finally:
             conn.close()

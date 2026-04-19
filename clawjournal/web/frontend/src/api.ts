@@ -7,6 +7,7 @@ import type {
   Stats,
   ProjectSummary,
   DashboardData,
+  HighlightsData,
   RedactionReport,
   AllowlistEntry,
   InsightsData,
@@ -149,6 +150,10 @@ export const api = {
 
   dashboard(params: { start?: string; end?: string } = {}): Promise<DashboardData> {
     return request(`/dashboard${qs(params)}`);
+  },
+
+  highlights(params: { days?: number; top?: number; min_quality?: number } = {}): Promise<HighlightsData> {
+    return request(`/dashboard/highlights${qs(params)}`);
   },
 
   projects(): Promise<ProjectSummary[]> {
