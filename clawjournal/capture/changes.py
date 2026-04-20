@@ -13,6 +13,14 @@ Two consumer models are supported:
 Each consumer holds its own cursor (see cursors.py) and advances only
 after its own sink commit, so one consumer cannot cause another to miss
 data and crashes replay cleanly.
+
+Rotation detection is best-effort at the stat level. Inode change,
+size decrease, and mtime regression all signal rotation/truncation.
+Unlink-then-recreate on Linux often reuses the inode immediately; if
+the replacement file is also larger than the prior cursor offset, it
+is indistinguishable from a plain append at stat(2). Vendor JSONLs
+are append-only, so this is not a production concern — logrotate-style
+rotation always produces a new inode via rename and is caught.
 """
 
 from __future__ import annotations

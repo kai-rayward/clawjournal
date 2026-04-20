@@ -68,7 +68,12 @@ def test_rotation_resets_offset(tmp_path):
     p.write_bytes(b'{"a":1}\n')
     batch = iter_new_lines(p, None, client="claude")
     cur = cursor_after(batch, p, consumer_id="events")
-    p.unlink()
+    # Logrotate-style rotation: move the old file aside, then write a
+    # fresh file at the original path. Guarantees a new inode on any
+    # POSIX filesystem. Unlink-then-recreate on Linux often reuses the
+    # inode immediately, making stat(2) unable to distinguish rotation
+    # from a plain append — see the rotation note in changes.py.
+    p.rename(tmp_path / "a.jsonl.1")
     p.write_bytes(b'{"new":1}\n')
     batch2 = iter_new_lines(p, cur, client="claude")
     assert batch2 is not None
@@ -131,7 +136,9 @@ def test_file_has_changed_detects_rotation(tmp_path):
     p = tmp_path / "a.jsonl"
     p.write_bytes(b'{"a":1}\n')
     cur = cursor_to_eof(p, consumer_id="scanner", client="claude")
-    p.unlink()
+    # Rename-then-recreate so the test doesn't depend on inode-reuse
+    # behavior of the underlying filesystem.
+    p.rename(tmp_path / "a.jsonl.1")
     p.write_bytes(b'{"new":1}\n')
     assert file_has_changed(p, cur) is True
 

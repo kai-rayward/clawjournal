@@ -143,6 +143,111 @@ def test_local_agent_missing_directory_is_a_no_op(isolated_homedir):
     assert files == []
 
 
+# ---------- wrapper validity gates (mirror parser.py:220-227) ----------
+
+
+def _make_workspace_dirs(isolated_homedir):
+    root_uuid = isolated_homedir / "local_agent" / "11111111-2222-3333-4444-555555555555"
+    workspace_uuid = root_uuid / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    workspace_uuid.mkdir(parents=True)
+    return workspace_uuid
+
+
+def test_local_agent_skips_wrapper_with_malformed_json(isolated_homedir):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper = workspace_uuid / "local_bad.json"
+    wrapper.write_text("{not json")
+    session_dir = wrapper.with_suffix("")
+    session_dir.mkdir()
+    proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
+    (session_dir / "audit.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    assert files == []
+
+
+def test_local_agent_skips_wrapper_that_is_not_a_dict(isolated_homedir):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper = workspace_uuid / "local_list.json"
+    wrapper.write_text(json.dumps([1, 2, 3]))
+    session_dir = wrapper.with_suffix("")
+    session_dir.mkdir()
+    proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    assert files == []
+
+
+def test_local_agent_skips_wrapper_without_cli_session_id(isolated_homedir):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper = workspace_uuid / "local_missing.json"
+    wrapper.write_text(json.dumps({"sessionId": "sess-3", "processName": "x"}))
+    session_dir = wrapper.with_suffix("")
+    session_dir.mkdir()
+    proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    assert files == []
+
+
+# ---------- nested project dir selection (mirror parser.py:247-253) ----------
+
+
+def test_local_agent_prefers_sessions_processname_dir_over_others(isolated_homedir):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "pref",
+        cli_session_id="cli-5",
+        session_id="sess-5",
+        process_name="myproc",
+        user_folder="/Users/me/ws",
+    )
+    expected = session_dir / ".claude" / "projects" / "-sessions-myproc"
+    expected.mkdir(parents=True)
+    (expected / "match.jsonl").write_text("{}\n")
+    # Extra unrelated dir — must not be tailed when the processName dir exists
+    stray = session_dir / ".claude" / "projects" / "stray"
+    stray.mkdir(parents=True)
+    (stray / "stray.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    names = sorted(f.path.name for f in files)
+    assert names == ["match.jsonl"]
+
+
+def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "fb",
+        cli_session_id="cli-6",
+        session_id="sess-6",
+        process_name="unexpected",  # no -sessions-unexpected dir below
+        user_folder="/Users/me/ws",
+    )
+    alt = session_dir / ".claude" / "projects" / "-sessions-fallback"
+    alt.mkdir(parents=True)
+    (alt / "picked.jsonl").write_text("{}\n")
+    extra = session_dir / ".claude" / "projects" / "-sessions-other"
+    extra.mkdir(parents=True)
+    (extra / "skipped.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    names = sorted(f.path.name for f in files)
+    # Only the alphabetically-first fallback dir is picked (sorted iterdir).
+    # Parser's unsorted fallback is OS-dependent; the adapter is deterministic.
+    assert names == ["picked.jsonl"]
+
+
 # ---------- Codex ----------
 
 
