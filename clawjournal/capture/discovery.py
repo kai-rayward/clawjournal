@@ -16,9 +16,10 @@ Phase 1 steps 1 and 1b cover:
     - Wrappers with malformed JSON, non-dict payloads, or no
       `cliSessionId` are skipped entirely (parity with parser.py:220-227).
     - The nested `.claude/projects/-sessions-<processName>` directory is
-      preferred, with a first-subdirectory fallback when no match exists
-      (sorted for reproducibility; the parser's unsorted iterdir is
-      OS-dependent). Only one nested project dir is tailed per wrapper.
+      preferred, with a first-subdirectory fallback when no match exists.
+      The fallback mirrors the parser's raw `iterdir()` order exactly,
+      even though that order is OS/filesystem dependent. Only one nested
+      project dir is tailed per wrapper.
     - Only `{chosen_nested_project_dir}/{cliSessionId}.jsonl` is yielded
       per wrapper — the single transcript file the current parser reads.
     - Semantic dedupe against native Claude sessions is intentionally
@@ -54,7 +55,10 @@ use `iter_parse_inputs()` to recover the current parser's logical units:
 native subagent-only sessions collapse to their enclosing session dir,
 and native/local-agent duplicates share a `session_key` with explicit
 priority ordering instead of forcing each consumer to rediscover Claude
-precedence rules.
+precedence rules. When callers pass only a changed-file subset,
+`iter_parse_inputs()` rehydrates the full discovered Claude session
+family for those `session_key`s before grouping so native-first fallback
+and subagent-session merging still match the current parser.
 """
 
 from __future__ import annotations
@@ -131,14 +135,20 @@ def iter_parse_inputs(
       the same logical session.
 
     `iter_parse_inputs()` preserves the physical file layer for cursoring,
-    but emits parser-ready candidates ordered by `(session_key, priority,
-    parse_path)`. Downstream consumers can group consecutive entries by
-    `session_key` and try candidates in order until one parses.
+    but emits parser-ready candidates ordered by session-family discovery
+    order, with candidates for the same session kept consecutive and
+    ordered by priority / first-seen position. If callers provide only a
+    changed-file subset, Claude `session_key`s are first expanded back
+    to the full discovered family so native/local fallback precedence
+    and subagent-session merging are still preserved. Downstream
+    consumers can group consecutive entries by `session_key` and try
+    candidates in order until one parses.
     """
 
     files = list(source_files) if source_files is not None else list(
         iter_source_files(source_filter=source_filter)
     )
+    files = _expand_claude_parse_families(files)
     groups: dict[tuple[str, str, str, Path, str, int], list[SourceFile]] = defaultdict(list)
     for source in files:
         groups[
@@ -152,8 +162,25 @@ def iter_parse_inputs(
             )
         ].append(source)
 
-    for key in sorted(groups, key=lambda item: (item[0], item[5], str(item[3]))):
-        members = sorted(groups[key], key=lambda source: str(source.path))
+    session_first_seen: dict[str, int] = {}
+    first_seen: dict[tuple[str, str, str, Path, str, int], int] = {}
+    for index, source in enumerate(files):
+        session_first_seen.setdefault(source.session_key, index)
+        key = (
+            source.session_key,
+            source.client,
+            source.project_dir_name,
+            source.parse_path,
+            source.parse_kind,
+            source.parse_priority,
+        )
+        first_seen.setdefault(key, index)
+
+    for key in sorted(
+        groups,
+        key=lambda item: (session_first_seen[item[0]], item[5], first_seen[item]),
+    ):
+        members = groups[key]
         yield ParseInput(
             session_key=key[0],
             client=key[1],
@@ -218,14 +245,14 @@ def _iter_local_agent_files() -> Iterator[SourceFile]:
     if not root.exists():
         return
     try:
-        roots = sorted(root.iterdir())
+        roots = list(root.iterdir())
     except OSError:
         return
     for root_entry in roots:
         if not (root_entry.is_dir() and _UUID_RE.match(root_entry.name)):
             continue
         try:
-            workspaces = sorted(root_entry.iterdir())
+            workspaces = list(root_entry.iterdir())
         except OSError:
             continue
         for workspace_entry in workspaces:
@@ -238,7 +265,7 @@ def _iter_workspace_files(
     workspace_dir: Path,
 ) -> Iterator[SourceFile]:
     try:
-        entries = sorted(workspace_dir.iterdir())
+        entries = list(workspace_dir.iterdir())
     except OSError:
         return
     for wrapper_path in entries:
@@ -333,12 +360,8 @@ def _iter_local_agent_transcript(
 def _pick_nested_project_dir(
     nested_projects_root: Path, wrapper: dict
 ) -> Path | None:
-    """Mirror parser.py:247-253 — prefer `-sessions-<processName>`, else
-    fall back to a single subdirectory. Parser uses unsorted iterdir,
-    which is OS-dependent; we sort for reproducibility. Any observable
-    difference is limited to workspaces with multiple nested project
-    dirs AND no match for the wrapper's processName — already an
-    irregular state.
+    """Mirror parser.py:247-253 exactly — prefer `-sessions-<processName>`,
+    else fall back to the first subdirectory yielded by raw `iterdir()`.
     """
     if not nested_projects_root.is_dir():
         return None
@@ -347,7 +370,7 @@ def _pick_nested_project_dir(
     candidate = nested_projects_root / f"-sessions-{safe_process_name}"
     if candidate.is_dir():
         return candidate
-    for d in sorted(nested_projects_root.iterdir()):
+    for d in nested_projects_root.iterdir():
         if d.is_dir():
             return d
     return None
@@ -426,6 +449,61 @@ def _iter_openclaw_files() -> Iterator[SourceFile]:
 
 def _claude_session_key(project_dir_name: str, session_id: str) -> str:
     return f"claude:{project_dir_name}:{session_id}"
+
+
+def _expand_claude_parse_families(files: list[SourceFile]) -> list[SourceFile]:
+    """Expand a changed-file subset back to full Claude session families.
+
+    The current parser resolves Claude precedence at the session level:
+    - native root/local-agent duplicates compete within one session key,
+    - duplicate local-agent wrappers are alternate candidates,
+    - subagent-only sessions merge every `agent-*.jsonl` file in the dir.
+
+    If a caller hands us only changed `SourceFile`s, grouping those files
+    directly would lose that context. Re-scan Claude discovery and pull in
+    every physical source whose `session_key` matches a changed Claude
+    source before we coalesce into parser-facing `ParseInput`s.
+    """
+    claude_keys = {
+        source.session_key
+        for source in files
+        if source.client == parser.CLAUDE_SOURCE
+    }
+    if not claude_keys:
+        return files
+
+    discovered_by_session: dict[str, list[SourceFile]] = defaultdict(list)
+    for source in iter_source_files(source_filter=parser.CLAUDE_SOURCE):
+        if source.session_key in claude_keys:
+            discovered_by_session[source.session_key].append(source)
+
+    expanded: list[SourceFile] = []
+    seen_paths: set[Path] = set()
+    emitted_sessions: set[str] = set()
+
+    for source in files:
+        if source.client != parser.CLAUDE_SOURCE:
+            if source.path not in seen_paths:
+                expanded.append(source)
+                seen_paths.add(source.path)
+            continue
+
+        if source.session_key in emitted_sessions:
+            continue
+        emitted_sessions.add(source.session_key)
+
+        family = discovered_by_session.get(source.session_key)
+        if family:
+            for member in family:
+                if member.path not in seen_paths:
+                    expanded.append(member)
+                    seen_paths.add(member.path)
+            continue
+
+        if source.path not in seen_paths:
+            expanded.append(source)
+            seen_paths.add(source.path)
+    return expanded
 
 
 def _make_source_file(

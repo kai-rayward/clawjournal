@@ -1,4 +1,5 @@
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -308,6 +309,40 @@ def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
     assert files[0].path == alt / "cli-6.jsonl"
 
 
+def test_local_agent_fallback_uses_raw_iterdir_order_when_processname_missing(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "raworder",
+        cli_session_id="cli-raw",
+        session_id="sess-raw",
+        process_name="unexpected",
+        user_folder="/Users/me/ws",
+    )
+    nested_root = session_dir / ".claude" / "projects"
+    alt = nested_root / "-sessions-fallback"
+    alt.mkdir(parents=True)
+    (alt / "cli-raw.jsonl").write_text("{}\n")
+    extra = nested_root / "-sessions-other"
+    extra.mkdir(parents=True)
+    (extra / "cli-raw.jsonl").write_text("{}\n")
+
+    original_iterdir = discovery.Path.iterdir
+
+    def fake_iterdir(self):
+        if self == nested_root:
+            return iter([extra, alt])
+        return original_iterdir(self)
+
+    with patch.object(discovery.Path, "iterdir", fake_iterdir):
+        files = list(discovery.iter_source_files(source_filter="claude"))
+
+    assert len(files) == 1
+    assert files[0].path == extra / "cli-raw.jsonl"
+
+
 # ---------- duplicate preservation / parser-level fallback ----------
 
 
@@ -463,6 +498,62 @@ def test_parse_inputs_encode_native_then_local_agent_fallback_order(
     assert inputs[1].parse_path == proj / "dup.jsonl"
 
 
+def test_parse_inputs_expand_changed_local_agent_duplicate_to_full_fallback_set(
+    isolated_homedir,
+):
+    native = isolated_homedir / "claude" / "projects" / "-Users-me-shared"
+    native.mkdir(parents=True)
+    (native / "dup.jsonl").write_text("{}\n")
+
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "dup",
+        cli_session_id="dup",
+        session_id="sess-dup",
+        process_name="proc",
+        user_folder="/Users/me/shared",
+    )
+    proj = session_dir / ".claude" / "projects" / "-sessions-proc"
+    proj.mkdir(parents=True)
+    la_file = proj / "dup.jsonl"
+    la_file.write_text("{}\n")
+
+    all_files = list(discovery.iter_source_files(source_filter="claude"))
+    changed_only = [source for source in all_files if source.path == la_file]
+
+    inputs = list(discovery.iter_parse_inputs(source_files=changed_only))
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [0, 1]
+    assert inputs[0].parse_path == native / "dup.jsonl"
+    assert inputs[1].parse_path == la_file
+
+
+def test_parse_inputs_expand_changed_subagent_file_to_full_session(
+    isolated_homedir,
+):
+    proj = isolated_homedir / "claude" / "projects" / "p"
+    proj.mkdir(parents=True)
+    session_dir = proj / "only-uuid"
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    agent_one = subagents / "agent-1.jsonl"
+    agent_two = subagents / "agent-2.jsonl"
+    agent_one.write_text("{}\n")
+    agent_two.write_text("{}\n")
+
+    all_files = list(discovery.iter_source_files(source_filter="claude"))
+    changed_only = [source for source in all_files if source.path == agent_one]
+
+    inputs = list(discovery.iter_parse_inputs(source_files=changed_only))
+    assert len(inputs) == 1
+    assert inputs[0].parse_path == session_dir
+    assert tuple(path.name for path in inputs[0].source_paths) == (
+        "agent-1.jsonl",
+        "agent-2.jsonl",
+    )
+
+
 def test_parse_inputs_preserve_duplicate_local_agent_candidates_stably(
     isolated_homedir,
 ):
@@ -499,6 +590,209 @@ def test_parse_inputs_preserve_duplicate_local_agent_candidates_stably(
         sorted(str(parse_input.parse_path) for parse_input in inputs)
     )
     assert all(len(parse_input.source_paths) == 1 for parse_input in inputs)
+
+
+def test_parse_inputs_preserve_raw_wrapper_order_for_duplicate_local_agent_candidates(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper_one, session_one = _write_local_agent_wrapper(
+        workspace_uuid,
+        "one",
+        cli_session_id="dup-cli",
+        session_id="sess-one",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_one = session_one / ".claude" / "projects" / "-sessions-proc"
+    proj_one.mkdir(parents=True)
+    file_one = proj_one / "dup-cli.jsonl"
+    file_one.write_text("{}\n")
+
+    wrapper_two, session_two = _write_local_agent_wrapper(
+        workspace_uuid,
+        "two",
+        cli_session_id="dup-cli",
+        session_id="sess-two",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_two = session_two / ".claude" / "projects" / "-sessions-proc"
+    proj_two.mkdir(parents=True)
+    file_two = proj_two / "dup-cli.jsonl"
+    file_two.write_text("{}\n")
+
+    original_iterdir = discovery.Path.iterdir
+
+    def fake_iterdir(self):
+        if self == workspace_uuid:
+            return iter([wrapper_two, session_two, wrapper_one, session_one])
+        return original_iterdir(self)
+
+    with patch.object(discovery.Path, "iterdir", fake_iterdir):
+        inputs = list(discovery.iter_parse_inputs(source_filter="claude"))
+
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [1, 1]
+    assert [parse_input.parse_path for parse_input in inputs] == [file_two, file_one]
+
+
+def test_parse_inputs_preserve_raw_wrapper_order_for_distinct_local_agent_sessions(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper_a, session_a = _write_local_agent_wrapper(
+        workspace_uuid,
+        "a",
+        cli_session_id="a",
+        session_id="sess-a",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_a = session_a / ".claude" / "projects" / "-sessions-proc"
+    proj_a.mkdir(parents=True)
+    file_a = proj_a / "a.jsonl"
+    file_a.write_text("{}\n")
+
+    wrapper_z, session_z = _write_local_agent_wrapper(
+        workspace_uuid,
+        "z",
+        cli_session_id="z",
+        session_id="sess-z",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_z = session_z / ".claude" / "projects" / "-sessions-proc"
+    proj_z.mkdir(parents=True)
+    file_z = proj_z / "z.jsonl"
+    file_z.write_text("{}\n")
+
+    original_iterdir = discovery.Path.iterdir
+
+    def fake_iterdir(self):
+        if self == workspace_uuid:
+            return iter([wrapper_z, session_z, wrapper_a, session_a])
+        return original_iterdir(self)
+
+    with patch.object(discovery.Path, "iterdir", fake_iterdir):
+        inputs = list(discovery.iter_parse_inputs(source_filter="claude"))
+
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [1, 1]
+    assert [parse_input.parse_path for parse_input in inputs] == [file_z, file_a]
+
+
+def test_parse_inputs_expand_changed_local_agent_candidate_to_all_duplicate_wrappers(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_one = _write_local_agent_wrapper(
+        workspace_uuid,
+        "one",
+        cli_session_id="dup-cli",
+        session_id="sess-one",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_one = session_one / ".claude" / "projects" / "-sessions-proc"
+    proj_one.mkdir(parents=True)
+    file_one = proj_one / "dup-cli.jsonl"
+    file_one.write_text("{}\n")
+
+    _, session_two = _write_local_agent_wrapper(
+        workspace_uuid,
+        "two",
+        cli_session_id="dup-cli",
+        session_id="sess-two",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_two = session_two / ".claude" / "projects" / "-sessions-proc"
+    proj_two.mkdir(parents=True)
+    file_two = proj_two / "dup-cli.jsonl"
+    file_two.write_text("{}\n")
+
+    all_files = list(discovery.iter_source_files(source_filter="claude"))
+    changed_only = [source for source in all_files if source.path == file_one]
+
+    inputs = list(discovery.iter_parse_inputs(source_files=changed_only))
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [1, 1]
+    assert {parse_input.parse_path for parse_input in inputs} == {file_one, file_two}
+
+
+def test_parse_inputs_expand_changed_duplicate_local_agent_in_raw_wrapper_order(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    wrapper_one, session_one = _write_local_agent_wrapper(
+        workspace_uuid,
+        "one",
+        cli_session_id="dup-cli",
+        session_id="sess-one",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_one = session_one / ".claude" / "projects" / "-sessions-proc"
+    proj_one.mkdir(parents=True)
+    file_one = proj_one / "dup-cli.jsonl"
+    file_one.write_text("{}\n")
+
+    wrapper_two, session_two = _write_local_agent_wrapper(
+        workspace_uuid,
+        "two",
+        cli_session_id="dup-cli",
+        session_id="sess-two",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_two = session_two / ".claude" / "projects" / "-sessions-proc"
+    proj_two.mkdir(parents=True)
+    file_two = proj_two / "dup-cli.jsonl"
+    file_two.write_text("{}\n")
+
+    original_iterdir = discovery.Path.iterdir
+
+    def fake_iterdir(self):
+        if self == workspace_uuid:
+            return iter([wrapper_two, session_two, wrapper_one, session_one])
+        return original_iterdir(self)
+
+    with patch.object(discovery.Path, "iterdir", fake_iterdir):
+        all_files = list(discovery.iter_source_files(source_filter="claude"))
+        changed_only = [source for source in all_files if source.path == file_one]
+        inputs = list(discovery.iter_parse_inputs(source_files=changed_only))
+
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [1, 1]
+    assert [parse_input.parse_path for parse_input in inputs] == [file_two, file_one]
+
+
+# ---------- mixed-source ordering ----------
+
+
+def test_parse_inputs_preserve_mixed_source_order_when_expanding_claude_families(
+    isolated_homedir,
+):
+    native = isolated_homedir / "claude" / "projects" / "p"
+    native.mkdir(parents=True)
+    claude_file = native / "c.jsonl"
+    claude_file.write_text("{}\n")
+
+    codex = isolated_homedir / "codex" / "sessions" / "2026" / "04" / "19"
+    _write_codex_session(codex / "rollout-k.jsonl", "/cwd")
+
+    files = list(discovery.iter_source_files())
+    assert [(source.client, source.path.name) for source in files] == [
+        ("claude", "c.jsonl"),
+        ("codex", "rollout-k.jsonl"),
+    ]
+
+    inputs = list(discovery.iter_parse_inputs(source_files=files))
+    assert [(parse_input.client, parse_input.parse_path.name) for parse_input in inputs] == [
+        ("claude", "c.jsonl"),
+        ("codex", "rollout-k.jsonl"),
+    ]
 
 
 # ---------- Codex ----------
