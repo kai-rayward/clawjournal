@@ -10,7 +10,7 @@ Contract: docs/plans/phase-1/01-capture-pipeline.md.
 from clawjournal.capture.changes import (
     LineBatch,
     cursor_after,
-    cursor_to_eof,
+    cursor_for_reparse,
     file_has_changed,
     iter_new_lines,
 )
@@ -28,7 +28,7 @@ __all__ = [
     "LineBatch",
     "SourceFile",
     "cursor_after",
-    "cursor_to_eof",
+    "cursor_for_reparse",
     "ensure_schema",
     "file_has_changed",
     "get_cursor",
