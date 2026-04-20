@@ -910,6 +910,7 @@ def _parse_opencode_session(
         "cwd": None,
         "git_branch": None,
         "model": None,
+        "model_effort": None,
         "start_time": None,
         "end_time": None,
     }
@@ -949,6 +950,8 @@ def _parse_opencode_session(
                 model = _extract_opencode_model(message_data)
                 if metadata["model"] is None and model:
                     metadata["model"] = model
+                if metadata.get("model_effort") is None:
+                    metadata["model_effort"] = _extract_model_effort(message_data)
 
                 part_rows = conn.execute(
                     "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC",
@@ -1000,6 +1003,41 @@ def _make_stats() -> dict[str, int]:
     }
 
 
+_EFFORT_FIELD_ALIASES = (
+    "effort",                  # Codex turn_context
+    "reasoningEffort",         # OpenAI-flavored SDKs, OpenCode, OpenClaw
+    "reasoning_effort",        # Python SDK / Kimi
+    "reasoning_effort_level",
+)
+
+_EFFORT_NESTED_CONTAINERS = ("options", "providerOptions", "params", "config")
+
+
+def _extract_model_effort(payload: Any) -> str | None:
+    """Return a per-turn model effort ("medium"/"high"/"xhigh"/…) if present.
+
+    Each agent names the knob differently — Codex `turn_context` uses
+    ``effort``; OpenAI-style SDKs and OpenCode use ``reasoningEffort``;
+    the Python SDK uses ``reasoning_effort``. Some formats nest the field
+    under ``options``/``providerOptions``/``params``. When none of the
+    aliases are present (Claude Code, Gemini CLI today) the caller keeps
+    ``model_effort`` as ``None`` and the column simply won't populate.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for key in _EFFORT_FIELD_ALIASES:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for container_key in _EFFORT_NESTED_CONTAINERS:
+        nested = payload.get(container_key)
+        if isinstance(nested, dict):
+            inner = _extract_model_effort(nested)
+            if inner is not None:
+                return inner
+    return None
+
+
 def _make_session_result(
     metadata: dict[str, Any], messages: list[dict[str, Any]], stats: dict[str, int],
 ) -> dict[str, Any] | None:
@@ -1015,7 +1053,7 @@ def _make_session_result(
         "stats": stats,
     }
     # Pass through optional provenance fields from metadata
-    for key in ("entrypoint", "originator", "codex_source"):
+    for key in ("entrypoint", "originator", "codex_source", "model_effort"):
         val = metadata.get(key)
         if val is not None:
             result[key] = val
@@ -1060,6 +1098,7 @@ def _parse_claude_session_file(
         "git_branch": None,
         "claude_version": None,
         "model": None,
+        "model_effort": None,
         "start_time": None,
         "end_time": None,
         "entrypoint": None,
@@ -1251,6 +1290,7 @@ def _parse_gemini_session_file(
         "cwd": None,
         "git_branch": None,
         "model": None,
+        "model_effort": None,
         "start_time": data.get("startTime"),
         "end_time": data.get("lastUpdated"),
     }
@@ -1282,6 +1322,8 @@ def _parse_gemini_session_file(
         elif msg_type == "gemini":
             if metadata["model"] is None:
                 metadata["model"] = msg_data.get("model")
+            if metadata.get("model_effort") is None:
+                metadata["model_effort"] = _extract_model_effort(msg_data)
 
             tokens = msg_data.get("tokens", {})
             if tokens:
@@ -1344,6 +1386,7 @@ def _parse_openclaw_session_file(
         "cwd": None,
         "git_branch": None,
         "model": None,
+        "model_effort": None,
         "start_time": header.get("timestamp"),
         "end_time": None,
     }
@@ -1392,6 +1435,9 @@ def _parse_openclaw_session_file(
             model_id = entry.get("modelId", "")
             if model_id:
                 metadata["model"] = f"{provider}/{model_id}" if provider else model_id
+            effort = _extract_model_effort(entry)
+            if effort is not None:
+                metadata["model_effort"] = effort
 
         if entry_type == "compaction":
             comp_ts = timestamp
@@ -1443,6 +1489,8 @@ def _parse_openclaw_session_file(
             if model and metadata["model"] is None:
                 provider = msg_data.get("provider", "")
                 metadata["model"] = f"{provider}/{model}" if provider else model
+            if metadata.get("model_effort") is None:
+                metadata["model_effort"] = _extract_model_effort(msg_data)
 
             usage = msg_data.get("usage", {})
             if isinstance(usage, dict):
@@ -1656,6 +1704,10 @@ def _parse_codex_session_file(
             "model_provider": None,
             "originator": None,
             "codex_source": None,
+            # Codex logs `effort` (e.g. "medium"/"high"/"xhigh") in every
+            # `turn_context` event. Keep the first non-empty value so we
+            # attribute the session to the mode it was launched in.
+            "model_effort": None,
         },
     )
 
@@ -1752,6 +1804,8 @@ def _handle_codex_turn_context(
         model_name = payload.get("model")
         if isinstance(model_name, str) and model_name.strip():
             state.metadata["model"] = model_name
+    if state.metadata.get("model_effort") is None:
+        state.metadata["model_effort"] = _extract_model_effort(payload)
 
 
 def _handle_codex_response_item(
@@ -2086,6 +2140,7 @@ def _parse_kimi_session_file(
         "cwd": None,
         "git_branch": None,
         "model": None,
+        "model_effort": None,
         "start_time": None,
         "end_time": None,
     }
@@ -2094,6 +2149,8 @@ def _parse_kimi_session_file(
     try:
         for entry in _iter_jsonl(filepath):
             role = entry.get("role")
+            if metadata.get("model_effort") is None:
+                metadata["model_effort"] = _extract_model_effort(entry)
 
             if role == "user":
                 content = entry.get("content")
@@ -2274,8 +2331,11 @@ def _process_entry(
     elif entry_type == "assistant":
         msg = _extract_assistant_content(entry, anonymizer, include_thinking, tool_result_map)
         if msg:
+            message_payload = entry.get("message", {})
             if metadata["model"] is None:
-                metadata["model"] = entry.get("message", {}).get("model")
+                metadata["model"] = message_payload.get("model")
+            if metadata.get("model_effort") is None:
+                metadata["model_effort"] = _extract_model_effort(message_payload)
             usage = entry.get("message", {}).get("usage", {})
             stats["input_tokens"] += usage.get("input_tokens", 0)
             stats["output_tokens"] += usage.get("output_tokens", 0)

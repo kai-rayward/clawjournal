@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     project            TEXT NOT NULL,
     source             TEXT NOT NULL,
     model              TEXT,
+    model_effort       TEXT,
     start_time         TEXT,
     end_time           TEXT,
     duration_seconds   INTEGER,
@@ -242,6 +243,7 @@ def open_index() -> sqlite3.Connection:
         ("ai_summary", "TEXT"),           # replaces ai_quality_tier
         ("tool_counts", "TEXT"),
         ("user_interrupts", "INTEGER"),
+        ("model_effort", "TEXT"),   # Codex-style reasoning effort ("medium"/"high"/"xhigh")
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -1102,7 +1104,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         # are simply absent from the SET clause.
         conn.execute(
             """INSERT INTO sessions (
-                session_id, project, source, model,
+                session_id, project, source, model, model_effort,
                 start_time, end_time, duration_seconds,
                 git_branch,
                 user_messages, assistant_messages, tool_uses,
@@ -1128,7 +1130,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 tool_counts, user_interrupts,
                 hold_state
             ) VALUES (
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?,
                 ?,
                 ?, ?, ?,
@@ -1158,6 +1160,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 project = excluded.project,
                 source = excluded.source,
                 model = excluded.model,
+                model_effort = excluded.model_effort,
                 start_time = excluded.start_time,
                 end_time = excluded.end_time,
                 duration_seconds = excluded.duration_seconds,
@@ -1191,7 +1194,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 user_interrupts = excluded.user_interrupts
             """,
             (
-                session_id, project, source, session.get("model"),
+                session_id, project, source, session.get("model"), session.get("model_effort"),
                 session.get("start_time"), session.get("end_time"), duration,
                 session.get("git_branch"),
                 stats.get("user_messages", 0),
@@ -1327,7 +1330,7 @@ def query_sessions(
     # Validate sort column to prevent SQL injection
     allowed_sort_columns = {
         "start_time", "end_time", "indexed_at", "updated_at",
-        "project", "source", "model", "review_status", "task_type",
+        "project", "source", "model", "model_effort", "review_status", "task_type",
         "user_messages", "assistant_messages", "tool_uses",
         "input_tokens", "output_tokens", "duration_seconds",
         "sensitivity_score", "ai_quality_score",
