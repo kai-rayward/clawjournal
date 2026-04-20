@@ -433,6 +433,70 @@ class TestDashboardAnalytics:
             {"source": "codex", "input_tokens": 500, "output_tokens": 100},
         ]
 
+    def test_outcome_normalization_collapses_duplicates(self, index_conn):
+        # AI `resolved` and heuristic `tests_passed` both normalize to
+        # 'resolved'; heuristic `partial` (interrupted) and AI `partial`
+        # (progress made) must stay separated.
+        upsert_sessions(index_conn, [
+            _make_session("a", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("b", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("c", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("d", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("e", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+        ])
+        # a: AI resolved, b: heuristic tests_passed  → both map to 'resolved'
+        update_session(index_conn, "a", ai_outcome_badge="resolved")
+        index_conn.execute("UPDATE sessions SET outcome_badge='tests_passed' WHERE session_id='b'")
+        # c: heuristic 'completed' (no signal) → 'inconclusive'
+        index_conn.execute("UPDATE sessions SET outcome_badge='completed' WHERE session_id='c'")
+        # d: heuristic 'partial' (interrupted) vs e: AI 'partial' (progress)
+        index_conn.execute("UPDATE sessions SET outcome_badge='partial' WHERE session_id='d'")
+        update_session(index_conn, "e", ai_outcome_badge="partial")
+
+        analytics = get_dashboard_analytics(index_conn)
+        buckets = {r["outcome_label"]: r["count"] for r in analytics["by_outcome_label"]}
+        assert buckets["resolved"] == 2
+        assert buckets["inconclusive"] == 1
+        assert buckets["interrupted"] == 1
+        assert buckets["partial"] == 1
+        # Resolve rate drops `completed` from the numerator: 2 resolved / 5 labeled.
+        assert analytics["resolve_rate"] == 0.4
+
+    def test_invalid_ai_outcome_gets_cleaned_on_open(self, tmp_path):
+        from clawjournal.workbench.index import open_index, INDEX_DB
+        import clawjournal.workbench.index as idx
+        import clawjournal.config
+        orig_dir = clawjournal.config.CONFIG_DIR
+        orig_db = idx.INDEX_DB
+        orig_blobs = idx.BLOBS_DIR
+        try:
+            clawjournal.config.CONFIG_DIR = tmp_path
+            idx.CONFIG_DIR = tmp_path
+            idx.INDEX_DB = tmp_path / "index.db"
+            idx.BLOBS_DIR = tmp_path / "blobs"
+            conn = open_index()
+            upsert_sessions(conn, [_make_session("bad")])
+            # Simulate a judge-era bug writing 'unknown' (not in valid set).
+            conn.execute("UPDATE sessions SET ai_outcome_badge = 'unknown'")
+            conn.commit()
+            conn.close()
+
+            conn2 = open_index()
+            row = conn2.execute(
+                "SELECT ai_outcome_badge FROM sessions WHERE session_id = 'bad'"
+            ).fetchone()
+            assert row["ai_outcome_badge"] is None
+            conn2.close()
+        finally:
+            clawjournal.config.CONFIG_DIR = orig_dir
+            idx.INDEX_DB = orig_db
+            idx.BLOBS_DIR = orig_blobs
+
     def test_by_task_type_groups_by_coalesce_not_raw_column(self, index_conn):
         # Regression: `GROUP BY task_type` in SQLite with an alias that shadows
         # a real column resolves to the column, producing duplicate rows for

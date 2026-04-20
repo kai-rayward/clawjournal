@@ -51,13 +51,19 @@ def collect_advisor_stats(
     # Same-model traffic at different reasoning-effort tiers (e.g.
     # `gpt-5.4 @ high` vs `gpt-5.4 @ xhigh`) is split into separate rows
     # so "Most efficient" and "Highest quality" picks a specific tier.
+    # Numerator matches the normalized `resolved` bucket in
+    # workbench.index (AI `resolved` or heuristic `tests_passed`).
+    # Dropping heuristic `completed` from the success set — it's the
+    # "no signal either way" fallback and overstated quality.
     rows = conn.execute(
         "SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
         "       THEN model || ' @ ' || model_effort ELSE model END as model, "
         "COUNT(*) as sessions, "
         "SUM(estimated_cost_usd) as cost, "
         "AVG(ai_quality_score) as avg_score, "
-        "SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
+        "SUM(CASE WHEN ai_outcome_badge = 'resolved' "
+        "          OR (ai_outcome_badge IS NULL AND outcome_badge = 'tests_passed') "
+        "         THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
         "AND model IS NOT NULL AND model != '<synthetic>' "
         "GROUP BY 1 ORDER BY cost DESC",

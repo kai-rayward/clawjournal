@@ -100,7 +100,7 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
         ai_score_reason=result.reason,
         ai_scoring_detail=result.detail_json,
         ai_task_type=result.task_type,
-        ai_outcome_badge=result.outcome_label,
+        ai_outcome_badge=result.outcome_label or None,
         ai_value_badges=json.dumps(result.value_labels),
         ai_risk_badges=json.dumps(result.risk_level),
         ai_display_title=result.display_title or None,

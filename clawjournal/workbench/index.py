@@ -28,6 +28,33 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 SECURITY_SCHEMA_VERSION = 2
 BACKFILL_WINDOW = 100
 
+# Display-only normalization from the mixed AI/heuristic outcome vocabulary
+# onto a single coherent label set. Prevents the duplicate-meaning rows we
+# used to get (AI `resolved` next to heuristic `tests_passed`; AI `partial`
+# colliding with heuristic `partial` that means "user spoke last"). AI
+# labels take precedence when present; invalid judge output maps to
+# `unknown` (validation at the write path now prevents this from growing).
+# Keep columns selectable everywhere by wrapping in `({_OUTCOME_NORMALIZE_SQL}) as outcome_label`.
+_OUTCOME_NORMALIZE_SQL = (
+    "CASE "
+    "WHEN ai_outcome_badge = 'resolved'    THEN 'resolved' "
+    "WHEN ai_outcome_badge = 'partial'     THEN 'partial' "
+    "WHEN ai_outcome_badge = 'failed'      THEN 'failed' "
+    "WHEN ai_outcome_badge = 'abandoned'   THEN 'abandoned' "
+    "WHEN ai_outcome_badge = 'exploratory' THEN 'exploratory' "
+    "WHEN ai_outcome_badge = 'trivial'     THEN 'trivial' "
+    "WHEN ai_outcome_badge IS NOT NULL     THEN 'unknown' "
+    "WHEN outcome_badge = 'tests_passed'   THEN 'resolved' "
+    "WHEN outcome_badge = 'tests_failed'   THEN 'failed' "
+    "WHEN outcome_badge = 'build_failed'   THEN 'failed' "
+    "WHEN outcome_badge = 'errored'        THEN 'failed' "
+    "WHEN outcome_badge = 'completed'      THEN 'inconclusive' "
+    "WHEN outcome_badge = 'partial'        THEN 'interrupted' "
+    "WHEN outcome_badge = 'analysis_only'  THEN 'exploratory' "
+    "ELSE 'unscored' "
+    "END"
+)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id         TEXT PRIMARY KEY,
@@ -272,6 +299,18 @@ def open_index() -> sqlite3.Connection:
                 raise
 
     _migrate_security_refactor(conn)
+
+    # Clean up ai_outcome_badge values that the judge wrote before the
+    # resolution validator rejected invalid labels. Idempotent: after
+    # the first cleanup this UPDATE matches zero rows. Keeps the
+    # normalized outcome chart free of silent "unknown" buckets.
+    conn.execute(
+        "UPDATE sessions SET ai_outcome_badge = NULL "
+        "WHERE ai_outcome_badge IS NOT NULL "
+        "AND ai_outcome_badge NOT IN "
+        "('resolved', 'partial', 'failed', 'abandoned', 'exploratory', 'trivial')"
+    )
+    conn.commit()
 
     return conn
 
@@ -1890,14 +1929,19 @@ def get_dashboard_analytics(
 
     # Resolve rate with previous-period comparison for trend coloring
     def _compute_resolve_rate(rr_start: str | None, rr_end: str | None) -> float | None:
+        # Denominator excludes sessions that normalize to `unscored` (no
+        # label at all). Numerator is the normalized `resolved` bucket —
+        # AI `resolved` plus heuristic `tests_passed`. The previous
+        # formula folded heuristic `completed` into "resolved" too, but
+        # `completed` is now `inconclusive` (no-signal fallback), which
+        # would overstate success.
         rr_where, rr_params = _build_start_time_where(
             start=rr_start, end=rr_end,
-            base_clauses=["COALESCE(ai_outcome_badge, outcome_badge) IS NOT NULL"],
+            base_clauses=[f"({_OUTCOME_NORMALIZE_SQL}) != 'unscored'"],
         )
         r = conn.execute(
             "SELECT COUNT(*) as total, "
-            "SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) "
-            "IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) as resolved "
+            f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) as resolved "
             f"FROM sessions {rr_where}",
             rr_params,
         ).fetchone()
@@ -1972,15 +2016,18 @@ def get_dashboard_analytics(
     ).fetchall()
     result["activity"] = [dict(r) for r in rows]
 
-    # Outcome badge distribution (prefer LLM classification)
+    # Outcome distribution — normalized to the clean dashboard vocabulary
+    # so we don't show AI `resolved` next to heuristic `tests_passed`
+    # (same underlying fact) or collide AI `partial` (progress made)
+    # with heuristic `partial` (user interrupted the session).
     outcome_where, outcome_params = _build_start_time_where(
         start=start, end=end,
-        base_clauses=["COALESCE(ai_outcome_badge, outcome_badge) IS NOT NULL"],
+        base_clauses=[f"({_OUTCOME_NORMALIZE_SQL}) != 'unscored'"],
     )
     rows = conn.execute(
-        "SELECT COALESCE(ai_outcome_badge, outcome_badge) as outcome_label, "
+        f"SELECT ({_OUTCOME_NORMALIZE_SQL}) as outcome_label, "
         f"COUNT(*) as count FROM sessions {outcome_where} "
-        "GROUP BY outcome_label",
+        "GROUP BY 1",
         outcome_params,
     ).fetchall()
     result["by_outcome_label"] = [dict(r) for r in rows]
@@ -2441,7 +2488,7 @@ def get_insights(
         f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
         f"COUNT(*) as sessions, "
         f"AVG(ai_quality_score) as avg_score, "
-        f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
+        f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"SUM(estimated_cost_usd) as total_cost "
         f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
@@ -2469,7 +2516,7 @@ def get_insights(
         f"COUNT(*) as sessions, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"AVG(duration_seconds) as avg_duration, "
-        f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
+        f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
         f"FROM sessions {where} "
         f"GROUP BY day ORDER BY day",
         params_base,

@@ -59,21 +59,25 @@ const COLORS: Record<BadgeKind, Record<string, { bg: string; fg: string }>> = {
 };
 
 export const LABELS: Record<string, string> = {
-  // Resolution labels
+  // Normalized outcome labels (what the dashboard shows)
   resolved: 'Resolved',
   partial: 'Partial',
+  interrupted: 'Interrupted',
   failed: 'Failed',
   abandoned: 'Abandoned',
   exploratory: 'Exploratory',
+  inconclusive: 'Inconclusive',
   trivial: 'Trivial',
-  // Legacy outcome labels
+  unscored: 'Unscored',
+  unknown: 'Unknown',
+  // Raw badges kept so session-detail views still render correctly when
+  // they show the source-of-truth label instead of the normalized one.
   tests_passed: 'Tests Passed',
   tests_failed: 'Tests Failed',
   build_failed: 'Build Failed',
   analysis_only: 'Analysis',
   completed: 'Completed',
   errored: 'Errored',
-  unknown: 'Unknown',
   // Session tags
   multi_file: 'Multi-File',
   single_file: 'Single File',
