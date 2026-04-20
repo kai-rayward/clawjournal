@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tool_uses          INTEGER DEFAULT 0,
     input_tokens       INTEGER DEFAULT 0,
     output_tokens      INTEGER DEFAULT 0,
+    cache_read_tokens       INTEGER DEFAULT 0,
+    cache_creation_tokens   INTEGER DEFAULT 0,
     display_title      TEXT,
     outcome_badge      TEXT,
     value_badges       TEXT,
@@ -244,6 +246,11 @@ def open_index() -> sqlite3.Connection:
         ("tool_counts", "TEXT"),
         ("user_interrupts", "INTEGER"),
         ("model_effort", "TEXT"),   # Codex-style reasoning effort ("medium"/"high"/"xhigh")
+        # Cached-input token buckets. Previously tracked only in the in-memory
+        # stats dict (and used for cost estimation), not persisted. Without
+        # them the Token Usage chart under-counts Claude input by ~50x.
+        ("cache_read_tokens", "INTEGER DEFAULT 0"),
+        ("cache_creation_tokens", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -1109,6 +1116,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 git_branch,
                 user_messages, assistant_messages, tool_uses,
                 input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens,
                 display_title,
                 outcome_badge, value_badges, risk_badges,
                 sensitivity_score, task_type,
@@ -1134,6 +1142,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 ?, ?, ?,
                 ?,
                 ?, ?, ?,
+                ?, ?,
                 ?, ?,
                 ?,
                 ?, ?, ?,
@@ -1170,6 +1179,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 tool_uses = excluded.tool_uses,
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_creation_tokens = excluded.cache_creation_tokens,
                 display_title = excluded.display_title,
                 outcome_badge = excluded.outcome_badge,
                 value_badges = excluded.value_badges,
@@ -1202,6 +1213,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 stats.get("tool_uses", 0),
                 in_tok,
                 out_tok,
+                cache_read,
+                cache_create,
                 display_title,
                 badges["outcome_badge"],
                 json.dumps(badges["value_badges"]),
@@ -1854,10 +1867,13 @@ def get_dashboard_analytics(
         base_clauses=["start_time IS NOT NULL"],
     )
 
-    # Summary
+    # Summary. `total_tokens` sums all input buckets (including cached reads
+    # and cache creation) plus output, matching how billing reports it.
+    # Omitting cache_* under-counts Claude by ~50x.
     row = conn.execute(
         "SELECT COUNT(*) as total_sessions, "
-        "SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as total_tokens, "
+        "SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        "  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as total_tokens, "
         "COUNT(DISTINCT project) as unique_projects, "
         "COUNT(DISTINCT source) as unique_sources, "
         "SUM(estimated_cost_usd) as total_cost "
@@ -2017,9 +2033,14 @@ def get_dashboard_analytics(
     ).fetchall()
     result["by_model"] = [dict(r) for r in rows]
 
-    # Tokens by source
+    # Tokens by source. `input_tokens` holds the fresh non-cached bucket
+    # only; Claude's heavy prompt caching means the full input seen by
+    # the model is input + cache_read + cache_creation. Sum all three
+    # for the display bar so Claude's input doesn't look artificially
+    # 50x smaller than output.
     rows = conn.execute(
-        "SELECT source, SUM(input_tokens) as input_tokens, "
+        "SELECT source, "
+        "SUM(input_tokens) + SUM(COALESCE(cache_read_tokens, 0)) + SUM(COALESCE(cache_creation_tokens, 0)) as input_tokens, "
         "SUM(output_tokens) as output_tokens "
         f"FROM sessions{filtered_where} GROUP BY source",
         filtered_params,

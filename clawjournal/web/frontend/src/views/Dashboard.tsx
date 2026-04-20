@@ -392,7 +392,7 @@ export function Dashboard() {
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Sessions</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Avg Score</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Resolve Rate</th>
-                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Avg API Cost</th>
+                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }} title="Average API cost per session (total cost ÷ sessions)">Avg Cost / Session</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Total API Cost</th>
                   </tr>
                 </thead>
@@ -446,9 +446,9 @@ export function Dashboard() {
       {triage && (
         <div style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', gap: 14, fontSize: 13, color: colors.gray500, marginBottom: 4 }}>
-            <span style={{ color: colors.green500 }}>{approved} approved</span>
-            <span style={{ color: colors.yellow400 }}>{toReview} to review</span>
-            <span>{skipped} skipped</span>
+            <span style={{ color: colors.green500 }} title="Sessions you've approved and are cleared for export/share">{approved} approved</span>
+            <span style={{ color: colors.yellow400 }} title="Unreviewed (new) and shortlisted sessions — waiting for your triage decision">{toReview} to review</span>
+            <span title="Sessions you've blocked — they stay local and are excluded from bundles and shares">{skipped} skipped</span>
           </div>
           <div style={{ display: 'flex', height: 6, borderRadius: 3, overflow: 'hidden', background: colors.gray100 }}>
             {approved > 0 && summary.total_sessions > 0 && <div style={{ width: `${(approved / summary.total_sessions) * 100}%`, background: colors.green400, transition: 'width 0.3s' }} />}
