@@ -2006,9 +2006,13 @@ def get_dashboard_analytics(
         start=start, end=end,
         base_clauses=["model IS NOT NULL", "model != '<synthetic>'"],
     )
+    # Split same-model traffic across effort tiers (e.g. "gpt-5.4 @ high"
+    # vs "gpt-5.4 @ xhigh"); fall back to bare model when effort is NULL.
     rows = conn.execute(
-        "SELECT model, COUNT(*) as count FROM sessions "
-        f"{model_where} GROUP BY model ORDER BY count DESC",
+        "SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        "       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        "COUNT(*) as count FROM sessions "
+        f"{model_where} GROUP BY 1 ORDER BY count DESC",
         model_params,
     ).fetchall()
     result["by_model"] = [dict(r) for r in rows]
@@ -2404,13 +2408,15 @@ def get_insights(
     # same rationale as scoring/insights.py:55 and the cli.py:479 export
     # filter. These sessions have no real model/cost and pollute the table.
     rows = conn.execute(
-        f"SELECT model, COUNT(*) as sessions, "
+        f"SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        f"COUNT(*) as sessions, "
         f"AVG(ai_quality_score) as avg_score, "
         f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"SUM(estimated_cost_usd) as total_cost "
         f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
-        f"GROUP BY model ORDER BY sessions DESC",
+        f"GROUP BY 1 ORDER BY sessions DESC",
         params_base,
     ).fetchall()
     result["model_effectiveness"] = [
@@ -2459,11 +2465,14 @@ def get_insights(
     ).fetchall()
     result["effort_distribution"] = [dict(r) for r in rows]
 
-    # Cost breakdown (excludes `<synthetic>` — same rationale).
+    # Cost breakdown (excludes `<synthetic>` — same rationale). Splits
+    # same-model spend across effort tiers.
     rows = conn.execute(
-        f"SELECT model, COALESCE(SUM(estimated_cost_usd), 0) as cost "
+        f"SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
-        f"GROUP BY model ORDER BY cost DESC",
+        f"GROUP BY 1 ORDER BY cost DESC",
         params_base,
     ).fetchall()
     result["cost_by_model"] = [dict(r) for r in rows]
