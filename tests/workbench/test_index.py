@@ -433,6 +433,34 @@ class TestDashboardAnalytics:
             {"source": "codex", "input_tokens": 500, "output_tokens": 100},
         ]
 
+    def test_by_task_type_groups_by_coalesce_not_raw_column(self, index_conn):
+        # Regression: `GROUP BY task_type` in SQLite with an alias that shadows
+        # a real column resolves to the column, producing duplicate rows for
+        # the same displayed COALESCE value. Confirm the fix groups by the
+        # expression so each visible label appears exactly once.
+        upsert_sessions(index_conn, [
+            _make_session("a", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("b", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+            _make_session("c", start_time="2025-01-10T00:00:00+00:00",
+                          end_time="2025-01-10T00:10:00+00:00"),
+        ])
+        # Induce the ai_task_type='unknown' / task_type!='unknown' divergence
+        # that triggered the dashboard duplicate rows.
+        index_conn.execute("UPDATE sessions SET task_type = 'refactor' WHERE session_id = 'a'")
+        index_conn.execute("UPDATE sessions SET task_type = 'feature' WHERE session_id = 'b'")
+        index_conn.execute("UPDATE sessions SET task_type = 'docs' WHERE session_id = 'c'")
+        update_session(index_conn, "a", ai_task_type="unknown")
+        update_session(index_conn, "b", ai_task_type="unknown")
+        update_session(index_conn, "c", ai_task_type="unknown")
+        analytics = get_dashboard_analytics(index_conn)
+        task_types = [row["task_type"] for row in analytics["by_task_type"]]
+        assert task_types == ["unknown"], (
+            f"Expected one collapsed row, got {analytics['by_task_type']}"
+        )
+        assert analytics["by_task_type"][0]["count"] == 3
+
 
 class TestShares:
     def test_create_and_get(self, index_conn):

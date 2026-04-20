@@ -366,7 +366,7 @@ export function Dashboard() {
                         <div style={{ width: `${(f.sessions / maxFocus) * 100}%`, background: colors.primary400, borderRadius: 3, height: 14, minWidth: 2, transition: 'width 0.3s ease' }} />
                       </div>
                       <div style={{ width: 80, fontSize: 12, color: colors.gray500, textAlign: 'right', flexShrink: 0 }}>
-                        {f.sessions}s · {formatCost(f.cost)}
+                        {f.sessions} sess · {formatCost(f.cost)}
                       </div>
                     </div>
                   );

@@ -2008,10 +2008,16 @@ def get_dashboard_analytics(
         start=start, end=end,
         base_clauses=["COALESCE(ai_task_type, task_type) IS NOT NULL"],
     )
+    # NOTE: Must GROUP BY 1 (ordinal), not by the alias. SQLite resolves
+    # `GROUP BY task_type` to the raw `task_type` column, not the
+    # COALESCE expression, because the alias name collides with a real
+    # column — producing multiple rows for the same displayed label
+    # (e.g. two "unknown" rows when ai_task_type='unknown' differs from
+    # the raw task_type).
     rows = conn.execute(
         "SELECT COALESCE(ai_task_type, task_type) as task_type, "
         f"COUNT(*) as count FROM sessions {task_where} "
-        "GROUP BY task_type ORDER BY count DESC",
+        "GROUP BY 1 ORDER BY count DESC",
         task_params,
     ).fetchall()
     result["by_task_type"] = [dict(r) for r in rows]
@@ -2381,7 +2387,8 @@ def get_insights(
         f"SELECT DATE(start_time) as day, "
         f"CAST(strftime('%H', start_time) AS INTEGER) as hour, "
         f"COUNT(*) as sessions, "
-        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as tokens, "
+        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        f"  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as tokens, "
         f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} "
         f"GROUP BY day, hour ORDER BY day, hour",
@@ -2392,7 +2399,8 @@ def get_insights(
     # Focus: sessions by project with cost and task type breakdown
     rows = conn.execute(
         f"SELECT project, COUNT(*) as sessions, "
-        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as tokens, "
+        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        f"  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as tokens, "
         f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} "
         f"GROUP BY project ORDER BY sessions DESC LIMIT 20",
