@@ -1175,6 +1175,7 @@ def _parse_subagent_session(
         "git_branch": None,
         "claude_version": None,
         "model": None,
+        "model_effort": None,
         "start_time": None,
         "end_time": None,
     }
