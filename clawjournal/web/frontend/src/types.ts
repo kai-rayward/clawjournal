@@ -5,6 +5,7 @@ export interface Session {
   project: string;
   source: string;
   model: string | null;
+  model_effort: string | null;
   start_time: string | null;
   end_time: string | null;
   duration_seconds: number | null;

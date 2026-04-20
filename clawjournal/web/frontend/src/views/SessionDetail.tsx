@@ -315,7 +315,16 @@ export default function SessionDetail() {
               color: sourceLabel(session).color,
             }}>{sourceLabel(session).label}</span>
           } />
-          <MetaRow label="Model" value={session.model ?? '--'} />
+          <MetaRow
+            label="Model"
+            value={
+              session.model
+                ? session.model_effort
+                  ? `${session.model} @ ${session.model_effort}`
+                  : session.model
+                : '--'
+            }
+          />
           <MetaRow label="Branch" value={session.git_branch ?? '--'} />
           <MetaRow label="Task type" value={session.task_type ?? '--'} />
           <MetaRow label="Started" value={formatTime(session.start_time)} />
@@ -425,7 +434,11 @@ export default function SessionDetail() {
         <h2 style={{ margin: '0 0 4px', fontSize: 20 }}>{session.display_title}</h2>
         <div style={{ fontSize: 13, color: colors.gray500, marginBottom: 16 }}>
           {session.project} &middot; {session.source}
-          {session.model && <> &middot; {session.model}</>}
+          {session.model && (
+            <> &middot; {session.model}
+              {session.model_effort && <> @ {session.model_effort}</>}
+            </>
+          )}
         </div>
 
         {session.messages.length === 0 && (
