@@ -50,6 +50,13 @@ def _write_local_agent_wrapper(
     return wrapper, session_dir
 
 
+def _make_workspace_dirs(isolated_homedir):
+    root_uuid = isolated_homedir / "local_agent" / "11111111-2222-3333-4444-555555555555"
+    workspace_uuid = root_uuid / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    workspace_uuid.mkdir(parents=True)
+    return workspace_uuid
+
+
 # ---------- Claude native ----------
 
 
@@ -76,41 +83,37 @@ def test_claude_native_discovery_yields_sessions_and_subagents(isolated_homedir)
 # ---------- Claude Desktop local-agent (step 1b) ----------
 
 
-def test_local_agent_discovery_uses_user_folder_workspace_key(isolated_homedir):
-    root_uuid = isolated_homedir / "local_agent" / "11111111-2222-3333-4444-555555555555"
-    workspace_uuid = root_uuid / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    workspace_uuid.mkdir(parents=True)
-
+def test_local_agent_yields_only_cli_session_id_transcript(isolated_homedir):
+    """parser.py:862 reads only `{nested_project_dir}/{cli_session_id}.jsonl`
+    per wrapper. Other `.jsonl` files in the same dir, subagent streams,
+    and audit.jsonl are deliberately skipped so step-2 Scanner parity
+    holds."""
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
     _, session_dir = _write_local_agent_wrapper(
         workspace_uuid,
         "abc",
-        cli_session_id="cli-1",
-        session_id="sess-1",
+        cli_session_id="cli-42",
+        session_id="sess-42",
         process_name="myproc",
         user_folder="/Users/me/ws-one",
     )
-    projects_dir = session_dir / ".claude" / "projects" / "-sessions-myproc"
-    projects_dir.mkdir(parents=True)
-    (projects_dir / "inside.jsonl").write_text("{}\n")
-    subagents = projects_dir / "inside" / "subagents"
+    proj = session_dir / ".claude" / "projects" / "-sessions-myproc"
+    proj.mkdir(parents=True)
+    (proj / "cli-42.jsonl").write_text("{}\n")          # matches cliSessionId
+    (proj / "stale-session.jsonl").write_text("{}\n")   # parser ignores
+    subagents = proj / "cli-42" / "subagents"
     subagents.mkdir(parents=True)
-    (subagents / "agent-9.jsonl").write_text("{}\n")
-    (session_dir / "audit.jsonl").write_text("{}\n")
+    (subagents / "agent-1.jsonl").write_text("{}\n")    # parser ignores
+    (session_dir / "audit.jsonl").write_text("{}\n")    # metadata, not a transcript
 
     files = list(discovery.iter_source_files(source_filter="claude"))
-    names = sorted(f.path.name for f in files)
-    assert names == ["agent-9.jsonl", "audit.jsonl", "inside.jsonl"]
-    assert {f.project_dir_name for f in files} == {"-Users-me-ws-one"}
-    assert all(f.client == "claude" for f in files)
+    assert [f.path.name for f in files] == ["cli-42.jsonl"]
+    assert files[0].project_dir_name == "-Users-me-ws-one"
+    assert files[0].client == "claude"
 
 
-def test_local_agent_discovery_falls_back_to_cowork_key_without_user_folder(
-    isolated_homedir,
-):
-    root_uuid = isolated_homedir / "local_agent" / "11111111-2222-3333-4444-555555555555"
-    workspace_uuid = root_uuid / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    workspace_uuid.mkdir(parents=True)
-
+def test_local_agent_falls_back_to_cowork_key_without_user_folder(isolated_homedir):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
     _, session_dir = _write_local_agent_wrapper(
         workspace_uuid,
         "def",
@@ -118,13 +121,55 @@ def test_local_agent_discovery_falls_back_to_cowork_key_without_user_folder(
         session_id="sess-2",
         process_name="otherproc",
     )
-    projects_dir = session_dir / ".claude" / "projects" / "-sessions-otherproc"
-    projects_dir.mkdir(parents=True)
-    (projects_dir / "inside2.jsonl").write_text("{}\n")
+    proj = session_dir / ".claude" / "projects" / "-sessions-otherproc"
+    proj.mkdir(parents=True)
+    (proj / "cli-2.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert len(files) == 1
     assert files[0].project_dir_name == "_cowork_sess-2"
+    assert files[0].path.name == "cli-2.jsonl"
+
+
+def test_local_agent_skips_workspace_without_nested_project_dir(isolated_homedir):
+    """parser.py:415 filters out local-agent descriptors without a
+    nested_project_dir. A wrapper whose session dir has no
+    `.claude/projects` subtree yields nothing downstream, so the adapter
+    yields nothing either — even if audit.jsonl is present."""
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "noproj",
+        cli_session_id="cli-nodir",
+        session_id="sess-nodir",
+        process_name="x",
+    )
+    (session_dir / "audit.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    assert files == []
+
+
+def test_local_agent_skips_when_cli_session_transcript_missing(isolated_homedir):
+    """Only the cliSessionId-named transcript is read. If it doesn't
+    exist in the chosen nested project dir, the wrapper yields nothing,
+    matching parser.py:862 `if not jsonl_path: continue`."""
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_dir = _write_local_agent_wrapper(
+        workspace_uuid,
+        "nomatch",
+        cli_session_id="cli-expected",
+        session_id="sess-nomatch",
+        process_name="myproc",
+        user_folder="/Users/me/ws",
+    )
+    proj = session_dir / ".claude" / "projects" / "-sessions-myproc"
+    proj.mkdir(parents=True)
+    # Non-matching session file exists but the cliSessionId-named one does not
+    (proj / "cli-different.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    assert files == []
 
 
 def test_local_agent_skips_non_uuid_directories(isolated_homedir):
@@ -138,19 +183,11 @@ def test_local_agent_skips_non_uuid_directories(isolated_homedir):
 
 
 def test_local_agent_missing_directory_is_a_no_op(isolated_homedir):
-    # local_agent dir never created
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert files == []
 
 
 # ---------- wrapper validity gates (mirror parser.py:220-227) ----------
-
-
-def _make_workspace_dirs(isolated_homedir):
-    root_uuid = isolated_homedir / "local_agent" / "11111111-2222-3333-4444-555555555555"
-    workspace_uuid = root_uuid / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    workspace_uuid.mkdir(parents=True)
-    return workspace_uuid
 
 
 def test_local_agent_skips_wrapper_with_malformed_json(isolated_homedir):
@@ -161,8 +198,7 @@ def test_local_agent_skips_wrapper_with_malformed_json(isolated_homedir):
     session_dir.mkdir()
     proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
     proj_dir.mkdir(parents=True)
-    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
-    (session_dir / "audit.jsonl").write_text("{}\n")
+    (proj_dir / "anything.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert files == []
@@ -176,7 +212,7 @@ def test_local_agent_skips_wrapper_that_is_not_a_dict(isolated_homedir):
     session_dir.mkdir()
     proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
     proj_dir.mkdir(parents=True)
-    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
+    (proj_dir / "anything.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert files == []
@@ -190,7 +226,7 @@ def test_local_agent_skips_wrapper_without_cli_session_id(isolated_homedir):
     session_dir.mkdir()
     proj_dir = session_dir / ".claude" / "projects" / "-sessions-x"
     proj_dir.mkdir(parents=True)
-    (proj_dir / "should-not-show.jsonl").write_text("{}\n")
+    (proj_dir / "anything.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert files == []
@@ -211,15 +247,16 @@ def test_local_agent_prefers_sessions_processname_dir_over_others(isolated_homed
     )
     expected = session_dir / ".claude" / "projects" / "-sessions-myproc"
     expected.mkdir(parents=True)
-    (expected / "match.jsonl").write_text("{}\n")
-    # Extra unrelated dir — must not be tailed when the processName dir exists
+    (expected / "cli-5.jsonl").write_text("{}\n")
+    # Unrelated dir: even if the selection logic changed, its transcript
+    # should never be reached when -sessions-myproc is present.
     stray = session_dir / ".claude" / "projects" / "stray"
     stray.mkdir(parents=True)
-    (stray / "stray.jsonl").write_text("{}\n")
+    (stray / "cli-5.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
-    names = sorted(f.path.name for f in files)
-    assert names == ["match.jsonl"]
+    assert len(files) == 1
+    assert files[0].path == expected / "cli-5.jsonl"
 
 
 def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
@@ -236,16 +273,15 @@ def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
     )
     alt = session_dir / ".claude" / "projects" / "-sessions-fallback"
     alt.mkdir(parents=True)
-    (alt / "picked.jsonl").write_text("{}\n")
+    (alt / "cli-6.jsonl").write_text("{}\n")
     extra = session_dir / ".claude" / "projects" / "-sessions-other"
     extra.mkdir(parents=True)
-    (extra / "skipped.jsonl").write_text("{}\n")
+    (extra / "cli-6.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
-    names = sorted(f.path.name for f in files)
-    # Only the alphabetically-first fallback dir is picked (sorted iterdir).
-    # Parser's unsorted fallback is OS-dependent; the adapter is deterministic.
-    assert names == ["picked.jsonl"]
+    # Alphabetically-first fallback dir wins; the other is ignored.
+    assert len(files) == 1
+    assert files[0].path == alt / "cli-6.jsonl"
 
 
 # ---------- Codex ----------
