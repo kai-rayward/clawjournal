@@ -132,13 +132,18 @@ const SCATTER_W = 760;
 const SCATTER_H = 200;
 const SPAD = { top: 16, right: 16, bottom: 28, left: 50 };
 
+// Colors keyed on the normalized outcome vocabulary emitted by the
+// backend (see workbench/index.py._OUTCOME_NORMALIZE_SQL). Anything
+// unrecognized falls through to the default gray in the caller.
 const RESOLUTION_COLORS: Record<string, string> = {
-  resolved: colors.green500,
-  completed: colors.green500,
-  tests_passed: colors.green400,
-  partial: colors.yellow400,
-  failed: colors.red400,
-  abandoned: colors.red500,
+  resolved:     colors.green500,
+  partial:      colors.yellow400,
+  interrupted:  colors.yellow400,
+  failed:       colors.red400,
+  abandoned:    colors.red500,
+  exploratory:  colors.gray400,
+  inconclusive: colors.gray400,
+  trivial:      colors.gray400,
 };
 
 function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
@@ -218,12 +223,12 @@ function sourceLabel(source: string | null | undefined): string {
 }
 
 function outcomeColor(outcome: string | null | undefined): string {
+  // Normalized vocabulary from workbench/index.py._OUTCOME_NORMALIZE_SQL.
   if (!outcome) return colors.gray400;
-  const good = ['resolved', 'shipped', 'tests_passed', 'completed', 'success'];
-  const bad = ['failed', 'abandoned', 'build_failed', 'tests_failed', 'errored'];
-  if (good.includes(outcome)) return colors.green500;
-  if (bad.includes(outcome)) return colors.red400;
-  return colors.yellow400;
+  if (outcome === 'resolved') return colors.green500;
+  if (outcome === 'failed' || outcome === 'abandoned') return colors.red400;
+  if (outcome === 'partial' || outcome === 'interrupted') return colors.yellow400;
+  return colors.gray400;  // exploratory / inconclusive / trivial / unknown
 }
 
 function displayProject(project: string): string {

@@ -2468,10 +2468,15 @@ def get_insights(
         focus.append(proj)
     result["focus"] = focus
 
-    # Productivity: duration vs score
+    # Productivity: duration vs score. Returns the normalized resolution
+    # (`resolved` / `failed` / `partial` / etc.) so the frontend scatter
+    # plot only has to color-code one vocabulary. Before normalization,
+    # heuristic badges like `tests_failed` / `build_failed` / `errored`
+    # fell into the color map's default gray "Other" bucket instead of
+    # red failures.
     rows = conn.execute(
         f"SELECT session_id, duration_seconds, ai_quality_score, "
-        f"COALESCE(ai_outcome_badge, outcome_badge) as resolution, "
+        f"({_OUTCOME_NORMALIZE_SQL}) as resolution, "
         f"estimated_cost_usd as cost "
         f"FROM sessions {where} "
         f"AND duration_seconds IS NOT NULL AND ai_quality_score IS NOT NULL "
@@ -2500,12 +2505,16 @@ def get_insights(
         for r in rows
     ]
 
-    # Tool usage
+    # Tool usage. Uses `tool_counts` (JSON map of tool-name → call-count)
+    # rather than `commands_run` (list of raw shell strings). The prior
+    # query summed bash command lines like "ls /Users/..." and displayed
+    # them as the top tool, which was nonsensical. Mirrors the dashboard
+    # top_tools query.
     rows = conn.execute(
-        f"SELECT j.value as tool, COUNT(*) as calls "
-        f"FROM sessions, json_each(COALESCE(commands_run, '[]')) j "
-        f"{where} AND commands_run IS NOT NULL AND commands_run != '[]' "
-        f"GROUP BY tool ORDER BY calls DESC LIMIT 20",
+        f"SELECT key as tool, SUM(value) as calls "
+        f"FROM sessions, json_each(tool_counts) "
+        f"{where} AND tool_counts IS NOT NULL AND tool_counts != '{{}}' "
+        f"GROUP BY key ORDER BY calls DESC LIMIT 20",
         params_base,
     ).fetchall()
     result["tool_usage"] = [dict(r) for r in rows]
