@@ -586,9 +586,15 @@ def test_parse_inputs_preserve_duplicate_local_agent_candidates_stably(
     assert len(inputs) == 2
     assert inputs[0].session_key == inputs[1].session_key == "claude:-Users-me-ws:dup-cli"
     assert [parse_input.priority for parse_input in inputs] == [1, 1]
-    assert tuple(str(parse_input.parse_path) for parse_input in inputs) == tuple(
-        sorted(str(parse_input.parse_path) for parse_input in inputs)
-    )
+    # Both physical candidates are surfaced. Filesystem iterdir order is
+    # OS-dependent — macOS happens to return entries alphabetically, but
+    # Linux ext4 uses hash order. That's deliberate parser parity; the
+    # sibling test_..._preserve_raw_wrapper_order_... pins ordering via a
+    # patched iterdir. Here we only check presence.
+    assert {parse_input.parse_path for parse_input in inputs} == {
+        proj_one / "dup-cli.jsonl",
+        proj_two / "dup-cli.jsonl",
+    }
     assert all(len(parse_input.source_paths) == 1 for parse_input in inputs)
 
 
