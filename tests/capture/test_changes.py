@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from clawjournal.capture.changes import (
     cursor_after,
@@ -131,6 +133,36 @@ def test_cursor_after_is_immune_to_replacement_between_read_and_commit(tmp_path)
     assert batch2 is not None
     assert batch2.start_offset == 0
     assert batch2.lines == ['{"new":"much longer"}', '{"more":"stuff"}']
+
+
+def test_iter_new_lines_binds_batch_to_opened_file(tmp_path):
+    """If the path is replaced immediately before open(), the batch must
+    describe the replacement file we actually read, not the pre-open
+    inode that used to live at the path.
+    """
+    p = tmp_path / "a.jsonl"
+    p.write_bytes(b'{"old":1}\n')
+    replacement = b'{"new":1}\n{"new":2}\n'
+    original_open = Path.open
+    swapped = False
+
+    def fake_open(self, *args, **kwargs):
+        nonlocal swapped
+        if self == p and not swapped:
+            os.rename(p, tmp_path / "a.jsonl.old")
+            with open(p, "wb") as f:
+                f.write(replacement)
+            swapped = True
+        return original_open(self, *args, **kwargs)
+
+    with patch.object(Path, "open", fake_open):
+        batch = iter_new_lines(p, None, client="claude")
+
+    assert batch is not None
+    assert batch.lines == ['{"new":1}', '{"new":2}']
+    assert batch.inode == p.stat().st_ino
+    cur = cursor_after(batch, consumer_id="events")
+    assert iter_new_lines(p, cur, client="claude") is None
 
 
 # ---------- file-level change detection ----------

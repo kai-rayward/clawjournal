@@ -21,10 +21,15 @@ Phase 1 steps 1 and 1b cover:
       OS-dependent). Only one nested project dir is tailed per wrapper.
     - Only `{chosen_nested_project_dir}/{cliSessionId}.jsonl` is yielded
       per wrapper — the single transcript file the current parser reads.
-    - Wrappers whose `cliSessionId` matches a native session UUID in the
-      SAME workspace_key are dropped, mirroring the dedupe at
-      parser.py:399-400. Prevents step-2 Scanner from double-ingesting a
-      session that exists in both native and local-agent layouts.
+    - Semantic dedupe against native Claude sessions is intentionally
+      deferred to downstream consumers. The current parser suppresses a
+      local-agent duplicate only after a native transcript actually
+      parses successfully; discovery cannot know that from filenames
+      alone without risking fallback loss.
+    - Duplicate local-agent wrappers with the same `cliSessionId` are
+      likewise surfaced individually. The parser handles those with
+      session-level dedupe and fallback; capture stays at the physical
+      source-file layer.
     - Workspaces without a nested project dir surface nothing
       (parser.py:415 filters those out of discovery).
     - `workspace_key` comes from `userSelectedFolders[0]` with a
@@ -33,18 +38,33 @@ Phase 1 steps 1 and 1b cover:
 - Codex (`~/.codex/sessions/**`, `~/.codex/archived_sessions/*.jsonl`),
   grouped by the cwd extracted from each session's metadata.
 
+- OpenClaw (`~/.openclaw/agents/*/sessions/*.jsonl`), grouped by the cwd
+  read from each file's first-line `type: "session"` header (mirrors
+  `parser._build_openclaw_project_index` / `_extract_openclaw_cwd`).
+  Unparseable or header-less files fall back to `UNKNOWN_OPENCLAW_CWD`
+  so step-2 Scanner preserves the `openclaw:<cwd-name>` project group.
+
 Broader coverage (audit files, local-agent subagents, other clients) is
 deferred to migration step 5, when the legacy parser discovery is folded
 into the capture adapter.
+
+`iter_source_files()` stays at the physical-file layer because cursoring
+and line-level streaming are file-based. Parser-facing consumers should
+use `iter_parse_inputs()` to recover the current parser's logical units:
+native subagent-only sessions collapse to their enclosing session dir,
+and native/local-agent duplicates share a `session_key` with explicit
+priority ordering instead of forcing each consumer to rediscover Claude
+precedence rules.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from clawjournal.parsing import parser
 
@@ -60,6 +80,22 @@ class SourceFile:
     client: str
     project_dir_name: str
     size_bytes: int
+    session_key: str
+    parse_path: Path
+    parse_kind: str
+    parse_priority: int
+
+
+@dataclass(frozen=True)
+class ParseInput:
+    session_key: str
+    client: str
+    project_dir_name: str
+    parse_path: Path
+    parse_kind: str
+    priority: int
+    source_paths: tuple[Path, ...]
+    size_bytes: int
 
 
 def iter_source_files(
@@ -68,42 +104,69 @@ def iter_source_files(
     normalized = (source_filter or "").strip().lower()
     want_claude = normalized in ("", "auto", "all", "both", parser.CLAUDE_SOURCE)
     want_codex = normalized in ("", "auto", "all", "both", parser.CODEX_SOURCE)
+    want_openclaw = normalized in ("", "auto", "all", "both", parser.OPENCLAW_SOURCE)
 
     if want_claude:
-        native_ids_by_project = _compute_native_session_ids()
         yield from _iter_claude_native_files()
-        yield from _iter_local_agent_files(native_ids_by_project)
+        yield from _iter_local_agent_files()
     if want_codex:
         yield from _iter_codex_files()
+    if want_openclaw:
+        yield from _iter_openclaw_files()
+
+
+def iter_parse_inputs(
+    *,
+    source_filter: str | None = None,
+    source_files: Iterable[SourceFile] | None = None,
+) -> Iterator[ParseInput]:
+    """Coalesce physical source files into parser-facing logical inputs.
+
+    The current parser consumes some Claude sources at a coarser grain than
+    individual files:
+    - native subagent-only sessions parse as one session-dir merge,
+    - native/local-agent duplicates are a single logical session with
+      precedence (native first, then local-agent fallback),
+    - duplicate local-agent wrappers are multiple fallback candidates for
+      the same logical session.
+
+    `iter_parse_inputs()` preserves the physical file layer for cursoring,
+    but emits parser-ready candidates ordered by `(session_key, priority,
+    parse_path)`. Downstream consumers can group consecutive entries by
+    `session_key` and try candidates in order until one parses.
+    """
+
+    files = list(source_files) if source_files is not None else list(
+        iter_source_files(source_filter=source_filter)
+    )
+    groups: dict[tuple[str, str, str, Path, str, int], list[SourceFile]] = defaultdict(list)
+    for source in files:
+        groups[
+            (
+                source.session_key,
+                source.client,
+                source.project_dir_name,
+                source.parse_path,
+                source.parse_kind,
+                source.parse_priority,
+            )
+        ].append(source)
+
+    for key in sorted(groups, key=lambda item: (item[0], item[5], str(item[3]))):
+        members = sorted(groups[key], key=lambda source: str(source.path))
+        yield ParseInput(
+            session_key=key[0],
+            client=key[1],
+            project_dir_name=key[2],
+            parse_path=key[3],
+            parse_kind=key[4],
+            priority=key[5],
+            source_paths=tuple(member.path for member in members),
+            size_bytes=sum(member.size_bytes for member in members),
+        )
 
 
 # ---------- Claude native ----------
-
-
-def _compute_native_session_ids() -> dict[str, set[str]]:
-    """Return {project_dir_name: {session UUIDs with a native transcript}}.
-
-    Mirrors `parser._get_native_session_ids`: a UUID counts as native if it
-    appears as a root `<uuid>.jsonl` file OR as a subagent-only session
-    directory (a UUID-named dir with subagents but no root jsonl). Used to
-    dedupe local-agent wrappers whose `cliSessionId` matches a native
-    session in the same workspace (parser.py:399-400).
-    """
-    projects_dir = parser.PROJECTS_DIR
-    result: dict[str, set[str]] = {}
-    if not projects_dir.exists():
-        return result
-    for project_dir in projects_dir.iterdir():
-        if not project_dir.is_dir():
-            continue
-        ids: set[str] = {f.stem for f in project_dir.glob("*.jsonl")}
-        for entry in project_dir.iterdir():
-            if entry.is_dir() and entry.name not in ids:
-                subagents = entry / "subagents"
-                if subagents.is_dir() and any(subagents.glob("agent-*.jsonl")):
-                    ids.add(entry.name)
-        result[project_dir.name] = ids
-    return result
 
 
 def _iter_claude_native_files() -> Iterator[SourceFile]:
@@ -116,7 +179,15 @@ def _iter_claude_native_files() -> Iterator[SourceFile]:
         root_stems: set[str] = set()
         for jsonl in sorted(project_dir.glob("*.jsonl")):
             root_stems.add(jsonl.stem)
-            yield _make_source_file(jsonl, parser.CLAUDE_SOURCE, project_dir.name)
+            yield _make_source_file(
+                jsonl,
+                parser.CLAUDE_SOURCE,
+                project_dir.name,
+                session_key=_claude_session_key(project_dir.name, jsonl.stem),
+                parse_path=jsonl,
+                parse_kind="file",
+                parse_priority=0,
+            )
         # Subagent-only sessions: only yield for UUID-named dirs with no
         # sibling <uuid>.jsonl. Mirrors parser._find_subagent_only_sessions.
         # For rooted sessions, subagents are consumed as part of the root
@@ -129,16 +200,20 @@ def _iter_claude_native_files() -> Iterator[SourceFile]:
             if subagents.is_dir():
                 for jsonl in sorted(subagents.glob("agent-*.jsonl")):
                     yield _make_source_file(
-                        jsonl, parser.CLAUDE_SOURCE, project_dir.name
+                        jsonl,
+                        parser.CLAUDE_SOURCE,
+                        project_dir.name,
+                        session_key=_claude_session_key(project_dir.name, child.name),
+                        parse_path=child,
+                        parse_kind="claude_subagent_session",
+                        parse_priority=0,
                     )
 
 
 # ---------- Claude Desktop local-agent-mode ----------
 
 
-def _iter_local_agent_files(
-    native_ids_by_project: dict[str, set[str]],
-) -> Iterator[SourceFile]:
+def _iter_local_agent_files() -> Iterator[SourceFile]:
     root = parser.LOCAL_AGENT_DIR
     if not root.exists():
         return
@@ -156,12 +231,11 @@ def _iter_local_agent_files(
         for workspace_entry in workspaces:
             if not (workspace_entry.is_dir() and _UUID_RE.match(workspace_entry.name)):
                 continue
-            yield from _iter_workspace_files(workspace_entry, native_ids_by_project)
+            yield from _iter_workspace_files(workspace_entry)
 
 
 def _iter_workspace_files(
     workspace_dir: Path,
-    native_ids_by_project: dict[str, set[str]],
 ) -> Iterator[SourceFile]:
     try:
         entries = sorted(workspace_dir.iterdir())
@@ -181,12 +255,6 @@ def _iter_workspace_files(
         if wrapper is None:
             continue
         workspace_key = _workspace_key_from_wrapper(wrapper, session_dir)
-        cli_session_id = wrapper["cliSessionId"]
-        # Dedupe: if a native project at this workspace_key already has a
-        # session with the same UUID, skip the local-agent transcript to
-        # avoid double-ingest. Mirrors parser.py:399-400.
-        if cli_session_id in native_ids_by_project.get(workspace_key, ()):
-            continue
         yield from _iter_local_agent_transcript(
             session_dir, wrapper, workspace_key
         )
@@ -251,7 +319,15 @@ def _iter_local_agent_transcript(
     cli_session_id = wrapper["cliSessionId"]
     transcript = nested_project_dir / f"{cli_session_id}.jsonl"
     if transcript.is_file():
-        yield _make_source_file(transcript, parser.CLAUDE_SOURCE, workspace_key)
+        yield _make_source_file(
+            transcript,
+            parser.CLAUDE_SOURCE,
+            workspace_key,
+            session_key=_claude_session_key(workspace_key, cli_session_id),
+            parse_path=transcript,
+            parse_kind="file",
+            parse_priority=1,
+        )
 
 
 def _pick_nested_project_dir(
@@ -287,13 +363,29 @@ def _iter_codex_files() -> Iterator[SourceFile]:
             if path in seen:
                 continue
             seen.add(path)
-            yield _make_source_file(path, parser.CODEX_SOURCE, _codex_cwd(path))
+            yield _make_source_file(
+                path,
+                parser.CODEX_SOURCE,
+                _codex_cwd(path),
+                session_key=f"codex:{path}",
+                parse_path=path,
+                parse_kind="file",
+                parse_priority=0,
+            )
     if parser.CODEX_ARCHIVED_DIR.exists():
         for path in sorted(parser.CODEX_ARCHIVED_DIR.glob("*.jsonl")):
             if path in seen:
                 continue
             seen.add(path)
-            yield _make_source_file(path, parser.CODEX_SOURCE, _codex_cwd(path))
+            yield _make_source_file(
+                path,
+                parser.CODEX_SOURCE,
+                _codex_cwd(path),
+                session_key=f"codex:{path}",
+                parse_path=path,
+                parse_kind="file",
+                parse_priority=0,
+            )
 
 
 def _codex_cwd(session_file: Path) -> str:
@@ -301,10 +393,51 @@ def _codex_cwd(session_file: Path) -> str:
     return cwd or parser.UNKNOWN_CODEX_CWD
 
 
+# ---------- OpenClaw ----------
+
+
+def _iter_openclaw_files() -> Iterator[SourceFile]:
+    agents_dir = parser.OPENCLAW_AGENTS_DIR
+    if not agents_dir.exists():
+        return
+    try:
+        agent_dirs = sorted(agents_dir.iterdir())
+    except OSError:
+        return
+    for agent_dir in agent_dirs:
+        sessions_dir = agent_dir / "sessions"
+        if not sessions_dir.is_dir():
+            continue
+        for session_file in sorted(sessions_dir.glob("*.jsonl")):
+            cwd = parser._extract_openclaw_cwd(session_file) or parser.UNKNOWN_OPENCLAW_CWD
+            yield _make_source_file(
+                session_file,
+                parser.OPENCLAW_SOURCE,
+                cwd,
+                session_key=f"openclaw:{session_file}",
+                parse_path=session_file,
+                parse_kind="file",
+                parse_priority=0,
+            )
+
+
 # ---------- shared ----------
 
 
-def _make_source_file(path: Path, client: str, project_dir_name: str) -> SourceFile:
+def _claude_session_key(project_dir_name: str, session_id: str) -> str:
+    return f"claude:{project_dir_name}:{session_id}"
+
+
+def _make_source_file(
+    path: Path,
+    client: str,
+    project_dir_name: str,
+    *,
+    session_key: str,
+    parse_path: Path,
+    parse_kind: str,
+    parse_priority: int,
+) -> SourceFile:
     try:
         size = path.stat().st_size
     except FileNotFoundError:
@@ -314,4 +447,8 @@ def _make_source_file(path: Path, client: str, project_dir_name: str) -> SourceF
         client=client,
         project_dir_name=project_dir_name,
         size_bytes=size,
+        session_key=session_key,
+        parse_path=parse_path,
+        parse_kind=parse_kind,
+        parse_priority=parse_priority,
     )

@@ -17,6 +17,7 @@ def isolated_homedir(tmp_path, monkeypatch):
         parser, "CODEX_ARCHIVED_DIR", tmp_path / "codex" / "archived_sessions"
     )
     monkeypatch.setattr(parser, "LOCAL_AGENT_DIR", tmp_path / "local_agent")
+    monkeypatch.setattr(parser, "OPENCLAW_AGENTS_DIR", tmp_path / "openclaw" / "agents")
     return tmp_path
 
 
@@ -307,20 +308,22 @@ def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
     assert files[0].path == alt / "cli-6.jsonl"
 
 
-# ---------- cross-source dedupe (mirror parser.py:399-400) ----------
+# ---------- duplicate preservation / parser-level fallback ----------
 
 
-def test_local_agent_skipped_when_matching_native_session_exists(isolated_homedir):
-    """A local-agent wrapper whose cliSessionId matches a native session
-    UUID in the same workspace is dropped, so the Scanner doesn't
-    double-ingest the same session."""
-    # Native project at workspace_key `-Users-me-shared` with session UUID `dup`
+def test_local_agent_matching_native_session_is_still_surfaced(isolated_homedir):
+    """Discovery must preserve both physical sources when native and
+    local-agent layouts share a session UUID.
+
+    The current parser only suppresses the local-agent copy after the
+    native transcript actually parses. If discovery dropped the LA file
+    based on filenames alone, an empty or malformed native transcript
+    would block the LA fallback entirely.
+    """
     native = isolated_homedir / "claude" / "projects" / "-Users-me-shared"
     native.mkdir(parents=True)
-    (native / "dup.jsonl").write_text("{}\n")
+    (native / "dup.jsonl").write_text("")
 
-    # LA wrapper in a matching workspace (userSelectedFolders → same key)
-    # with cliSessionId == "dup" — should be skipped.
     workspace_uuid = _make_workspace_dirs(isolated_homedir)
     _, session_dir = _write_local_agent_wrapper(
         workspace_uuid,
@@ -336,7 +339,10 @@ def test_local_agent_skipped_when_matching_native_session_exists(isolated_homedi
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     paths = sorted(str(f.path.relative_to(isolated_homedir)) for f in files)
-    assert paths == ["claude/projects/-Users-me-shared/dup.jsonl"]
+    assert paths == [
+        "claude/projects/-Users-me-shared/dup.jsonl",
+        "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_dup/.claude/projects/-sessions-proc/dup.jsonl",
+    ]
 
 
 def test_local_agent_included_when_session_id_differs_from_native(isolated_homedir):
@@ -362,32 +368,137 @@ def test_local_agent_included_when_session_id_differs_from_native(isolated_homed
     assert names == ["la-only.jsonl", "native-only.jsonl"]
 
 
-def test_local_agent_dedupe_matches_native_subagent_only_session(isolated_homedir):
-    """Native subagent-only sessions also count as native IDs for dedupe —
-    parser._get_native_session_ids treats them as transcripts."""
+def test_duplicate_local_agent_wrappers_same_cli_session_id_are_both_surfaced(
+    isolated_homedir,
+):
+    """Capture stays at the physical source-file layer.
+
+    Multiple wrappers can point at the same logical session UUID. The
+    parser handles session-level dedupe and fallback; discovery should
+    surface both raw transcripts rather than picking one prematurely.
+    """
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_one = _write_local_agent_wrapper(
+        workspace_uuid,
+        "one",
+        cli_session_id="dup-cli",
+        session_id="sess-one",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_one = session_one / ".claude" / "projects" / "-sessions-proc"
+    proj_one.mkdir(parents=True)
+    (proj_one / "dup-cli.jsonl").write_text("{}\n")
+
+    _, session_two = _write_local_agent_wrapper(
+        workspace_uuid,
+        "two",
+        cli_session_id="dup-cli",
+        session_id="sess-two",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_two = session_two / ".claude" / "projects" / "-sessions-proc"
+    proj_two.mkdir(parents=True)
+    (proj_two / "dup-cli.jsonl").write_text("{}\n")
+
+    files = list(discovery.iter_source_files(source_filter="claude"))
+    paths = sorted(str(f.path.relative_to(isolated_homedir)) for f in files)
+    assert paths == [
+        "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_one/.claude/projects/-sessions-proc/dup-cli.jsonl",
+        "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_two/.claude/projects/-sessions-proc/dup-cli.jsonl",
+    ]
+
+
+# ---------- parser-facing logical inputs ----------
+
+
+def test_parse_inputs_collapse_native_subagent_only_session(isolated_homedir):
+    proj = isolated_homedir / "claude" / "projects" / "p"
+    proj.mkdir(parents=True)
+    session_dir = proj / "only-uuid"
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    (subagents / "agent-1.jsonl").write_text("{}\n")
+    (subagents / "agent-2.jsonl").write_text("{}\n")
+
+    inputs = list(discovery.iter_parse_inputs(source_filter="claude"))
+    assert len(inputs) == 1
+    parse_input = inputs[0]
+    assert parse_input.session_key == "claude:p:only-uuid"
+    assert parse_input.parse_kind == "claude_subagent_session"
+    assert parse_input.priority == 0
+    assert parse_input.parse_path == session_dir
+    assert tuple(path.name for path in parse_input.source_paths) == (
+        "agent-1.jsonl",
+        "agent-2.jsonl",
+    )
+
+
+def test_parse_inputs_encode_native_then_local_agent_fallback_order(
+    isolated_homedir,
+):
     native = isolated_homedir / "claude" / "projects" / "-Users-me-shared"
     native.mkdir(parents=True)
-    # Subagent-only native session with UUID "sub-dup"
-    subs = native / "sub-dup" / "subagents"
-    subs.mkdir(parents=True)
-    (subs / "agent-1.jsonl").write_text("{}\n")
+    (native / "dup.jsonl").write_text("")
 
     workspace_uuid = _make_workspace_dirs(isolated_homedir)
     _, session_dir = _write_local_agent_wrapper(
         workspace_uuid,
-        "ladup",
-        cli_session_id="sub-dup",  # matches native subagent-only UUID
-        session_id="sess-sub",
+        "dup",
+        cli_session_id="dup",
+        session_id="sess-dup",
         process_name="proc",
         user_folder="/Users/me/shared",
     )
     proj = session_dir / ".claude" / "projects" / "-sessions-proc"
     proj.mkdir(parents=True)
-    (proj / "sub-dup.jsonl").write_text("{}\n")
+    (proj / "dup.jsonl").write_text("{}\n")
 
-    files = list(discovery.iter_source_files(source_filter="claude"))
-    # Only the native subagent file is yielded; the LA transcript is deduped.
-    assert [f.path.name for f in files] == ["agent-1.jsonl"]
+    inputs = list(discovery.iter_parse_inputs(source_filter="claude"))
+    assert len(inputs) == 2
+    assert [parse_input.priority for parse_input in inputs] == [0, 1]
+    assert inputs[0].session_key == inputs[1].session_key == "claude:-Users-me-shared:dup"
+    assert inputs[0].parse_path == native / "dup.jsonl"
+    assert inputs[1].parse_path == proj / "dup.jsonl"
+
+
+def test_parse_inputs_preserve_duplicate_local_agent_candidates_stably(
+    isolated_homedir,
+):
+    workspace_uuid = _make_workspace_dirs(isolated_homedir)
+    _, session_one = _write_local_agent_wrapper(
+        workspace_uuid,
+        "one",
+        cli_session_id="dup-cli",
+        session_id="sess-one",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_one = session_one / ".claude" / "projects" / "-sessions-proc"
+    proj_one.mkdir(parents=True)
+    (proj_one / "dup-cli.jsonl").write_text("{}\n")
+
+    _, session_two = _write_local_agent_wrapper(
+        workspace_uuid,
+        "two",
+        cli_session_id="dup-cli",
+        session_id="sess-two",
+        process_name="proc",
+        user_folder="/Users/me/ws",
+    )
+    proj_two = session_two / ".claude" / "projects" / "-sessions-proc"
+    proj_two.mkdir(parents=True)
+    (proj_two / "dup-cli.jsonl").write_text("{}\n")
+
+    inputs = list(discovery.iter_parse_inputs(source_filter="claude"))
+    assert len(inputs) == 2
+    assert inputs[0].session_key == inputs[1].session_key == "claude:-Users-me-ws:dup-cli"
+    assert [parse_input.priority for parse_input in inputs] == [1, 1]
+    assert tuple(str(parse_input.parse_path) for parse_input in inputs) == tuple(
+        sorted(str(parse_input.parse_path) for parse_input in inputs)
+    )
+    assert all(len(parse_input.source_paths) == 1 for parse_input in inputs)
 
 
 # ---------- Codex ----------
@@ -421,6 +532,59 @@ def test_codex_discovery_falls_back_to_unknown_cwd_when_missing_metadata(
     assert files[0].project_dir_name == parser.UNKNOWN_CODEX_CWD
 
 
+# ---------- OpenClaw ----------
+
+
+def _write_openclaw_session(path, cwd):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "session", "cwd": cwd}) + "\n")
+
+
+def test_openclaw_discovery_groups_by_header_cwd(isolated_homedir):
+    agents = isolated_homedir / "openclaw" / "agents"
+    _write_openclaw_session(agents / "coder" / "sessions" / "s1.jsonl", "/Users/me/projA")
+    _write_openclaw_session(agents / "coder" / "sessions" / "s2.jsonl", "/Users/me/projB")
+    _write_openclaw_session(agents / "reviewer" / "sessions" / "s3.jsonl", "/Users/me/projA")
+
+    files = list(discovery.iter_source_files(source_filter="openclaw"))
+    by_name = {f.path.name: f for f in files}
+    assert set(by_name) == {"s1.jsonl", "s2.jsonl", "s3.jsonl"}
+    assert by_name["s1.jsonl"].project_dir_name == "/Users/me/projA"
+    assert by_name["s2.jsonl"].project_dir_name == "/Users/me/projB"
+    assert by_name["s3.jsonl"].project_dir_name == "/Users/me/projA"
+    assert all(f.client == "openclaw" for f in files)
+
+
+def test_openclaw_discovery_falls_back_to_unknown_cwd(isolated_homedir):
+    """Files without a first-line `type: session` header, or with no cwd,
+    group under UNKNOWN_OPENCLAW_CWD — mirrors parser._extract_openclaw_cwd."""
+    sessions = isolated_homedir / "openclaw" / "agents" / "a" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "no-header.jsonl").write_text(json.dumps({"type": "message"}) + "\n")
+    (sessions / "empty.jsonl").write_text("")
+    (sessions / "bad-json.jsonl").write_text("{not valid json\n")
+
+    files = list(discovery.iter_source_files(source_filter="openclaw"))
+    assert {f.path.name for f in files} == {
+        "no-header.jsonl",
+        "empty.jsonl",
+        "bad-json.jsonl",
+    }
+    assert all(f.project_dir_name == parser.UNKNOWN_OPENCLAW_CWD for f in files)
+
+
+def test_openclaw_discovery_skips_agent_dirs_without_sessions_subdir(isolated_homedir):
+    agents = isolated_homedir / "openclaw" / "agents"
+    # Agent dir with the required sessions/ subdir.
+    _write_openclaw_session(agents / "with" / "sessions" / "s.jsonl", "/cwd")
+    # Sibling agent dir missing the sessions/ subdir — must be ignored.
+    (agents / "without").mkdir(parents=True)
+    (agents / "without" / "notes.txt").write_text("stray file")
+
+    files = list(discovery.iter_source_files(source_filter="openclaw"))
+    assert [f.path.name for f in files] == ["s.jsonl"]
+
+
 # ---------- auto and unknown filters ----------
 
 
@@ -430,10 +594,14 @@ def test_auto_filter_yields_all_supported_clients(isolated_homedir):
     (native_proj / "s.jsonl").write_text("{}\n")
     codex = isolated_homedir / "codex" / "sessions"
     _write_codex_session(codex / "r.jsonl", "/cwd")
+    _write_openclaw_session(
+        isolated_homedir / "openclaw" / "agents" / "a" / "sessions" / "oc.jsonl",
+        "/cwd",
+    )
 
     files = list(discovery.iter_source_files())
     clients = {f.client for f in files}
-    assert clients == {"claude", "codex"}
+    assert clients == {"claude", "codex", "openclaw"}
 
 
 def test_unknown_source_returns_nothing(isolated_homedir):

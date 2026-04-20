@@ -5,10 +5,10 @@ Two consumer models are supported:
 - **Line-level deltas** (`iter_new_lines` / `cursor_after`) — streaming
   consumers (the 02 normalized-event pipeline) read appended lines since
   the cursor and advance one line-batch at a time. The cursor they
-  persist is derived from the stat snapshot captured at the moment the
-  batch was read, not a fresh stat, so a file replacement between read
-  and sink commit cannot move the cursor into an unrelated file's
-  middle.
+  persist is derived from the descriptor-backed stat snapshot captured
+  for the file ACTUALLY opened for the batch, not a fresh path stat, so
+  a file replacement before or after the read cannot move the cursor
+  into an unrelated file's middle.
 
 - **File-level change detection** (`file_has_changed` /
   `cursor_for_reparse`) — whole-file-reparse consumers (the workbench
@@ -38,6 +38,7 @@ rotation always produces a new inode via rename and is caught.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,20 +60,25 @@ def iter_new_lines(
     path: Path, cursor: Cursor | None, *, client: str
 ) -> LineBatch | None:
     try:
-        st = path.stat()
+        with path.open("rb") as f:
+            st = os.fstat(f.fileno())
+            start_offset = 0
+            if (
+                cursor is not None
+                and cursor.inode == st.st_ino
+                and cursor.last_offset <= st.st_size
+            ):
+                start_offset = cursor.last_offset
+
+            if start_offset >= st.st_size:
+                return None
+
+            # Read against the same descriptor we snapshotted so batch
+            # metadata matches the bytes we actually consumed.
+            f.seek(start_offset)
+            raw = f.read(st.st_size - start_offset)
     except FileNotFoundError:
         return None
-
-    start_offset = 0
-    if cursor is not None and cursor.inode == st.st_ino and cursor.last_offset <= st.st_size:
-        start_offset = cursor.last_offset
-
-    if start_offset >= st.st_size:
-        return None
-
-    with path.open("rb") as f:
-        f.seek(start_offset)
-        raw = f.read(st.st_size - start_offset)
 
     last_newline = raw.rfind(b"\n")
     if last_newline < 0:

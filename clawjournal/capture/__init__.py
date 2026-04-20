@@ -21,17 +21,19 @@ from clawjournal.capture.cursors import (
     list_cursors,
     set_cursor,
 )
-from clawjournal.capture.discovery import SourceFile, iter_source_files
+from clawjournal.capture.discovery import ParseInput, SourceFile, iter_parse_inputs, iter_source_files
 
 __all__ = [
     "Cursor",
     "LineBatch",
+    "ParseInput",
     "SourceFile",
     "cursor_after",
     "cursor_for_reparse",
     "ensure_schema",
     "file_has_changed",
     "get_cursor",
+    "iter_parse_inputs",
     "iter_new_lines",
     "iter_source_files",
     "list_cursors",
