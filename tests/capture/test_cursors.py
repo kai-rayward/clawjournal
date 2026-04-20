@@ -92,6 +92,29 @@ def test_get_cursor_wrong_consumer_returns_none():
     assert get_cursor(conn, "events", "/tmp/a.jsonl") is None
 
 
+def test_set_cursor_preserves_first_seen_across_updates():
+    """first_seen records when the cursor was initially created; updates
+    should leave it unchanged while advancing last_seen. The ON CONFLICT
+    DO UPDATE clause must not include first_seen in its SET list."""
+    conn = _open()
+    set_cursor(conn, _cursor(last_offset=0))
+    first_row = conn.execute(
+        "SELECT first_seen, last_seen FROM capture_cursors "
+        "WHERE consumer_id = ? AND source_path = ?",
+        ("scanner", "/tmp/a.jsonl"),
+    ).fetchone()
+    original_first_seen = first_row[0]
+    # Advance the cursor; first_seen should stick, last_seen should refresh
+    set_cursor(conn, _cursor(last_offset=100))
+    second_row = conn.execute(
+        "SELECT first_seen, last_seen FROM capture_cursors "
+        "WHERE consumer_id = ? AND source_path = ?",
+        ("scanner", "/tmp/a.jsonl"),
+    ).fetchone()
+    assert second_row[0] == original_first_seen
+    assert second_row[1] >= first_row[1]
+
+
 def test_list_cursors_filters_by_consumer_and_client():
     conn = _open()
     set_cursor(conn, _cursor(consumer_id="scanner", source_path="/tmp/a.jsonl", client="claude"))

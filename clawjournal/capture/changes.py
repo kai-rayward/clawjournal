@@ -117,6 +117,14 @@ def file_has_changed(path: Path, cursor: Cursor | None) -> bool:
 
     Returns True if `path` differs from the cursor's recorded state in
     inode, size, or mtime. Missing files return False (nothing to do).
+
+    Designed for `cursor_for_reparse` cursors, where `last_offset`
+    equals the file size at snapshot time. A `cursor_after` cursor's
+    `last_offset` can legitimately trail the file size (the file ended
+    in a partial line at read time), so this function will return True
+    in steady state on such cursors even when no new bytes have been
+    written. Line-level consumers should use `iter_new_lines` directly
+    rather than gating on `file_has_changed`.
     """
     try:
         st = path.stat()

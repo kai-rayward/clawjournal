@@ -198,6 +198,29 @@ def test_cursor_for_reparse_returns_none_for_missing_file(tmp_path):
     )
 
 
+def test_file_has_changed_returns_true_for_line_level_cursor_with_partial_tail(
+    tmp_path,
+):
+    """Documents that file_has_changed is a whole-file-reparse gate. A
+    line-level cursor (from cursor_after) can legitimately sit behind
+    the live file size when the file ends in a partial trailing line;
+    file_has_changed sees `last_offset < size` and returns True even
+    though no new complete lines are available. Line-level consumers
+    must use iter_new_lines directly to check for actual progress."""
+    p = tmp_path / "a.jsonl"
+    p.write_bytes(b'{"a":1}\n{"partial')  # partial trailing line after the first
+    batch = iter_new_lines(p, None, client="claude")
+    assert batch is not None
+    assert batch.end_offset < p.stat().st_size  # cursor legitimately trails
+    cur = cursor_after(batch, consumer_id="events")
+    # No new writes; the file is in steady state from the consumer's
+    # point of view — but file_has_changed still flags it because the
+    # size does not equal last_offset.
+    assert file_has_changed(p, cur) is True
+    # The correct staleness check for a line-level consumer:
+    assert iter_new_lines(p, cur, client="claude") is None
+
+
 def test_cursor_for_reparse_snapshot_survives_concurrent_append(tmp_path):
     """TOCTOU-safe usage: snapshot BEFORE parse, persist AFTER sink
     commit. If the file grows during the parse, the cursor stays at
