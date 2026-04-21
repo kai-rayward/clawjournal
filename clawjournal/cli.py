@@ -61,6 +61,7 @@ SETUP_TO_PUBLISH_STEPS = [
 EXPLICIT_SOURCE_CHOICES = {"claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
 SOURCE_CHOICES = ["auto", "claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all"]
 WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "openclaw", "cursor", "copilot", "aider"]
+EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
 
 
@@ -3185,6 +3186,19 @@ def main() -> None:
     cfg.add_argument("--confirm-projects", action="store_true",
                      help="Mark project selection as confirmed (include all)")
 
+    events_parser = sub.add_parser("events", help="Execution recorder commands")
+    events_sub = events_parser.add_subparsers(dest="events_command", required=True)
+    events_ingest = events_sub.add_parser(
+        "ingest",
+        help="Drain pending raw execution events into index.db",
+    )
+    events_ingest.add_argument("--source", choices=EVENT_SOURCE_CHOICES, default="auto")
+    events_ingest.add_argument("--json", action="store_true", help="Output JSON summary")
+    events_sub.add_parser(
+        "capabilities",
+        help="Dump the execution-recorder capability matrix as JSON",
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -3676,6 +3690,10 @@ def main() -> None:
         _handle_config(args)
         return
 
+    if command == "events":
+        _run_events(args)
+        return
+
     _run_export(args)
 
 
@@ -3839,6 +3857,31 @@ def _run_training_format(args) -> None:
         return
     print(f"Training format: {summary['turns']} turns from {summary['sessions']} sessions")
     print(f"Output written to {args.output}")
+
+
+def _run_events(args) -> None:
+    from .events import capabilities_json, ingest_pending
+    from .workbench.index import open_index
+
+    if args.events_command == "capabilities":
+        print(json.dumps(capabilities_json(), indent=2, sort_keys=True))
+        return
+
+    conn = open_index()
+    try:
+        summary = ingest_pending(conn, source_filter=args.source)
+    finally:
+        conn.close()
+
+    payload = summary.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        f"Ingested {payload['event_rows']} event rows from "
+        f"{payload['files_with_changes']} changed files "
+        f"({payload['lines_read']} lines, {payload['sessions_touched']} sessions)."
+    )
 
 
 def _generate_pii_findings(file_path: Path, output_path: Path, provider: str, min_confidence: float = 0.0, backend: str = "auto") -> dict[str, Any]:

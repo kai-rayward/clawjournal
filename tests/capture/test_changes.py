@@ -25,6 +25,7 @@ def test_first_read_returns_all_complete_lines(tmp_path):
     batch = iter_new_lines(p, None, client="claude")
     assert batch is not None
     assert batch.lines == ['{"a":1}', '{"b":2}']
+    assert batch.line_offsets == [0, len(b'{"a":1}\n')]
     assert batch.start_offset == 0
     assert batch.end_offset == len(b'{"a":1}\n{"b":2}\n')
     assert batch.client == "claude"
@@ -43,6 +44,7 @@ def test_incremental_append_reads_only_new(tmp_path):
     batch2 = iter_new_lines(p, cur, client="claude")
     assert batch2 is not None
     assert batch2.lines == ['{"b":2}']
+    assert batch2.line_offsets == [batch1.end_offset]
     assert batch2.start_offset == batch1.end_offset
 
 
@@ -60,6 +62,7 @@ def test_partial_trailing_line_is_not_consumed(tmp_path):
     batch = iter_new_lines(p, None, client="claude")
     assert batch is not None
     assert batch.lines == ['{"a":1}']
+    assert batch.line_offsets == [0]
     assert batch.end_offset == len(b'{"a":1}\n')
 
     cur = cursor_after(batch, consumer_id="events")
@@ -67,6 +70,10 @@ def test_partial_trailing_line_is_not_consumed(tmp_path):
     batch2 = iter_new_lines(p, cur, client="claude")
     assert batch2 is not None
     assert batch2.lines == ['{"incomplete":true}', '{"c":3}']
+    assert batch2.line_offsets == [
+        len(b'{"a":1}\n'),
+        len(b'{"a":1}\n{"incomplete":true}\n'),
+    ]
 
 
 def test_rotation_resets_offset(tmp_path):
