@@ -2898,41 +2898,63 @@ def get_share_ready_stats(
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= recent_cutoff
 
+    # Recommender contract: "my latest work that's worth sharing."
+    # Within the 7-day window recency beats everything — the user has
+    # more context on what they just did and can drag-reorder if they
+    # want older-but-curated traces. Older 5-star approved only
+    # backfills when the recent pool is thin.
+    #
+    # Eligibility inside the window: score=5 (approved or new) OR any
+    # non-trivial session (>= 2 user or assistant messages). The
+    # message-count floor keeps accidentally-created stub sessions
+    # out of the default recommendation while still surfacing today's
+    # real sessions even before ``clawjournal score`` has run on them.
+    #
+    # Sort locally by ``start_time DESC`` — the outer SELECT tier-sorts
+    # approved ahead of new (useful for the list view), but the
+    # recommender wants pure recency so today's unreviewed beats last
+    # week's approved.
+    recent_sorted = sorted(
+        (s for s in sessions if _is_recent(s.get("start_time"))),
+        key=lambda s: s.get("start_time") or "",
+        reverse=True,
+    )
+    recommended_pool: list[dict] = []
+    seen_ids: set[str] = set()
+    for session in recent_sorted:
+        if len(recommended_pool) >= 5:
+            break
+        sid = session.get("session_id")
+        if not sid or sid in seen_ids:
+            continue
+        score = session.get("ai_quality_score")
+        # Explicitly-low-quality sessions (1-2 stars) shouldn't be
+        # recommended for sharing even when recent — the scorer judged
+        # them not worth it. ``None`` (unscored) still passes through.
+        if score is not None and score <= 2:
+            continue
+        user_msgs = session.get("user_messages") or 0
+        assistant_msgs = session.get("assistant_messages") or 0
+        substantive = user_msgs >= 2 or assistant_msgs >= 2
+        if not (score == 5 or substantive):
+            continue
+        recommended_pool.append(session)
+        seen_ids.add(sid)
+
     five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
-    five_star_recent = [s for s in five_star if _is_recent(s.get("start_time"))]
     five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
-    recommended_pool = list(five_star_recent)
 
-    # Widen the recent slot when the approved pool is thin: any 5-star
-    # session from the last 7 days, even if it's still ``review_status=
-    # 'new'``. Package auto-approves on the way through, so including
-    # unreviewed-but-high-score recent work surfaces what the user
-    # actually just did instead of showing the same stale 5-star
-    # approved sessions week after week.
+    # Backfill: older approved 5-star to top up when the recent window
+    # is genuinely thin.
     if len(recommended_pool) < 5:
-        seen_ids = {s["session_id"] for s in recommended_pool}
-        for session in sessions:
-            if len(recommended_pool) >= 5:
-                break
-            if session.get("ai_quality_score") != 5:
-                continue
-            if not _is_recent(session.get("start_time")):
-                continue
-            if session["session_id"] in seen_ids:
-                continue
-            recommended_pool.append(session)
-            seen_ids.add(session["session_id"])
-
-    # Older approved 5-star as final backfill if we still aren't at 5.
-    if len(recommended_pool) < 5:
-        seen_ids = {s["session_id"] for s in recommended_pool}
         for session in five_star_older:
             if len(recommended_pool) >= 5:
                 break
-            if session["session_id"] in seen_ids:
+            sid = session.get("session_id")
+            if not sid or sid in seen_ids:
                 continue
             recommended_pool.append(session)
-            seen_ids.add(session["session_id"])
+            seen_ids.add(sid)
 
     recommended_ids = [s["session_id"] for s in recommended_pool[:5]]
 
