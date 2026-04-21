@@ -17,6 +17,8 @@ from clawjournal.events.classify import classify_line
 from clawjournal.events.ingest import ingest_pending
 from clawjournal.workbench.index import open_index
 
+from ._fixtures import ALL_CORPORA
+
 
 # Timestamps chosen so input == normalized output (no trailing zero
 # fractions to be stripped by datetime.isoformat).
@@ -142,157 +144,30 @@ def test_raw_json_roundtrip_preserves_vendor_content(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-_CLAUDE_CORPUS = [
-    {"type": "user", "timestamp": TS0, "message": {"content": "plain text"}},
-    {
-        "type": "user",
-        "timestamp": TS0,
-        "message": {
-            "content": [
-                {"type": "tool_result", "tool_use_id": "tu-1", "content": "ok"}
-            ]
-        },
-    },
-    {
-        "type": "assistant",
-        "timestamp": TS0,
-        "message": {
-            "content": [
-                {"type": "text", "text": "calling a tool"},
-                {"type": "tool_use", "id": "tu-2", "name": "Read", "input": {}},
-            ]
-        },
-    },
-    {
-        "type": "assistant",
-        "timestamp": TS0,
-        "message": {
-            "content": [
-                {"type": "tool_use", "id": "tu-3", "name": "Write", "input": {}},
-            ]
-        },
-    },
-    {
-        "type": "assistant",
-        "timestamp": TS0,
-        "message": {
-            "content": [
-                {"type": "tool_use", "id": "tu-4", "name": "Bash", "input": {}},
-            ]
-        },
-    },
-    # NOTE: approval_request/decision are in the plan's `type` vocabulary
-    # but no real Claude JSONL line carries them today. Classifier has
-    # defensive branches for them; intentionally not exercised here so
-    # this test pins the realistic-vendor-input surface. If future
-    # fixtures add an approval line and this test fails, either add
-    # (claude, approval_*) to the capability matrix or drop the dead
-    # classifier branch.
-]
-
-_CODEX_CORPUS = [
-    {"type": "session_meta", "timestamp": TS0, "payload": {"version": "0.7"}},
-    {
-        "type": "response_item",
-        "timestamp": TS0,
-        "payload": {
-            "type": "function_call",
-            "name": "shell",
-            "call_id": "c-1",
-            "arguments": "{}",
-        },
-    },
-    {
-        "type": "response_item",
-        "timestamp": TS0,
-        "payload": {
-            "type": "function_call_output",
-            "call_id": "c-1",
-            "output": "ok",
-        },
-    },
-    {
-        "type": "response_item",
-        "timestamp": TS0,
-        "payload": {"type": "reasoning", "summary": "thinking…"},
-    },
-    {
-        "type": "event_msg",
-        "timestamp": TS0,
-        "payload": {"type": "user_message", "message": "hi"},
-    },
-    {
-        "type": "event_msg",
-        "timestamp": TS0,
-        "payload": {"type": "agent_message", "message": "hello"},
-    },
-    {
-        "type": "event_msg",
-        "timestamp": TS0,
-        "payload": {"type": "agent_reasoning", "text": "…"},
-    },
-]
-
-_OPENCLAW_CORPUS = [
-    {"type": "session", "timestamp": TS0, "cwd": "/x/y"},
-    {
-        "type": "message",
-        "timestamp": TS0,
-        "message": {"role": "user", "content": "hi"},
-    },
-    {
-        "type": "message",
-        "timestamp": TS0,
-        "message": {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "response"},
-                {"type": "toolCall", "id": "tc-1", "name": "read_file"},
-            ],
-        },
-    },
-    {
-        "type": "message",
-        "timestamp": TS0,
-        "message": {"role": "toolResult", "toolCallId": "tc-1"},
-    },
-    {
-        "type": "message",
-        "timestamp": TS0,
-        "message": {
-            "role": "bashExecution",
-            "command": "ls",
-            "output": "a\nb\n",
-            "exitCode": 0,
-        },
-    },
-]
-
-
 def test_classifier_never_emits_type_that_matrix_marks_unsupported():
     """Every (client, type) a classifier emits for a realistic vendor
-    line must appear in CAPABILITY_MATRIX with supported=True. Guards
-    against drift where a classifier path starts emitting a type the
-    matrix doesn't know about."""
-    corpora = {
-        "claude": _CLAUDE_CORPUS,
-        "codex": _CODEX_CORPUS,
-        "openclaw": _OPENCLAW_CORPUS,
-    }
-    drift: list[tuple[str, str, dict]] = []
-    for client, lines in corpora.items():
-        for line in lines:
-            events = classify_line(client, line)
+    line must appear in CAPABILITY_MATRIX with supported=True. Pulls
+    the full per-client corpora from _fixtures so every new realistic
+    fixture automatically widens the drift tripwire. Fixtures tagged
+    realistic=False (defensive branches for shapes no vendor emits
+    today) are skipped — if future work starts emitting those types,
+    flip them to realistic=True and the matrix will need an entry."""
+    drift: list[tuple[str, str, str]] = []
+    for client, corpus in ALL_CORPORA.items():
+        for fixture in corpus:
+            if not fixture.realistic:
+                continue
+            events = classify_line(client, fixture.line)
             for event in events:
                 supported, _reason = CAPABILITY_MATRIX.get(
                     (client, event.type), (False, "missing")
                 )
                 if not supported:
-                    drift.append((client, event.type, line))
+                    drift.append((client, event.type, fixture.name))
 
     assert not drift, (
         "Classifier emitted types the capability matrix marks unsupported: "
-        f"{[(client, event_type) for client, event_type, _ in drift]}"
+        f"{drift}"
     )
 
 
