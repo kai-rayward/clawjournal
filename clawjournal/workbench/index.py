@@ -883,7 +883,7 @@ def apply_share_redactions(
             total_redactions += th_total
             redaction_log.extend(th_log)
     except Exception:  # noqa: BLE001 — never block share redaction on a flaky subprocess
-        pass
+        logger.warning("TruffleHog apply pass failed", exc_info=True)
 
     return session, total_redactions, redaction_log
 

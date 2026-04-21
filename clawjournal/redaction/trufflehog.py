@@ -579,14 +579,16 @@ def apply_trufflehog_pass(
                 if n:
                     msg[field_name] = new_val
                     total += n
-        for tool_use in msg.get("tool_uses", []) or []:
+        for tool_idx, tool_use in enumerate(msg.get("tool_uses", []) or []):
             if not isinstance(tool_use, dict):
                 continue
             for branch in ("input", "output"):
                 val = tool_use.get(branch)
                 if isinstance(val, str) and val:
                     new_val, n = _replace_in_text(
-                        val, field_name=f"tool_{branch}", message_index=msg_idx,
+                        val,
+                        field_name=f"tool_uses[{tool_idx}].{branch}",
+                        message_index=msg_idx,
                     )
                     if n:
                         tool_use[branch] = new_val
@@ -596,7 +598,7 @@ def apply_trufflehog_pass(
                         if isinstance(nested, str) and nested:
                             new_val, n = _replace_in_text(
                                 nested,
-                                field_name=f"tool_{branch}.{key}",
+                                field_name=f"tool_uses[{tool_idx}].{branch}.{key}",
                                 message_index=msg_idx,
                             )
                             if n:

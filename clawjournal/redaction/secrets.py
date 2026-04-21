@@ -825,6 +825,13 @@ def apply_findings_to_blob(
     from .pii import pii_secret_map_from_text_decisions
     from .trufflehog import trufflehog_secret_map_from_blob
 
+    # TruffleHog is a subprocess-backed engine — run it once on the
+    # original blob rather than inside the per-pass loop. The raws it
+    # finds don't change after the first replacement, so re-scanning
+    # on every pass would pay N× the subprocess cost for zero new
+    # information.
+    trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
+
     total = 0
     for pass_num in range(max_passes):
         # Build a global replace map from every text location's current state.
@@ -836,10 +843,7 @@ def apply_findings_to_blob(
             secret_map.update(
                 pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
             )
-        # TruffleHog runs per-blob (one subprocess), not per-text.
-        secret_map.update(
-            trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
-        )
+        secret_map.update(trufflehog_map)
         if not secret_map:
             break
 

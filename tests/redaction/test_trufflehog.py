@@ -323,6 +323,164 @@ class TestApplyTruffleHogPass:
         assert all("confidence" in e for e in log)
 
 
+class TestApplyPathIntegration:
+    """End-to-end through ``apply_findings_to_blob``: TruffleHog's
+    subprocess must run exactly once regardless of ``max_passes``, and
+    ``decisions`` must be honored (ignored hashes stay in the blob)."""
+
+    @staticmethod
+    def _seed(conn, sess_id, content):
+        from clawjournal.findings import reset_salt_cache
+        from clawjournal.workbench.index import upsert_sessions
+
+        reset_salt_cache()
+        sess = {
+            "session_id": sess_id,
+            "display_title": "t",
+            "project": "p",
+            "source": "claude",
+            "start_time": "2026-04-20T00:00:00",
+            "end_time": "2026-04-20T00:10:00",
+            "messages": [{
+                "role": "user", "content": content,
+                "thinking": "", "tool_uses": [],
+            }],
+            "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0,
+                      "input_tokens": 1, "output_tokens": 0},
+        }
+        upsert_sessions(conn, [sess])
+        conn.commit()
+
+    @staticmethod
+    def _patch_trufflehog_once(monkeypatch, raw, detector="Stripe"):
+        calls = {"n": 0}
+
+        def fake_scan(text):
+            calls["n"] += 1
+            return [{"raw": raw, "detector": detector, "status": "verified"}]
+
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", fake_scan)
+        return calls
+
+    def test_subprocess_runs_once_not_per_pass(self, tmp_path, monkeypatch):
+        import sqlite3
+        from clawjournal.findings import hash_entity, reset_salt_cache
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+        from clawjournal.workbench.index import INDEX_DB, open_index  # noqa: F401
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+        reset_salt_cache()
+
+        conn = open_index()
+        try:
+            raw = "sk_live_abcdefg1234567890abcdef"
+            self._seed(conn, "sess-one", content=f"payload {raw}")
+            calls = self._patch_trufflehog_once(monkeypatch, raw)
+
+            # apply_findings_to_blob is the DB-backed redaction entry.
+            # With max_passes=3, a naive implementation would shell out
+            # three times; the fix caches the map once outside the loop.
+            blob = dict(conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", ("sess-one",),
+            ).fetchone())
+            # Construct a blob shape the apply path walks.
+            blob = {
+                "session_id": "sess-one",
+                "display_title": "t", "project": "p", "git_branch": "",
+                "messages": [{"content": f"payload {raw}", "thinking": "", "tool_uses": []}],
+            }
+            redacted, n = apply_findings_to_blob(blob, conn, "sess-one", max_passes=3)
+            assert n >= 1
+            assert raw not in redacted["messages"][0]["content"]
+            assert "[REDACTED_STRIPE]" in redacted["messages"][0]["content"]
+            assert calls["n"] == 1, (
+                f"TruffleHog subprocess ran {calls['n']} times; "
+                f"should be exactly 1 regardless of max_passes"
+            )
+        finally:
+            conn.close()
+
+    def test_ignored_hash_is_not_redacted(self, tmp_path, monkeypatch):
+        import sqlite3
+        from clawjournal.findings import hash_entity, reset_salt_cache
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+        from clawjournal.workbench.index import open_index
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+        reset_salt_cache()
+
+        conn = open_index()
+        try:
+            raw = "xoxb-should-be-left-alone-XYZ12345"
+            self._seed(conn, "sess-ign", content=f"keep this {raw}")
+            self._patch_trufflehog_once(monkeypatch, raw, detector="Slack")
+
+            # Seed an 'ignored' decision for this raw's hash.
+            entity_hash = hash_entity(raw)
+            conn.execute(
+                "INSERT INTO findings "
+                "(finding_id, session_id, engine, rule, entity_type, entity_hash, "
+                " entity_length, field, message_index, tool_field, offset, length, "
+                " confidence, status, decided_by, decision_source_id, decided_at, "
+                " decision_reason, revision, created_at) "
+                "VALUES ('fid', 'sess-ign', 'trufflehog', 'Slack', 'Slack', ?, ?, "
+                "        'content', 0, NULL, 0, ?, 1.0, 'ignored', 'user', NULL, "
+                "        '2026-04-20T00:00:00', NULL, 'v1:test', '2026-04-20T00:00:00')",
+                (entity_hash, len(raw), len(raw)),
+            )
+            conn.commit()
+
+            blob = {
+                "session_id": "sess-ign",
+                "display_title": "t", "project": "p", "git_branch": "",
+                "messages": [{"content": f"keep this {raw}", "thinking": "", "tool_uses": []}],
+            }
+            redacted, _ = apply_findings_to_blob(blob, conn, "sess-ign")
+            # Ignored decisions must not be redacted by any engine.
+            assert raw in redacted["messages"][0]["content"]
+            assert "[REDACTED_SLACK]" not in redacted["messages"][0]["content"]
+        finally:
+            conn.close()
+
+
+class TestFieldNameConsistency:
+    """The scan-time engine (scan_session_for_trufflehog_findings) and
+    the legacy apply pass (apply_trufflehog_pass) must use the same
+    field convention — ``tool_uses[<idx>].<branch>`` — so downstream
+    consumers (derive_preview, redaction_log correlation) can line
+    entries up. Reviewer flagged a prior `tool_<branch>` shortcut."""
+
+    def test_apply_pass_uses_bracketed_tool_field_names(self, monkeypatch):
+        raw = "ghp_abcdefghijklmnop12345678901234"
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(
+            trufflehog, "_scan_text_for_raw_matches",
+            lambda text: [{"raw": raw, "detector": "GitHub", "status": "verified"}],
+        )
+        session = {
+            "messages": [{
+                "content": "",
+                "tool_uses": [
+                    {"input": {"cmd": f"echo {raw}"}, "output": f"got {raw}"},
+                ],
+            }],
+        }
+        _, log = trufflehog.apply_trufflehog_pass(session)
+        fields = {entry.get("field") for entry in log}
+        # Both string-valued tool output and nested dict-valued tool
+        # input should use the bracketed form matching
+        # findings._resolve_field_text's regex.
+        assert any(f and f.startswith("tool_uses[0].output") for f in fields), fields
+        assert any(f and f.startswith("tool_uses[0].input") for f in fields), fields
+
+
 class TestFormatBlockMessage:
     def test_missing_binary_includes_install_hint(self):
         report = trufflehog.TruffleHogReport(
