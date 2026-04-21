@@ -866,6 +866,9 @@ export function Share() {
     }));
     const buckets = emptyBuckets();
     for (const entry of report.redaction_log || []) buckets[bucketOf(entry.type)] += 1;
+    const trufflehogHits = (report.redaction_log || [])
+      .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
+      .length;
     setRedactedSessions((prev) => ({
       ...prev,
       [id]: {
@@ -874,6 +877,7 @@ export function Share() {
         aiPiiFindings: report.ai_pii_findings || [],
         aiCoverage: report.ai_coverage || 'rules_only',
         buckets,
+        trufflehogHits,
       },
     }));
   };

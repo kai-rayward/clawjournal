@@ -105,12 +105,15 @@ class TruffleHogReport:
     top_detectors: list[str] = field(default_factory=list)
     bypassed: bool = False
     binary_missing: bool = False
+    scan_error: str | None = None
 
     @property
     def blocking(self) -> bool:
         if self.bypassed:
             return False
         if self.binary_missing:
+            return True
+        if self.scan_error:
             return True
         return len(self.findings) > 0
 
@@ -120,6 +123,8 @@ class TruffleHogReport:
             return None
         if self.binary_missing:
             return "trufflehog-not-installed"
+        if self.scan_error:
+            return "trufflehog-error"
         if self.findings:
             return "trufflehog-findings"
         return None
@@ -134,6 +139,7 @@ class TruffleHogReport:
             "top_detectors": list(self.top_detectors),
             "bypassed": self.bypassed,
             "binary_missing": self.binary_missing,
+            "scan_error": self.scan_error,
             "examples": [
                 {
                     "detector": f.detector,
@@ -313,11 +319,24 @@ def _parse_finding(parsed: dict) -> TruffleHogFinding | None:
 def scan_file(path: Path) -> TruffleHogReport:
     """Scan ``path`` with TruffleHog. Returns a report.
 
-    Never raises on missing-binary or on findings (both are encoded in
-    the returned report). Only raises when the subprocess itself fails
-    in an unexpected way (non-recognized exit code, inability to spawn).
+    Never raises on missing-binary, findings, subprocess timeouts,
+    spawn failures, unexpected exit statuses, or I/O errors reading
+    the scanned path — every failure is surfaced as a blocking
+    report so the mandatory share gate fails closed rather than
+    propagating a raw exception to the caller.
     """
-    scanned_sha256 = _sha256_file(path)
+    try:
+        scanned_sha256 = _sha256_file(path)
+    except OSError as exc:
+        # Permission denied / missing file / mid-read disk error:
+        # turn into a blocking report with scan_error instead of
+        # bubbling up to export_share_to_disk and aborting the share
+        # export with no block_reason persisted.
+        return TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256="",
+            scan_error=f"could not hash scan target: {exc.__class__.__name__}",
+        )
 
     if is_bypassed():
         return TruffleHogReport(
@@ -349,22 +368,35 @@ def scan_file(path: Path) -> TruffleHogReport:
     # export. DEVNULL on stdin prevents any interactive prompt from
     # deadlocking a non-interactive runner. Scrubbed env keeps the
     # parent process's API keys out of the child.
-    result = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-        stdin=subprocess.DEVNULL,
-        env=_scrubbed_subprocess_env(),
-    )
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+            env=_scrubbed_subprocess_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256=scanned_sha256,
+            scan_error="timed out after 60 seconds",
+        )
+    except OSError:
+        return TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256=scanned_sha256,
+            scan_error="could not execute the trufflehog binary",
+        )
     # TruffleHog exits 0 on clean and 183 on findings in some versions;
     # accept either as a successful scan.
     if result.returncode not in (0, 183):
-        raise RuntimeError(
-            "trufflehog exited with "
-            f"{result.returncode}: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+        return TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256=scanned_sha256,
+            scan_error=f"unexpected exit status {result.returncode}",
         )
 
     findings: list[TruffleHogFinding] = []
@@ -441,6 +473,7 @@ def write_report(path: Path, report: TruffleHogReport) -> None:
         "scanned_sha256": report.scanned_sha256,
         "bypassed": report.bypassed,
         "binary_missing": report.binary_missing,
+        "scan_error": report.scan_error,
         "findings": [
             {
                 "detector": f.detector,
@@ -782,6 +815,11 @@ def format_block_message(report: TruffleHogReport) -> str:
         return "TruffleHog was bypassed via CLAWJOURNAL_SKIP_TRUFFLEHOG."
     if report.binary_missing:
         return INSTALL_HINT
+    if report.scan_error:
+        return (
+            "TruffleHog scan failed before producing a result. "
+            f"Share blocked: {report.scan_error}."
+        )
     examples = ", ".join(
         f"L{f.line if f.line is not None else '?'} {f.status} {f.detector} {f.masked}"
         for f in report.findings[:5]

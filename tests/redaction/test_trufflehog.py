@@ -208,7 +208,7 @@ class TestScanFile:
         assert other["Raw"] not in payload
         assert "GitHub" in summary["top_detectors"]
 
-    def test_unexpected_exit_code_raises(self, tmp_path, monkeypatch):
+    def test_unexpected_exit_code_blocks_with_error_report(self, tmp_path, monkeypatch):
         self._enable_real_scan(monkeypatch)
         target = tmp_path / "sessions.jsonl"
         target.write_text("x\n")
@@ -219,8 +219,54 @@ class TestScanFile:
                 cmd, 2, stdout="", stderr="boom",
             ),
         )
-        with pytest.raises(RuntimeError, match="trufflehog exited with 2"):
-            trufflehog.scan_file(target)
+        report = trufflehog.scan_file(target)
+        assert report.blocking is True
+        assert report.block_reason == "trufflehog-error"
+        assert report.scan_error == "unexpected exit status 2"
+
+    def test_timeout_blocks_with_error_report(self, tmp_path, monkeypatch):
+        self._enable_real_scan(monkeypatch)
+        target = tmp_path / "sessions.jsonl"
+        target.write_text("x\n")
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=60)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        report = trufflehog.scan_file(target)
+        assert report.blocking is True
+        assert report.block_reason == "trufflehog-error"
+        assert report.scan_error == "timed out after 60 seconds"
+
+    def test_spawn_failure_blocks_with_error_report(self, tmp_path, monkeypatch):
+        self._enable_real_scan(monkeypatch)
+        target = tmp_path / "sessions.jsonl"
+        target.write_text("x\n")
+
+        def fake_run(cmd, **kwargs):
+            raise OSError("exec format error")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        report = trufflehog.scan_file(target)
+        assert report.blocking is True
+        assert report.block_reason == "trufflehog-error"
+        assert report.scan_error == "could not execute the trufflehog binary"
+
+    def test_hash_target_failure_blocks_with_error_report(self, tmp_path, monkeypatch):
+        """A permission error or mid-read I/O error reading the scan
+        target must surface as a blocking report, not bubble up as a
+        raw OSError to the share-export caller (no block_reason would
+        otherwise be persisted in the manifest)."""
+        self._enable_real_scan(monkeypatch)
+
+        def boom(path):
+            raise PermissionError("simulated permission denied")
+
+        monkeypatch.setattr(trufflehog, "_sha256_file", boom)
+        report = trufflehog.scan_file(tmp_path / "unreadable.jsonl")
+        assert report.blocking is True
+        assert report.block_reason == "trufflehog-error"
+        assert "PermissionError" in (report.scan_error or "")
 
 
 class TestScanText:
@@ -720,3 +766,13 @@ class TestFormatBlockMessage:
         msg = trufflehog.format_block_message(report)
         assert "verified=1" in msg
         assert "ghp_a***4567" in msg
+
+    def test_scan_error_mentions_blocked_status(self):
+        report = trufflehog.TruffleHogReport(
+            scanned_path="/x",
+            scanned_sha256="sha256:0",
+            scan_error="unexpected exit status 2",
+        )
+        msg = trufflehog.format_block_message(report)
+        assert "Share blocked" in msg
+        assert "unexpected exit status 2" in msg

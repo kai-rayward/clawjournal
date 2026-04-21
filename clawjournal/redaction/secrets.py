@@ -3,8 +3,8 @@
 Two surfaces coexist:
 
 1. **Legacy mutate-in-place API** (`scan_text`, `redact_session`, etc.).
-   Still used by the parse path and by `apply_share_redactions` during
-   the transition. Works on session dicts directly, returns the
+   Still used by the parse path and by older direct-redaction helpers.
+   Works on session dicts directly, returns the
    redacted copy plus a metadata-only log.
 
 2. **DB-backed findings API** (`scan_session_for_findings`,

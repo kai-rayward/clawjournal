@@ -860,6 +860,28 @@ class TestShareAPI:
         conn.close()
         assert row["status"] == "shared"
 
+    def test_download_bundle_includes_trufflehog_report(self, server):
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0"],
+            "note": "Download report test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            names = set(archive.namelist())
+            assert "sessions.jsonl" in names
+            assert "manifest.json" in names
+            assert "trufflehog.json" in names
+            report = json.loads(archive.read("trufflehog.json").decode("utf-8"))
+
+        assert report["summary"]["findings"] == 0
+        assert report["summary"]["bypassed"] is False
+
     def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
         monkeypatch.setattr(
             "clawjournal.workbench.daemon.load_config",

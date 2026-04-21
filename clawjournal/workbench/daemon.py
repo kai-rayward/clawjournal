@@ -692,7 +692,7 @@ def upload_share(
         from ..redaction import trufflehog as trufflehog_scanner
 
         post_pii_report = trufflehog_scanner.scan_file(sessions_file)
-    except RuntimeError as exc:
+    except Exception as exc:
         logger.warning("Post-PII TruffleHog scan failed: %s", exc)
         return {
             "error": "Post-redaction scan failed — upload aborted.",
@@ -1441,6 +1441,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             settings = get_effective_share_settings(conn, load_config())
             detail, _, _ = apply_share_redactions(
+                conn,
                 detail,
                 custom_strings=settings["custom_strings"],
                 user_allowlist=settings["allowlist_entries"],
@@ -1466,6 +1467,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             settings = get_effective_share_settings(conn, load_config())
             detail, redaction_count, redaction_log = apply_share_redactions(
+                conn,
                 detail,
                 custom_strings=settings["custom_strings"],
                 user_allowlist=settings["allowlist_entries"],
@@ -1869,14 +1871,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 }, 422)
                 return
 
-            sessions_content = (export_dir / "sessions.jsonl").read_text()
-            manifest_content = (export_dir / "manifest.json").read_text()
+            sessions_content = (export_dir / "sessions.jsonl").read_bytes()
+            manifest_content = (export_dir / "manifest.json").read_bytes()
+            trufflehog_path = export_dir / "trufflehog.json"
+            trufflehog_content = (
+                trufflehog_path.read_bytes() if trufflehog_path.exists() else None
+            )
 
             # Create in-memory zip
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("sessions.jsonl", sessions_content)
                 zf.writestr("manifest.json", manifest_content)
+                if trufflehog_content is not None:
+                    zf.writestr("trufflehog.json", trufflehog_content)
             zip_bytes = buf.getvalue()
 
             # Serve the zip
