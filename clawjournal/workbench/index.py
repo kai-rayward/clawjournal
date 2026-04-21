@@ -2898,54 +2898,83 @@ def get_share_ready_stats(
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= recent_cutoff
 
-    # Recommender contract: "my latest work that's worth sharing."
-    # Within the 7-day window recency beats everything — the user has
-    # more context on what they just did and can drag-reorder if they
-    # want older-but-curated traces. Older 5-star approved only
-    # backfills when the recent pool is thin.
+    # Recommender tiers, in priority order:
     #
-    # Eligibility inside the window: score=5 (approved or new) OR any
-    # non-trivial session (>= 2 user or assistant messages). The
-    # message-count floor keeps accidentally-created stub sessions
-    # out of the default recommendation while still surfacing today's
-    # real sessions even before ``clawjournal score`` has run on them.
+    #   1. Recent 5-star (<=7 days old) — approved or unreviewed,
+    #      newest first. Dominates the top slots so the user sees
+    #      recently-scored high-quality work, never week-old traces
+    #      just because they're approved.
+    #   2. Recent substantive unscored (<=2 days old, >=2 messages)
+    #      so today's real work can still surface when the scorer
+    #      hasn't caught up yet — but the 5-star tier has already
+    #      claimed the top of the list.
+    #   3. Older approved 5-star as final backfill.
     #
-    # Sort locally by ``start_time DESC`` — the outer SELECT tier-sorts
-    # approved ahead of new (useful for the list view), but the
-    # recommender wants pure recency so today's unreviewed beats last
-    # week's approved.
-    recent_sorted = sorted(
+    # Sort locally by ``start_time DESC`` — the outer SELECT
+    # tier-sorts approved ahead of new for the list-view use case,
+    # but the recommender wants pure recency within a tier.
+    recent_cutoff_tight = datetime.now(timezone.utc) - timedelta(days=2)
+
+    def _is_very_recent(start_time: str | None) -> bool:
+        if not start_time:
+            return False
+        try:
+            ts = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts >= recent_cutoff_tight
+
+    recent_sessions = sorted(
         (s for s in sessions if _is_recent(s.get("start_time"))),
         key=lambda s: s.get("start_time") or "",
         reverse=True,
     )
+
     recommended_pool: list[dict] = []
     seen_ids: set[str] = set()
-    for session in recent_sorted:
+
+    # Tier 1: recent 5-star, newest first. No quality-<3 gate needed
+    # here since score==5 is the filter.
+    for session in recent_sessions:
         if len(recommended_pool) >= 5:
             break
         sid = session.get("session_id")
         if not sid or sid in seen_ids:
             continue
-        score = session.get("ai_quality_score")
-        # Explicitly-low-quality sessions (1-2 stars) shouldn't be
-        # recommended for sharing even when recent — the scorer judged
-        # them not worth it. ``None`` (unscored) still passes through.
-        if score is not None and score <= 2:
-            continue
-        user_msgs = session.get("user_messages") or 0
-        assistant_msgs = session.get("assistant_messages") or 0
-        substantive = user_msgs >= 2 or assistant_msgs >= 2
-        if not (score == 5 or substantive):
+        if session.get("ai_quality_score") != 5:
             continue
         recommended_pool.append(session)
         seen_ids.add(sid)
 
+    # Tier 2: very-recent substantive unscored (last 2 days) so
+    # today's work surfaces even before `clawjournal score` runs.
+    # Explicitly-low-quality (1-2 stars) excluded.
+    if len(recommended_pool) < 5:
+        for session in recent_sessions:
+            if len(recommended_pool) >= 5:
+                break
+            sid = session.get("session_id")
+            if not sid or sid in seen_ids:
+                continue
+            if not _is_very_recent(session.get("start_time")):
+                continue
+            score = session.get("ai_quality_score")
+            if score is not None and score <= 2:
+                continue
+            user_msgs = session.get("user_messages") or 0
+            assistant_msgs = session.get("assistant_messages") or 0
+            if user_msgs < 2 and assistant_msgs < 2:
+                continue
+            recommended_pool.append(session)
+            seen_ids.add(sid)
+
     five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
     five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
 
-    # Backfill: older approved 5-star to top up when the recent window
-    # is genuinely thin.
+    # Tier 3: older approved 5-star backfill — only if we still
+    # haven't reached 5 after tiers 1 and 2.
     if len(recommended_pool) < 5:
         for session in five_star_older:
             if len(recommended_pool) >= 5:
