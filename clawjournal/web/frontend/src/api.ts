@@ -160,7 +160,7 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
     const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
     return request(`/share-ready${q}`);
   },

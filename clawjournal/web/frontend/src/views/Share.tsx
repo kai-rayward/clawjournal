@@ -102,6 +102,10 @@ function outcomeBadge(outcome: string | null): string {
 
 const formatTokens = (t: number) => t >= 1_000_000 ? `${(t / 1_000_000).toFixed(1)}M` : `${(t / 1000).toFixed(0)}k`;
 
+// Matches SessionDetail's formula: input + output (cache tokens excluded).
+const sessionTotalTokens = (s: { input_tokens?: number; output_tokens?: number }) =>
+  (s.input_tokens || 0) + (s.output_tokens || 0);
+
 // Map raw redaction-log `type` strings into a small set of buckets the UI
 // surfaces on Redact and Review. Everything else collapses to `other`.
 type RedactionBucket = 'tokens' | 'emails' | 'paths' | 'timestamps' | 'urls' | 'other';
@@ -152,6 +156,7 @@ interface ReadySession {
   assistant_messages: number;
   tool_uses: number;
   input_tokens: number;
+  output_tokens: number;
   outcome_badge: string | null;
   client_origin?: string | null;
   runtime_channel?: string | null;
@@ -956,7 +961,7 @@ export function Share() {
 
       // Bundle info — use `undefined` locale (empty-array form is a known
       // source of RangeError in some Intl configs).
-      const totalTokens = approvedList.reduce((sum, s) => sum + (s.input_tokens || 0), 0);
+      const totalTokens = approvedList.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
       const approxMB = Math.max(0.1, (totalTokens * 0.3) / (1024 * 1024));
       try {
         setBundleInfo({
@@ -1231,7 +1236,7 @@ function QueueStep(p: QueueStepProps) {
   const [dragId, setDragId] = useState<string | null>(null);
 
   const allSessions = p.readyStats?.sessions || [];
-  const totalTokens = p.queuedSessions.reduce((sum, s) => sum + (s.input_tokens || 0), 0);
+  const totalTokens = p.queuedSessions.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
   const uniqueProjects = [...new Set(p.queuedSessions.map(s => s.project).filter(Boolean))];
 
   const onDragStart = (e: React.DragEvent, id: string) => {
@@ -1424,7 +1429,7 @@ function QueueStep(p: QueueStepProps) {
                       <SourceBadge s={s} />
                       <span>{s.project}</span>
                       <span style={{ opacity: 0.5 }}>&middot;</span>
-                      <span>{formatTokens(s.input_tokens)} tokens</span>
+                      <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
                       {s.tool_uses > 0 && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span>{s.tool_uses} tools</span>
@@ -1553,7 +1558,7 @@ function QueueStep(p: QueueStepProps) {
                           <SourceBadge s={s} />
                           <span>{s.project}</span>
                           <span style={{ opacity: 0.5 }}>&middot;</span>
-                          <span>{formatTokens(s.input_tokens)} tokens</span>
+                          <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
                           {s.review_status && s.review_status !== 'approved' && (<>
                             <span style={{ opacity: 0.5 }}>&middot;</span>
                             <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
@@ -1829,7 +1834,7 @@ function RedactStep(p: RedactStepProps) {
                 <SourceBadge s={s} />
                 <span>{s.project}</span>
                 <span style={{ opacity: 0.5 }}>&middot;</span>
-                <span>{formatTokens(s.input_tokens)} tokens</span>
+                <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
               </div>
             </div>
             <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -2129,7 +2134,7 @@ function ReviewRow({
             <SourceBadge s={session} />
             <span>{session.project}</span>
             <span style={{ opacity: 0.5 }}>&middot;</span>
-            <span>{formatTokens(session.input_tokens)} tokens</span>
+            <span>{formatTokens(sessionTotalTokens(session))} tokens</span>
             {metaPhrase && (<>
               <span style={{ opacity: 0.5 }}>&middot;</span>
               <span style={{ color: colors.yellow700 }}>{metaPhrase}</span>

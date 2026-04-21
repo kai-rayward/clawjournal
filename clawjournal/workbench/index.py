@@ -2854,8 +2854,8 @@ def get_share_ready_stats(
     rows = conn.execute(
         "SELECT session_id, project, model, source, display_title,"
         " ai_quality_score, user_messages, assistant_messages, tool_uses,"
-        " input_tokens, outcome_badge, client_origin, runtime_channel,"
-        " start_time, review_status"
+        " input_tokens, output_tokens, outcome_badge, client_origin,"
+        " runtime_channel, start_time, review_status"
         " FROM sessions"
         f"{where_status}"
         f"{' AND' if where_status else ' WHERE'} session_id NOT IN ("
@@ -2876,7 +2876,7 @@ def get_share_ready_stats(
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
             "ai_quality_score", "user_messages", "assistant_messages",
-            "tool_uses", "input_tokens", "outcome_badge",
+            "tool_uses", "input_tokens", "output_tokens", "outcome_badge",
             "client_origin", "runtime_channel", "start_time", "review_status"]
     sessions = [dict(zip(cols, r)) for r in rows]
     if excluded_projects:
