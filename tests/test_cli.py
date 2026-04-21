@@ -977,6 +977,54 @@ class TestWorkbenchSourceChoices:
         assert seen["source"] == "aider"
 
 
+class TestEventsCLI:
+    def test_events_capabilities_outputs_json(self, capsys):
+        with patch.object(sys, "argv", ["clawjournal", "events", "capabilities"]):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["claude"]["tool_call"]["supported"] is True
+        assert payload["codex"]["stdout_chunk"]["supported"] is False
+
+    def test_events_ingest_outputs_summary_json(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "config")
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / "config")
+
+        from clawjournal.parsing import parser
+
+        monkeypatch.setattr(parser, "PROJECTS_DIR", tmp_path / "claude" / "projects")
+        monkeypatch.setattr(parser, "CODEX_SESSIONS_DIR", tmp_path / "codex" / "sessions")
+        monkeypatch.setattr(parser, "CODEX_ARCHIVED_DIR", tmp_path / "codex" / "archived_sessions")
+        monkeypatch.setattr(parser, "LOCAL_AGENT_DIR", tmp_path / "local_agent")
+        monkeypatch.setattr(parser, "OPENCLAW_AGENTS_DIR", tmp_path / "openclaw" / "agents")
+
+        session_file = tmp_path / "claude" / "projects" / "demo-project" / "cli.jsonl"
+        session_file.parent.mkdir(parents=True)
+        session_file.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": "2026-04-20T10:00:00.000Z",
+                    "message": {"content": "Hello from CLI"},
+                }
+            )
+            + "\n"
+        )
+
+        with patch.object(
+            sys,
+            "argv",
+            ["clawjournal", "events", "ingest", "--source", "claude", "--json"],
+        ):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["files_scanned"] == 1
+        assert payload["files_with_changes"] == 1
+        assert payload["event_rows"] == 1
+
+
 class TestShareHelpers:
     def test_share_preview_json_returns_payload(self):
         payload = _share_preview([{"session_id": "s1", "display_title": "hello", "risk_badges": "[]"}], output_json=True)

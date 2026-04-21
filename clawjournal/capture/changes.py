@@ -52,6 +52,7 @@ class LineBatch:
     start_offset: int
     end_offset: int
     lines: list[str]
+    line_offsets: list[int]
     inode: int
     last_modified: float
 
@@ -84,10 +85,15 @@ def iter_new_lines(
     if last_newline < 0:
         return None
     complete = raw[: last_newline + 1]
-    text_lines = [
-        line.decode("utf-8", errors="replace")
-        for line in complete.splitlines()
-    ]
+    text_lines: list[str] = []
+    line_offsets: list[int] = []
+    offset = start_offset
+    for raw_line in complete.splitlines(keepends=True):
+        line_offsets.append(offset)
+        text_lines.append(
+            raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+        )
+        offset += len(raw_line)
     end_offset = start_offset + last_newline + 1
 
     return LineBatch(
@@ -96,6 +102,7 @@ def iter_new_lines(
         start_offset=start_offset,
         end_offset=end_offset,
         lines=text_lines,
+        line_offsets=line_offsets,
         inode=st.st_ino,
         last_modified=st.st_mtime,
     )
