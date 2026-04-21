@@ -823,6 +823,7 @@ def apply_findings_to_blob(
 
     # Lazy import to avoid pii.py → secrets.py import cycle.
     from .pii import pii_secret_map_from_text_decisions
+    from .trufflehog import trufflehog_secret_map_from_blob
 
     total = 0
     for pass_num in range(max_passes):
@@ -835,6 +836,10 @@ def apply_findings_to_blob(
             secret_map.update(
                 pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
             )
+        # TruffleHog runs per-blob (one subprocess), not per-text.
+        secret_map.update(
+            trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
+        )
         if not secret_map:
             break
 

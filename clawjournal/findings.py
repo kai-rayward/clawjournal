@@ -59,7 +59,7 @@ def get_enabled_engines(config: dict[str, Any] | None = None) -> tuple[str, ...]
     automatically triggers a rescan. Both `regex_pii` and `regex_secrets`
     are wired through the findings pipeline + share-time apply path.
     """
-    default = ("regex_pii", "regex_secrets")
+    default = ("regex_pii", "regex_secrets", "trufflehog")
     if not config:
         return default
     engines = config.get("enabled_findings_engines")

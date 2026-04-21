@@ -233,6 +233,96 @@ class TestWriteReport:
         assert "raw" not in json.dumps(payload).lower() or "raw_sha256" in json.dumps(payload)
 
 
+class TestPlaceholderForDetector:
+    def test_normalizes_to_upper_snake(self):
+        assert trufflehog.placeholder_for_detector("GitHub") == "[REDACTED_GITHUB]"
+        assert trufflehog.placeholder_for_detector("Slack OAuth Token") == "[REDACTED_SLACK_OAUTH_TOKEN]"
+
+    def test_empty_detector_falls_back(self):
+        assert trufflehog.placeholder_for_detector("") == "[REDACTED_TRUFFLEHOG]"
+
+
+class TestFindingsEngineEntryPoints:
+    """scan_session_for_trufflehog_findings emits RawFinding rows whose
+    offsets point at each occurrence of the raw secret in every text
+    field. Only the subprocess shim is mocked; the field walk and
+    offset computation run for real against a realistic session dict.
+    """
+
+    @staticmethod
+    def _fake_matches(monkeypatch, raws):
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(
+            trufflehog, "_scan_text_for_raw_matches",
+            lambda text: [
+                {"raw": raw, "detector": detector, "status": "verified"}
+                for raw, detector in raws
+            ],
+        )
+
+    def test_findings_emitted_per_occurrence(self, monkeypatch):
+        from clawjournal.findings import RawFinding
+
+        raw_secret = "sk_live_verysecretabcdef"
+        self._fake_matches(monkeypatch, [(raw_secret, "Stripe")])
+        session = {
+            "project": f"prefix {raw_secret} suffix",
+            "messages": [
+                {"content": f"first occurrence: {raw_secret}", "tool_uses": []},
+                {"content": f"second here {raw_secret}, and again {raw_secret}", "tool_uses": []},
+            ],
+        }
+        out = trufflehog.scan_session_for_trufflehog_findings(session)
+        assert all(isinstance(f, RawFinding) for f in out)
+        assert len(out) == 4  # project + msg0 + 2x msg1
+        engines = {f.engine for f in out}
+        assert engines == {"trufflehog"}
+        detectors = {f.entity_type for f in out}
+        assert detectors == {"Stripe"}
+        for f in out:
+            assert f.entity_text == raw_secret
+            assert f.length == len(raw_secret)
+            assert f.confidence == 1.0
+
+    def test_missing_binary_returns_no_findings(self, monkeypatch):
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: False)
+        session = {"messages": [{"content": "sk-anything-looks-secret-like"}]}
+        assert trufflehog.scan_session_for_trufflehog_findings(session) == []
+
+
+class TestApplyTruffleHogPass:
+    """Legacy-path apply: replace raw strings in-place, emit log
+    entries that match the existing ``{type, confidence,
+    original_length, field, message_index?}`` shape."""
+
+    def test_replaces_in_all_locations_and_logs_per_occurrence(self, monkeypatch):
+        raw = "xoxb-0123456789-ABCDEFGHIJKL"
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(
+            trufflehog, "_scan_text_for_raw_matches",
+            lambda text: [{"raw": raw, "detector": "Slack", "status": "verified"}],
+        )
+        session = {
+            "project": f"p {raw} q",
+            "messages": [
+                {"content": f"hi {raw}", "tool_uses": [{"input": {"path": f"/x/{raw}/y"}}]},
+            ],
+        }
+        total, log = trufflehog.apply_trufflehog_pass(session)
+        assert total == 3
+        assert session["project"] == "p [REDACTED_SLACK] q"
+        assert session["messages"][0]["content"] == "hi [REDACTED_SLACK]"
+        assert session["messages"][0]["tool_uses"][0]["input"]["path"] == "/x/[REDACTED_SLACK]/y"
+        types = {e["type"] for e in log}
+        assert types == {"trufflehog_slack"}
+        assert len(log) == 3
+        assert all(e["original_length"] == len(raw) for e in log)
+        assert all("confidence" in e for e in log)
+
+
 class TestFormatBlockMessage:
     def test_missing_binary_includes_install_hint(self):
         report = trufflehog.TruffleHogReport(

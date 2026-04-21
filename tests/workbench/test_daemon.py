@@ -194,15 +194,6 @@ class TestSessionsAPI:
         assert "PartnerDev" not in redacted
         assert "foo.internal" not in redacted
         assert any(entry["type"] == "blocked_domain" for entry in data["redaction_log"])
-        # Per-session TruffleHog preview always present. In the test
-        # suite the autouse fixture bypasses the binary, so status is
-        # "bypassed" — the important assertion is that the block is
-        # emitted at all so the UI always gets a signal.
-        assert "trufflehog" in data
-        assert data["trufflehog"]["status"] in (
-            "clean", "findings", "bypassed", "unavailable", "error"
-        )
-        assert "findings_count" in data["trufflehog"]
 
     def test_update_session_status(self, server):
         status, data = _post(server, "/api/sessions/sess-0", {"status": "approved"})

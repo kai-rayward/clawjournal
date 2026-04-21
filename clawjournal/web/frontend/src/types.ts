@@ -225,27 +225,12 @@ export interface AiPiiFinding {
   source: string;
 }
 
-export interface TruffleHogFindingSummary {
-  detector: string;
-  status: 'verified' | 'unverified' | 'unknown';
-  line: number | null;
-  masked: string;
-}
-
-export interface TruffleHogPreview {
-  status: 'clean' | 'findings' | 'bypassed' | 'unavailable' | 'error';
-  findings_count: number;
-  findings: TruffleHogFindingSummary[];
-  error?: string;
-}
-
 export interface RedactionReport {
   session_id: string;
   redaction_count: number;
   redaction_log: RedactionLogEntry[];
   ai_pii_findings?: AiPiiFinding[];
   ai_coverage?: 'full' | 'rules_only';
-  trufflehog?: TruffleHogPreview;
   redacted_session: SessionDetail;
 }
 

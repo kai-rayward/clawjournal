@@ -429,14 +429,16 @@ class TestAllowlistRetroactive:
 
 
 class TestEnabledEngines:
-    def test_defaults_to_both_regex_engines(self):
-        assert get_enabled_engines(None) == ("regex_pii", "regex_secrets")
-        assert get_enabled_engines({}) == ("regex_pii", "regex_secrets")
+    DEFAULT = ("regex_pii", "regex_secrets", "trufflehog")
+
+    def test_defaults_to_all_shipped_engines(self):
+        assert get_enabled_engines(None) == self.DEFAULT
+        assert get_enabled_engines({}) == self.DEFAULT
 
     def test_returns_sorted_tuple(self):
-        result = get_enabled_engines({"enabled_findings_engines": ["regex_secrets", "regex_pii"]})
-        assert result == ("regex_pii", "regex_secrets")
+        result = get_enabled_engines({"enabled_findings_engines": ["trufflehog", "regex_secrets", "regex_pii"]})
+        assert result == self.DEFAULT
 
     def test_rejects_non_list(self):
         # Non-list config is treated as "use defaults".
-        assert get_enabled_engines({"enabled_findings_engines": "regex_secrets"}) == ("regex_pii", "regex_secrets")
+        assert get_enabled_engines({"enabled_findings_engines": "regex_secrets"}) == self.DEFAULT

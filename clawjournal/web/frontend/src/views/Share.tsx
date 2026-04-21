@@ -111,6 +111,7 @@ function bucketOf(type: string): RedactionBucket {
   if (t.includes('url')) return 'urls';
   if (t.includes('path') || t.includes('username') || t.includes('home')) return 'paths';
   if (t.includes('time') || t.includes('date')) return 'timestamps';
+  if (t.startsWith('trufflehog')) return 'tokens';
   if (t.includes('token') || t.includes('key') || t.includes('secret') || t.includes('jwt') || t.includes('cred') || t.includes('auth')) return 'tokens';
   return 'other';
 }
@@ -183,12 +184,6 @@ interface AiPiiFindingLocal {
   source: string;
 }
 
-interface TruffleHogPreviewLocal {
-  status: 'clean' | 'findings' | 'bypassed' | 'unavailable' | 'error';
-  count: number;
-  findings: Array<{ detector: string; status: string; line: number | null; masked: string }>;
-}
-
 interface RedactedSessionData {
   messages: RedactedReviewMessage[];
   loading: boolean;
@@ -196,7 +191,7 @@ interface RedactedSessionData {
   aiPiiFindings?: AiPiiFindingLocal[];
   aiCoverage?: 'full' | 'rules_only';
   buckets?: BucketCounts;
-  trufflehog?: TruffleHogPreviewLocal;
+  trufflehogHits?: number;
 }
 
 const CONFIDENCE_THRESHOLD = 0.85;
@@ -204,7 +199,6 @@ const CONFIDENCE_THRESHOLD = 0.85;
 function classify(d: RedactedSessionData | undefined): 'checking' | 'clear' | 'review' {
   if (!d || d.loading) return 'checking';
   if (d.aiCoverage === 'rules_only') return 'review';
-  if (d.trufflehog && d.trufflehog.status === 'findings') return 'review';
   const lowConf = (d.aiPiiFindings || []).some(f => f.confidence < CONFIDENCE_THRESHOLD);
   if (lowConf) return 'review';
   return 'clear';
@@ -744,19 +738,9 @@ export function Share() {
         for (const entry of report.redaction_log || []) {
           buckets[bucketOf(entry.type)] += 1;
         }
-        const th = report.trufflehog;
-        const trufflehog: TruffleHogPreviewLocal | undefined = th
-          ? {
-              status: th.status,
-              count: th.findings_count,
-              findings: (th.findings || []).map((f) => ({
-                detector: f.detector,
-                status: f.status,
-                line: f.line ?? null,
-                masked: f.masked,
-              })),
-            }
-          : undefined;
+        const trufflehogHits = (report.redaction_log || [])
+          .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
+          .length;
         setRedactedSessions((prev) => ({
           ...prev,
           [s.session_id]: {
@@ -765,7 +749,7 @@ export function Share() {
             aiPiiFindings: report.ai_pii_findings || [],
             aiCoverage: report.ai_coverage || 'rules_only',
             buckets,
-            trufflehog,
+            trufflehogHits,
           },
         }));
       } catch {
@@ -1701,20 +1685,9 @@ function RedactStep(p: RedactStepProps) {
     acc.urls += d.buckets.urls;
     acc.other += d.buckets.other;
     if (classify(d) === 'review') acc.flagged += 1;
-    if (d.trufflehog) acc.thHits += d.trufflehog.count;
+    acc.thHits += d.trufflehogHits || 0;
     return acc;
   }, { ...emptyBuckets(), flagged: 0, thHits: 0 });
-
-  // Aggregate TruffleHog status across all finished sessions. "findings"
-  // dominates (any hit → red); otherwise the worst non-clean state wins.
-  const thStates = p.queuedSessions
-    .map((s) => p.redactedSessions[s.session_id]?.trufflehog?.status)
-    .filter((x): x is TruffleHogPreviewLocal['status'] => !!x);
-  let thSummary: TruffleHogPreviewLocal['status'] | 'pending' = thStates.length === 0 ? 'pending' : 'clean';
-  if (thStates.includes('findings')) thSummary = 'findings';
-  else if (thStates.includes('error')) thSummary = 'error';
-  else if (thStates.includes('unavailable')) thSummary = 'unavailable';
-  else if (thStates.includes('bypassed')) thSummary = 'bypassed';
 
   const doneCount = p.queuedSessions.filter((s) => {
     const d = p.redactedSessions[s.session_id];
@@ -1784,33 +1757,15 @@ function RedactStep(p: RedactStepProps) {
         padding: '16px 18px', marginBottom: 20,
         background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8,
       }}>
-        {categoryRow('Secrets & credentials', totals.tokens, Math.max(totals.tokens, 4))}
+        {categoryRow(
+          `Secrets & credentials${totals.thHits > 0 ? ` (incl. ${totals.thHits} via TruffleHog)` : ''}`,
+          totals.tokens, Math.max(totals.tokens, 4),
+        )}
         {categoryRow('Email addresses', totals.emails, Math.max(totals.emails, 4))}
         {categoryRow('File paths & usernames', totals.paths, Math.max(totals.paths, 8))}
         {categoryRow('Timestamps coarsened', totals.timestamps, Math.max(totals.timestamps, 20))}
         {categoryRow('URLs', totals.urls, Math.max(totals.urls, 4), colors.blue500)}
         {categoryRow('AI-flagged for your review', totals.flagged, Math.max(totals.flagged, 2), colors.yellow400)}
-        {(() => {
-          const label = thSummary === 'findings'
-            ? `Post-redaction scan (TruffleHog) — ${totals.thHits} surviving finding${totals.thHits === 1 ? '' : 's'}`
-            : thSummary === 'unavailable'
-              ? 'Post-redaction scan (TruffleHog) — not installed'
-              : thSummary === 'bypassed'
-                ? 'Post-redaction scan (TruffleHog) — bypassed'
-                : thSummary === 'error'
-                  ? 'Post-redaction scan (TruffleHog) — scan error'
-                  : thSummary === 'pending'
-                    ? 'Post-redaction scan (TruffleHog) — pending'
-                    : 'Post-redaction scan (TruffleHog) — clean';
-          const color = thSummary === 'findings'
-            ? '#d3461f'
-            : thSummary === 'clean'
-              ? '#1fa65a'
-              : colors.gray500;
-          const count = thSummary === 'findings' ? totals.thHits : (thSummary === 'clean' ? p.queuedSessions.length : 0);
-          const max = Math.max(count, p.queuedSessions.length || 1);
-          return categoryRow(label, count, max, color);
-        })()}
       </div>
 
       <div style={{
@@ -1829,9 +1784,6 @@ function RedactStep(p: RedactStepProps) {
           if (d.buckets.paths) chips.push(`${d.buckets.paths} path${d.buckets.paths === 1 ? '' : 's'}`);
           if (d.buckets.timestamps) chips.push(`${d.buckets.timestamps} timestamps`);
           if (d.buckets.urls) chips.push(`${d.buckets.urls} URL${d.buckets.urls === 1 ? '' : 's'}`);
-          if (d.trufflehog && d.trufflehog.count > 0) {
-            chips.push(`${d.trufflehog.count} TruffleHog hit${d.trufflehog.count === 1 ? '' : 's'}`);
-          }
         }
         return (
           <div key={s.session_id} style={{

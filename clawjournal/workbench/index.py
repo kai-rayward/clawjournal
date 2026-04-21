@@ -870,6 +870,21 @@ def apply_share_redactions(
                         anonymizer.text,
                     )
 
+    # TruffleHog acts as another detection+redaction engine in the
+    # pipeline. Running after anonymize + regex means it only sees
+    # secrets our deterministic layers missed, which is what its
+    # ~800 SaaS-specific detectors are useful for. The later
+    # Package-step gate independently re-scans the merged output.
+    try:
+        from ..redaction.trufflehog import apply_trufflehog_pass
+
+        th_total, th_log = apply_trufflehog_pass(session)
+        if th_total:
+            total_redactions += th_total
+            redaction_log.extend(th_log)
+    except Exception:  # noqa: BLE001 — never block share redaction on a flaky subprocess
+        pass
+
     return session, total_redactions, redaction_log
 
 
