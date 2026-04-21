@@ -1487,12 +1487,57 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     logger.warning("AI PII detection failed for %s: %s", session_id, exc)
                     ai_coverage = "rules_only"
 
+            # Per-session TruffleHog preview on the final redacted content.
+            # The authoritative gate still runs at Package time on the
+            # merged sessions.jsonl; this exists so the Redact step UI
+            # can surface surviving secrets as early as possible.
+            trufflehog_block: dict[str, Any]
+            try:
+                from ..redaction import trufflehog as trufflehog_scanner
+
+                report = trufflehog_scanner.scan_text(
+                    json.dumps(detail, default=str)
+                )
+                if report.bypassed:
+                    status = "bypassed"
+                elif report.binary_missing:
+                    status = "unavailable"
+                elif report.findings:
+                    status = "findings"
+                else:
+                    status = "clean"
+                trufflehog_block = {
+                    "status": status,
+                    "findings_count": len(report.findings),
+                    "findings": [
+                        {
+                            "detector": f.detector,
+                            "status": f.status,
+                            "line": f.line,
+                            "masked": f.masked,
+                        }
+                        for f in report.findings[:10]
+                    ],
+                }
+            except Exception as exc:
+                logger.warning(
+                    "Redact-step TruffleHog scan failed for %s: %s",
+                    session_id, exc,
+                )
+                trufflehog_block = {
+                    "status": "error",
+                    "findings_count": 0,
+                    "findings": [],
+                    "error": str(exc),
+                }
+
             _json_response(self, {
                 "session_id": session_id,
                 "redaction_count": redaction_count + ai_pii_count,
                 "redaction_log": redaction_log,
                 "ai_pii_findings": ai_pii_findings,
                 "ai_coverage": ai_coverage,
+                "trufflehog": trufflehog_block,
                 "redacted_session": detail,
             })
         finally:

@@ -187,6 +187,27 @@ class TestScanFile:
             trufflehog.scan_file(target)
 
 
+class TestScanText:
+    def test_scan_text_round_trips_through_temp_file(self, monkeypatch):
+        """scan_text writes to a temp file, invokes scan_file, cleans up."""
+        seen_paths: list[str] = []
+
+        def fake_scan_file(path):
+            seen_paths.append(str(path))
+            assert path.exists(), "temp file should exist when scan_file is called"
+            assert path.read_text() == '{"hello":"world"}'
+            return trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+            )
+
+        monkeypatch.setattr(trufflehog, "scan_file", fake_scan_file)
+        report = trufflehog.scan_text('{"hello":"world"}')
+        assert report.blocking is False
+        # Temp file cleaned up after return.
+        assert not Path(seen_paths[0]).exists()
+
+
 class TestWriteReport:
     def test_report_round_trips_without_raw_values(self, tmp_path):
         report = trufflehog.TruffleHogReport(

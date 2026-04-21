@@ -279,6 +279,26 @@ def scan_file(path: Path) -> TruffleHogReport:
     )
 
 
+def scan_text(text: str) -> TruffleHogReport:
+    """Scan an in-memory string by dropping it to a temp file.
+
+    Used by the Redact step, which wants a per-session preview scan
+    without managing its own temp dir. The final authoritative gate
+    still runs on the merged sessions.jsonl at Package time.
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(text)
+        tmp_path = Path(tf.name)
+    try:
+        return scan_file(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def write_report(path: Path, report: TruffleHogReport) -> None:
     payload = {
         "scanned_path": report.scanned_path,
