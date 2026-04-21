@@ -41,11 +41,24 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
     (ANTHROPIC_API_KEY, OPENAI_API_KEY, GCS service-account JSON, …).
     A malicious ``trufflehog`` binary on PATH would inherit all of
     them by default. Restrict to what the binary genuinely needs:
-    ``PATH`` to exec helpers, ``HOME`` to find its config/cache dir,
-    ``TMPDIR`` for its own workspace, and the locale env so it
-    decodes stdin as UTF-8.
+
+    - ``PATH`` to exec helpers
+    - ``HOME`` / ``TMPDIR`` for config + workspace
+    - locale vars for UTF-8 decoding
+    - **Network trust**: ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` so
+      verification against provider APIs works on distros that rely
+      on env-specified CA bundles; proxy vars so the same works
+      behind a corporate HTTPS proxy. Without these, provider
+      verification silently fails and real secrets get downgraded
+      from ``verified`` to ``unknown``.
     """
-    keep = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
+    keep = (
+        "PATH", "HOME", "TMPDIR",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+    )
     return {k: os.environ[k] for k in keep if k in os.environ}
 
 # Detectors we ask TruffleHog to skip. The gate's "any finding blocks"
@@ -137,24 +150,45 @@ def is_available() -> bool:
     return shutil.which("trufflehog") is not None
 
 
-_version_cache: str | None = None
+_version_cache: dict[tuple, str] = {}
+
+_VERSION_RE = re.compile(r"\btrufflehog\s+(\d+\.\d+\.\d+)", re.IGNORECASE)
+
+
+def _binary_signature() -> tuple:
+    """Stable per-binary key for the fingerprint cache.
+
+    Folds the resolved path and its mtime+size so a ``brew upgrade``
+    (new inode, new size, new mtime) invalidates cached entries in
+    a long-running daemon without requiring a restart. Returns
+    ``("missing",)`` if the binary isn't on PATH.
+    """
+    resolved = shutil.which("trufflehog")
+    if resolved is None:
+        return ("missing",)
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return ("unknown", resolved)
+    return (resolved, st.st_mtime_ns, st.st_size)
 
 
 def engine_fingerprint() -> str:
     """Return a short fingerprint folded into ``findings_revision``.
 
-    Captures presence + version so cached revisions invalidate when
-    the user installs or upgrades TruffleHog. Missing binary reports
-    ``"missing"``; timeouts / errors report ``"unknown"``. Result is
-    memoized for the process lifetime — the scanner can call this
-    once per session without re-forking the binary.
+    Captures presence + version so cached session revisions invalidate
+    when the user installs or upgrades TruffleHog. Missing binary
+    reports ``"missing"``; parse/timeout errors report ``"unknown"``.
+    Result is memoized per ``(path, mtime, size)`` tuple so a long-
+    running daemon notices upgrades without a restart.
     """
-    global _version_cache
-    if _version_cache is not None:
-        return _version_cache
-    if not is_available():
-        _version_cache = "missing"
-        return _version_cache
+    signature = _binary_signature()
+    cached = _version_cache.get(signature)
+    if cached is not None:
+        return cached
+    if signature[0] == "missing":
+        _version_cache[signature] = "missing"
+        return "missing"
     try:
         result = subprocess.run(
             ["trufflehog", "--version"],
@@ -165,19 +199,25 @@ def engine_fingerprint() -> str:
             stdin=subprocess.DEVNULL,
             env=_scrubbed_subprocess_env(),
         )
-        # TruffleHog writes the version to stderr in some releases,
-        # stdout in others — accept either.
-        out = (result.stdout or result.stderr or "").strip().splitlines()
-        _version_cache = out[0] if out else "unknown"
+        blob = (result.stdout or "") + "\n" + (result.stderr or "")
+        match = _VERSION_RE.search(blob)
+        if match:
+            fingerprint = f"trufflehog {match.group(1)}"
+        else:
+            # Fallback for an unrecognized banner — take the first
+            # non-empty line verbatim.
+            lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+            fingerprint = lines[0] if lines else "unknown"
+        _version_cache[signature] = fingerprint
+        return fingerprint
     except (subprocess.TimeoutExpired, OSError):
-        _version_cache = "unknown"
-    return _version_cache
+        _version_cache[signature] = "unknown"
+        return "unknown"
 
 
 def reset_version_cache() -> None:
     """Clear the cached version fingerprint — for tests only."""
-    global _version_cache
-    _version_cache = None
+    _version_cache.clear()
 
 
 def is_bypassed() -> bool:
@@ -207,23 +247,43 @@ def _sha256_file(path: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
+def _classify_trufflehog_status(parsed: dict) -> FindingStatus:
+    """Status rules, matching TruffleHog's JSONL schema:
+
+    - ``Verified: true``  → verified (provider API said yes)
+    - ``VerificationError`` non-empty at top level → unknown (provider
+      unreachable / auth error / DNS failure; likely real but unprovable)
+    - fallback → unverified (pattern matched, no verification run or
+      provider said no)
+
+    ``VerificationError`` is a **top-level** field on TruffleHog's
+    output struct (see ``pkg/output/json.go``), not nested under
+    ``ExtraData``. Earlier iterations of this parser probed only the
+    nested path and mis-classified every verification failure as
+    ``unverified``.
+    """
+    if parsed.get("Verified") is True:
+        return "verified"
+    top_err = parsed.get("VerificationError")
+    if isinstance(top_err, str) and top_err.strip():
+        return "unknown"
+    # ExtraData probe kept as a defensive fallback for older/future
+    # TruffleHog versions that might move the field.
+    extra = parsed.get("ExtraData") if isinstance(parsed.get("ExtraData"), dict) else None
+    if extra:
+        for key in ("verification_error", "verificationError", "error"):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                return "unknown"
+    return "unverified"
+
+
 def _parse_finding(parsed: dict) -> TruffleHogFinding | None:
     detector = parsed.get("DetectorName")
     if not isinstance(detector, str):
         return None
 
-    if parsed.get("Verified") is True:
-        status: FindingStatus = "verified"
-    else:
-        extra = parsed.get("ExtraData") if isinstance(parsed.get("ExtraData"), dict) else None
-        has_verification_error = False
-        if extra:
-            for key in ("verification_error", "verificationError", "error"):
-                value = extra.get(key)
-                if isinstance(value, str) and value.strip():
-                    has_verification_error = True
-                    break
-        status = "unknown" if has_verification_error else "unverified"
+    status: FindingStatus = _classify_trufflehog_status(parsed)
 
     line_no: int | None = None
     source_metadata = parsed.get("SourceMetadata")
@@ -468,18 +528,7 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
         raw = parsed.get("Raw")
         if not isinstance(detector, str) or not isinstance(raw, str) or not raw:
             continue
-        if parsed.get("Verified") is True:
-            status = "verified"
-        else:
-            extra = parsed.get("ExtraData") if isinstance(parsed.get("ExtraData"), dict) else None
-            has_err = False
-            if extra:
-                for key in ("verification_error", "verificationError", "error"):
-                    v = extra.get(key)
-                    if isinstance(v, str) and v.strip():
-                        has_err = True
-                        break
-            status = "unknown" if has_err else "unverified"
+        status = _classify_trufflehog_status(parsed)
         key = (detector, raw)
         if key in seen:
             continue

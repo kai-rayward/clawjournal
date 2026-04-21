@@ -583,6 +583,40 @@ class TestShareAPI:
         assert data["ok"] is True
         return share_id
 
+    def test_upload_refuses_when_trufflehog_bypassed(self, server, monkeypatch):
+        """CLAWJOURNAL_SKIP_TRUFFLEHOG is a dev/CI escape hatch for
+        local bundle-export. Uploading an unscanned share to a remote
+        endpoint must fail closed — otherwise the escape hatch is a
+        one-flag ``--ship-secrets-anyway``."""
+        from clawjournal.redaction import trufflehog
+
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        # Unwind the class-level clean mock: simulate an actual bypass.
+        monkeypatch.setenv(trufflehog.SKIP_ENV_VAR, "1")
+        # Ensure scan_file observes the bypass by exercising the real
+        # path (short-circuits to bypassed=True) rather than the clean
+        # stub from the autouse fixture.
+        from pathlib import Path as _Path
+
+        def _real_bypass_scan(path):
+            return trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+                bypassed=True,
+            )
+
+        monkeypatch.setattr(trufflehog, "scan_file", _real_bypass_scan)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 422, data
+        assert data.get("block_reason") == "trufflehog-bypassed"
+        assert "CLAWJOURNAL_SKIP_TRUFFLEHOG" in data.get("error", "")
+
     def test_share_success(self, server, monkeypatch):
         """Full success path: create, export, share via HTTP."""
         WorkbenchHandler._last_share_time = 0.0

@@ -30,6 +30,42 @@ class TestMaskSecret:
         assert masked.endswith("GHIJ")
 
 
+class TestStatusClassification:
+    """VerificationError is a top-level field on TruffleHog's JSONL
+    output (see pkg/output/json.go); a nested-only probe was a
+    correctness bug that misclassified every verification failure as
+    ``unverified`` instead of ``unknown``."""
+
+    def test_top_level_verification_error_is_unknown(self):
+        record = {
+            "DetectorName": "Stripe",
+            "Verified": False,
+            "VerificationError": "dial tcp: lookup api.stripe.com: no such host",
+            "Raw": "synthetic_stripe_abcdefghijklmnopqrstuvwxyzABCDEF",
+        }
+        assert trufflehog._classify_trufflehog_status(record) == "unknown"
+
+    def test_nested_verification_error_still_classified_as_unknown(self):
+        # Defensive fallback: older / alternate TruffleHog versions
+        # that put the error under ExtraData.
+        record = {
+            "DetectorName": "Stripe",
+            "Verified": False,
+            "ExtraData": {"verification_error": "connection refused"},
+            "Raw": "synthetic_stripe_abcdef",
+        }
+        assert trufflehog._classify_trufflehog_status(record) == "unknown"
+
+    def test_empty_verification_error_is_unverified(self):
+        record = {
+            "DetectorName": "Stripe",
+            "Verified": False,
+            "VerificationError": "",  # present but empty per TruffleHog's `omitempty` behavior
+            "Raw": "synthetic_stripe_abcdef",
+        }
+        assert trufflehog._classify_trufflehog_status(record) == "unverified"
+
+
 class TestParseFinding:
     def test_verified_wins_over_error(self):
         record = {
@@ -62,7 +98,7 @@ class TestParseFinding:
         record = {
             "DetectorName": "Stripe",
             "Verified": False,
-            "Raw": "sk_live_abcdefghijklmnopqrstuv",
+            "Raw": "synthetic_stripe_abcdefghijklmnopqrstuv",
         }
         finding = trufflehog._parse_finding(record)
         assert finding is not None
@@ -264,7 +300,7 @@ class TestFindingsEngineEntryPoints:
     def test_findings_emitted_per_occurrence(self, monkeypatch):
         from clawjournal.findings import RawFinding
 
-        raw_secret = "sk_live_verysecretabcdef"
+        raw_secret = "synthetic_stripe_verysecretabcdef"
         self._fake_matches(monkeypatch, [(raw_secret, "Stripe")])
         session = {
             "project": f"prefix {raw_secret} suffix",
@@ -377,7 +413,7 @@ class TestApplyPathIntegration:
 
         conn = open_index()
         try:
-            raw = "sk_live_abcdefg1234567890abcdef"
+            raw = "synthetic_stripe_abcdefg1234567890abcdef"
             self._seed(conn, "sess-one", content=f"payload {raw}")
             calls = self._patch_trufflehog_once(monkeypatch, raw)
 
@@ -467,7 +503,7 @@ class TestApplyLoopExit:
 
         conn = open_index()
         try:
-            raw = "sk_live_exit_guard_probe_0123456789"
+            raw = "synthetic_stripe_exit_guard_probe_0123456789"
             upsert_sessions(conn, [{
                 "session_id": "sess-exit",
                 "display_title": "t", "project": "p", "source": "claude",
@@ -624,12 +660,12 @@ class TestEngineFingerprint:
 
     def test_missing_binary_reports_missing(self, monkeypatch):
         trufflehog.reset_version_cache()
-        monkeypatch.setattr(trufflehog, "is_available", lambda: False)
+        monkeypatch.setattr(trufflehog, "_binary_signature", lambda: ("missing",))
         assert trufflehog.engine_fingerprint() == "missing"
 
     def test_version_captured_when_available(self, monkeypatch):
         trufflehog.reset_version_cache()
-        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(trufflehog, "_binary_signature", lambda: ("/fake/trufflehog", 123, 456))
 
         def fake_run(args, **kwargs):
             return subprocess.CompletedProcess(args, 0, stdout="trufflehog 3.94.3\n", stderr="")
@@ -638,20 +674,26 @@ class TestEngineFingerprint:
         fp = trufflehog.engine_fingerprint()
         assert "3.94.3" in fp
 
-    def test_memoized_across_calls(self, monkeypatch):
+    def test_memoized_until_binary_changes(self, monkeypatch):
         trufflehog.reset_version_cache()
-        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        sig = ["/fake/trufflehog", 100, 456]
+        monkeypatch.setattr(trufflehog, "_binary_signature", lambda: tuple(sig))
         calls = {"n": 0}
 
         def fake_run(args, **kwargs):
             calls["n"] += 1
-            return subprocess.CompletedProcess(args, 0, stdout="trufflehog 3.94.3\n", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=f"trufflehog 3.{sig[1]}.0\n", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         trufflehog.engine_fingerprint()
         trufflehog.engine_fingerprint()
         trufflehog.engine_fingerprint()
         assert calls["n"] == 1
+        # A binary upgrade (mtime change) must invalidate the cache so
+        # a long-running daemon notices without a restart.
+        sig[1] = 200
+        trufflehog.engine_fingerprint()
+        assert calls["n"] == 2
 
 
 class TestFormatBlockMessage:
