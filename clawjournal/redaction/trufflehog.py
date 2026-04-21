@@ -25,6 +25,18 @@ from typing import Literal
 
 SKIP_ENV_VAR = "CLAWJOURNAL_SKIP_TRUFFLEHOG"
 
+# Detectors we ask TruffleHog to skip. The gate's "any finding blocks"
+# contract is deliberately strict, so this list exists only for detectors
+# that collide with structural content in agent session files.
+#
+# - ``refiner`` (refiner.io user-feedback platform): its pattern is
+#   "the word 'refiner' followed by a UUID", which trips on any project
+#   name containing that substring (e.g. ``tracerefinery``) since
+#   Claude/Codex session files are full of tool-use / session UUIDs
+#   stored nearby. Verification against api.refiner.io correctly
+#   returns ``unverified`` for those, so they are never real leaks.
+EXCLUDED_DETECTORS: tuple[str, ...] = ("refiner",)
+
 INSTALL_HINT = (
     "TruffleHog is required to export shares but was not found on PATH.\n"
     "Install it with:\n"
@@ -195,16 +207,20 @@ def scan_file(path: Path) -> TruffleHogReport:
             binary_missing=True,
         )
 
+    args = [
+        "trufflehog",
+        "filesystem",
+        str(path),
+        "-j",
+        "--results=verified,unknown,unverified",
+        "--no-color",
+        "--no-update",
+    ]
+    if EXCLUDED_DETECTORS:
+        args.append(f"--exclude-detectors={','.join(EXCLUDED_DETECTORS)}")
+
     result = subprocess.run(
-        [
-            "trufflehog",
-            "filesystem",
-            str(path),
-            "-j",
-            "--results=verified,unknown,unverified",
-            "--no-color",
-            "--no-update",
-        ],
+        args,
         capture_output=True,
         text=True,
         check=False,

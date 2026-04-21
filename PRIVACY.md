@@ -74,6 +74,8 @@ brew install trufflehog
 
 For the upload path, the scan runs **twice**: once inside `export_share_to_disk`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload.
 
+One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
+
 An escape hatch exists for CI and development: setting `CLAWJOURNAL_SKIP_TRUFFLEHOG=1` disables the gate. This is recorded in the manifest (`redaction_summary.trufflehog.bypassed=true`) so reviewers can tell scanned shares from bypassed ones. Do not use it for real shares.
 
 ## What a local bundle contains

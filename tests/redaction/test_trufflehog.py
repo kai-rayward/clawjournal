@@ -117,6 +117,12 @@ class TestScanFile:
             assert cmd[0] == "trufflehog"
             assert "filesystem" in cmd
             assert "--no-update" in cmd
+            # Detectors known to trip on agent-trace structural content
+            # are excluded at the TruffleHog layer.
+            assert any(
+                arg.startswith("--exclude-detectors=") and "refiner" in arg
+                for arg in cmd
+            ), f"expected --exclude-detectors=refiner in {cmd}"
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
