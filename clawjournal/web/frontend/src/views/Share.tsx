@@ -1429,9 +1429,17 @@ function QueueStep(p: QueueStepProps) {
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span>{s.tool_uses} tools</span>
                       </>)}
-                      {s.ai_quality_score != null && (<>
+                      {s.ai_quality_score != null ? (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span style={{ color: '#c08a1a', letterSpacing: -1 }}>{scoreBadge(s.ai_quality_score)}</span>
+                      </>) : (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span
+                          style={{ color: colors.gray500, fontStyle: 'italic' }}
+                          title="This session hasn't been scored yet. Click Preview → Score with AI, or run `clawjournal score` from a terminal."
+                        >
+                          unscored
+                        </span>
                       </>)}
                       {s.outcome_badge && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
