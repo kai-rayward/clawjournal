@@ -631,6 +631,16 @@ def upload_share(
     if not sessions_file.exists():
         return {"error": "Export failed — no sessions file.", "status": 500}
 
+    # Pre-PII TruffleHog scan already ran inside export_share_to_disk —
+    # if that stage blocked, fail closed before we do any additional work.
+    if manifest.get("blocked"):
+        return {
+            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+            "block_reason": manifest.get("block_reason"),
+            "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+            "status": 422,
+        }
+
     # Mandatory PII redaction pass — applied to ALL sessions before upload.
     # This catches names, orgs, usernames, etc. that regex-based secret
     # redaction misses.  No session cap: every session gets reviewed.
@@ -673,6 +683,55 @@ def upload_share(
             "full": coverage_full,
             "rules_only": coverage_rules_only,
         }
+
+    # Post-PII TruffleHog re-scan: the PII pass rewrote sessions.jsonl,
+    # so the scan embedded in the manifest by export_share_to_disk is
+    # stale. Run the gate again on the file that's actually about to
+    # leave this machine.
+    try:
+        from ..redaction import trufflehog as trufflehog_scanner
+
+        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
+    except Exception as exc:
+        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
+        return {
+            "error": "Post-redaction scan failed — upload aborted.",
+            "detail": str(exc),
+            "status": 500,
+        }
+    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
+    if manifest and isinstance(manifest.get("redaction_summary"), dict):
+        manifest["redaction_summary"]["trufflehog_post_pii"] = post_pii_report.summary()
+    if post_pii_report.blocking:
+        if manifest:
+            manifest["blocked"] = True
+            manifest["block_reason"] = post_pii_report.block_reason
+            manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
+            with open(manifest_file, "w") as f:
+                json.dump(manifest, f, indent=2, default=str)
+        return {
+            "error": trufflehog_scanner.format_block_message(post_pii_report),
+            "block_reason": post_pii_report.block_reason,
+            "trufflehog_summary": post_pii_report.summary(),
+            "status": 422,
+        }
+    # Bypass is allowed locally (bundle-export with CLAWJOURNAL_SKIP_
+    # TRUFFLEHOG=1 still writes files), but uploading an unscanned
+    # share to a remote endpoint should fail closed — the gate exists
+    # specifically to catch surviving secrets before they leave the
+    # machine.
+    if post_pii_report.bypassed:
+        return {
+            "error": (
+                "Refusing to upload: TruffleHog was bypassed via "
+                "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and "
+                "retry, or use bundle-export for local-only output."
+            ),
+            "block_reason": "trufflehog-bypassed",
+            "status": 422,
+        }
+
+    if manifest and isinstance(manifest.get("redaction_summary"), dict):
         with open(manifest_file, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
 
@@ -1382,6 +1441,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             settings = get_effective_share_settings(conn, load_config())
             detail, _, _ = apply_share_redactions(
+                conn,
                 detail,
                 custom_strings=settings["custom_strings"],
                 user_allowlist=settings["allowlist_entries"],
@@ -1407,6 +1467,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             settings = get_effective_share_settings(conn, load_config())
             detail, redaction_count, redaction_log = apply_share_redactions(
+                conn,
                 detail,
                 custom_strings=settings["custom_strings"],
                 user_allowlist=settings["allowlist_entries"],
@@ -1761,6 +1822,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "output_path must be under home directory or /tmp"}, 400)
                 return
 
+            if manifest.get("blocked"):
+                _json_response(self, {
+                    "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+                    "block_reason": manifest.get("block_reason"),
+                    "export_path": str(export_dir),
+                    "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+                }, 422)
+                return
+
             _json_response(self, {
                 "ok": True,
                 "export_path": str(export_dir),
@@ -1793,14 +1863,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Failed to prepare download"}, 500)
                 return
 
-            sessions_content = (export_dir / "sessions.jsonl").read_text()
-            manifest_content = (export_dir / "manifest.json").read_text()
+            if _manifest.get("blocked"):
+                _json_response(self, {
+                    "error": _manifest.get("block_message") or "Share blocked by TruffleHog",
+                    "block_reason": _manifest.get("block_reason"),
+                    "trufflehog_summary": _manifest.get("redaction_summary", {}).get("trufflehog"),
+                }, 422)
+                return
+
+            sessions_content = (export_dir / "sessions.jsonl").read_bytes()
+            manifest_content = (export_dir / "manifest.json").read_bytes()
+            trufflehog_path = export_dir / "trufflehog.json"
+            trufflehog_content = (
+                trufflehog_path.read_bytes() if trufflehog_path.exists() else None
+            )
 
             # Create in-memory zip
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("sessions.jsonl", sessions_content)
                 zf.writestr("manifest.json", manifest_content)
+                if trufflehog_content is not None:
+                    zf.writestr("trufflehog.json", trufflehog_content)
             zip_bytes = buf.getvalue()
 
             # Serve the zip

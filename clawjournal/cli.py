@@ -1484,8 +1484,14 @@ def _run_bundle_export(args) -> None:
             print("Output path must be under home directory or /tmp.")
             sys.exit(1)
 
+        if manifest.get("blocked"):
+            print(f"Share blocked: {manifest.get('block_reason', 'unknown')}")
+            print(manifest.get("block_message", ""))
+            print(f"Report: {export_dir}/trufflehog.json")
+            sys.exit(2)
+
         session_count = len(manifest.get("sessions", []))
-        files = ["sessions.jsonl", "manifest.json"]
+        files = ["sessions.jsonl", "manifest.json", "trufflehog.json"]
 
         # Optional training-format conversion
         training_summary = None

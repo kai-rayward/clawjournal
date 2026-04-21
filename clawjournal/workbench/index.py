@@ -790,7 +790,136 @@ def _redact_blocked_domains_in_value(
     return value, 0, []
 
 
+def _redact_custom_strings_in_value(
+    value: Any,
+    custom_strings: list[str],
+) -> tuple[Any, int]:
+    """Apply custom-string redactions recursively without running engine scans."""
+    from ..redaction.secrets import redact_custom_strings
+
+    if isinstance(value, str):
+        return redact_custom_strings(value, custom_strings)
+    if isinstance(value, dict):
+        total = 0
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            out[key], count = _redact_custom_strings_in_value(item, custom_strings)
+            total += count
+        return out, total
+    if isinstance(value, list):
+        total = 0
+        out_list: list[Any] = []
+        for item in value:
+            redacted, count = _redact_custom_strings_in_value(item, custom_strings)
+            out_list.append(redacted)
+            total += count
+        return out_list, total
+    return value, 0
+
+
+def _load_finding_decisions(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT entity_hash, status FROM findings WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    return {row["entity_hash"]: row["status"] for row in rows}
+
+
+def _redaction_log_entry(
+    *,
+    type_name: str,
+    confidence: float,
+    original_length: int,
+    field: str,
+    message_index: int | None = None,
+    tool_field: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "type": type_name,
+        "confidence": confidence,
+        "original_length": original_length,
+        "field": field,
+    }
+    if message_index is not None:
+        entry["message_index"] = message_index
+    if tool_field is not None:
+        entry["tool_field"] = tool_field
+    return entry
+
+
+def _build_deterministic_redaction_log(
+    conn: sqlite3.Connection,
+    session: dict[str, Any],
+    *,
+    user_allowlist: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a metadata-only log from the findings-backed redaction substrate."""
+    from ..findings import hash_entity
+    from ..redaction.pii import _dedupe_overlapping_pii, scan_text_for_pii
+    from ..redaction.secrets import _dedupe_overlapping_matches, _iter_text_locations, scan_text
+    from ..redaction.trufflehog import scan_session_for_trufflehog_findings
+
+    session_id = str(session.get("session_id") or "")
+    if not session_id:
+        return []
+
+    decisions = _load_finding_decisions(conn, session_id)
+    log: list[dict[str, Any]] = []
+
+    for text, field, msg_idx, tool_field, _wk, _wkey in _iter_text_locations(session):
+        for match in _dedupe_overlapping_matches(
+            scan_text(text, user_allowlist=user_allowlist),
+        ):
+            if decisions.get(hash_entity(match["match"])) == "ignored":
+                continue
+            log.append(_redaction_log_entry(
+                type_name=match["type"],
+                confidence=match["confidence"],
+                original_length=match["end"] - match["start"],
+                field=field,
+                message_index=msg_idx,
+                tool_field=tool_field,
+            ))
+        for match in _dedupe_overlapping_pii(
+            scan_text_for_pii(text, user_allowlist=user_allowlist),
+        ):
+            if decisions.get(hash_entity(match["match"])) == "ignored":
+                continue
+            log.append(_redaction_log_entry(
+                type_name=match["type"],
+                confidence=match["confidence"],
+                original_length=match["end"] - match["start"],
+                field=field,
+                message_index=msg_idx,
+                tool_field=tool_field,
+            ))
+
+    try:
+        for finding in scan_session_for_trufflehog_findings(
+            session,
+            user_allowlist=user_allowlist,
+        ):
+            if decisions.get(hash_entity(finding.entity_text)) == "ignored":
+                continue
+            log.append(_redaction_log_entry(
+                type_name=f"trufflehog_{finding.rule.lower()}",
+                confidence=finding.confidence,
+                original_length=finding.length,
+                field=finding.field,
+                message_index=finding.message_index,
+                tool_field=finding.tool_field,
+            ))
+    except Exception:  # noqa: BLE001 — preview/export should fail soft on engine issues
+        logger.warning("TruffleHog log build failed", exc_info=True)
+
+    return log
+
+
 def apply_share_redactions(
+    conn: sqlite3.Connection,
     session: dict[str, Any],
     *,
     custom_strings: list[str] | None = None,
@@ -800,13 +929,39 @@ def apply_share_redactions(
 ) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
     """Apply the full share/export redaction pipeline to a session."""
     from ..redaction.anonymizer import Anonymizer
-    from ..redaction.secrets import redact_session
+    from ..redaction.secrets import apply_findings_to_blob
 
-    session, total_redactions, redaction_log = redact_session(
-        session,
-        custom_strings=custom_strings,
-        user_allowlist=user_allowlist,
-    )
+    total_redactions = 0
+    redaction_log: list[dict[str, Any]] = []
+
+    if custom_strings:
+        custom_total = 0
+        for field in ("display_title", "project", "git_branch"):
+            if session.get(field):
+                session[field], count = _redact_custom_strings_in_value(
+                    session[field],
+                    custom_strings,
+                )
+                custom_total += count
+
+        for msg in session.get("messages", []):
+            for field in ("content", "thinking"):
+                if msg.get(field):
+                    msg[field], count = _redact_custom_strings_in_value(
+                        msg[field],
+                        custom_strings,
+                    )
+                    custom_total += count
+            for tool_use in msg.get("tool_uses", []):
+                for tool_field in ("input", "output"):
+                    if tool_use.get(tool_field):
+                        tool_use[tool_field], count = _redact_custom_strings_in_value(
+                            tool_use[tool_field],
+                            custom_strings,
+                        )
+                        custom_total += count
+
+        total_redactions += custom_total
 
     domain_patterns = [
         pattern
@@ -869,6 +1024,47 @@ def apply_share_redactions(
                         tool_use[tool_field],
                         anonymizer.text,
                     )
+
+    session_id = str(session.get("session_id") or "")
+    if not session_id:
+        # Silent no-op here would ship an un-redacted blob because all
+        # three deterministic engines route through the findings table,
+        # which is keyed by session_id. Fail loud instead — callers
+        # should never hand us a session stripped of its identifier.
+        raise ValueError(
+            "apply_share_redactions requires session['session_id']; "
+            "got an empty/missing value. The findings-backed engines "
+            "cannot attribute decisions without it."
+        )
+
+    redaction_log.extend(
+        _build_deterministic_redaction_log(
+            conn,
+            session,
+            user_allowlist=user_allowlist,
+        ),
+    )
+    session, deterministic_total = apply_findings_to_blob(
+        session,
+        conn,
+        session_id,
+        user_allowlist=user_allowlist,
+    )
+    total_redactions += deterministic_total
+
+    # TruffleHog acts as another detection+redaction engine in the
+    # pipeline through apply_findings_to_blob, so the share-time redaction
+    # step respects the same ignored/open decision substrate as the other
+    # deterministic engines. The later Package-step gate still re-scans the
+    # merged output independently before export/upload.
+    #
+    # Known tradeoff: ``redaction_log`` is built from a single pre-apply
+    # scan (see ``_build_deterministic_redaction_log``); the apply step
+    # runs up to ``max_passes=3`` passes that can surface secrets
+    # revealed by earlier replacements. In that rare case
+    # ``total_redactions`` may exceed ``len(redaction_log)``. The UI
+    # bucket counts come from the log and will undercount those
+    # multi-pass finds; the Package-step gate is authoritative.
 
     return session, total_redactions, redaction_log
 
@@ -1424,7 +1620,20 @@ def query_sessions(
     sql = base
     for clause in where_clauses:
         sql += f" AND {clause}"
-    sql += f" ORDER BY s.{sort} {order.upper()} LIMIT ? OFFSET ?"
+    # "Best first" should really mean "recent 5-star first, then lower
+    # scores, then unscored at the bottom" — a lone ``ORDER BY
+    # ai_quality_score DESC`` puts NULLs at the TOP in SQLite (NULL >
+    # any value when descending) AND shuffles old 5-star sessions over
+    # new ones arbitrarily. The composite tiebreak fixes both:
+    # non-NULL first, then score DESC, then newest within each score.
+    if sort == "ai_quality_score":
+        sql += (
+            " ORDER BY (s.ai_quality_score IS NULL), "
+            f"s.ai_quality_score {order.upper()}, "
+            "s.start_time DESC LIMIT ? OFFSET ?"
+        )
+    else:
+        sql += f" ORDER BY s.{sort} {order.upper()} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     rows = conn.execute(sql, params).fetchall()
@@ -2702,11 +2911,93 @@ def get_share_ready_stats(
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= recent_cutoff
 
+    # Recommender tiers, in priority order:
+    #
+    #   1. Recent 5-star (<=7 days old) — approved or unreviewed,
+    #      newest first. Dominates the top slots so the user sees
+    #      recently-scored high-quality work, never week-old traces
+    #      just because they're approved.
+    #   2. Recent substantive unscored (<=2 days old, >=2 messages)
+    #      so today's real work can still surface when the scorer
+    #      hasn't caught up yet — but the 5-star tier has already
+    #      claimed the top of the list.
+    #   3. Older approved 5-star as final backfill.
+    #
+    # Sort locally by ``start_time DESC`` — the outer SELECT
+    # tier-sorts approved ahead of new for the list-view use case,
+    # but the recommender wants pure recency within a tier.
+    recent_cutoff_tight = datetime.now(timezone.utc) - timedelta(days=2)
+
+    def _is_very_recent(start_time: str | None) -> bool:
+        if not start_time:
+            return False
+        try:
+            ts = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts >= recent_cutoff_tight
+
+    recent_sessions = sorted(
+        (s for s in sessions if _is_recent(s.get("start_time"))),
+        key=lambda s: s.get("start_time") or "",
+        reverse=True,
+    )
+
+    recommended_pool: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Tier 1: recent 5-star, newest first. No quality-<3 gate needed
+    # here since score==5 is the filter.
+    for session in recent_sessions:
+        if len(recommended_pool) >= 5:
+            break
+        sid = session.get("session_id")
+        if not sid or sid in seen_ids:
+            continue
+        if session.get("ai_quality_score") != 5:
+            continue
+        recommended_pool.append(session)
+        seen_ids.add(sid)
+
+    # Tier 2: very-recent substantive unscored (last 2 days) so
+    # today's work surfaces even before `clawjournal score` runs.
+    # Explicitly-low-quality (1-2 stars) excluded.
+    if len(recommended_pool) < 5:
+        for session in recent_sessions:
+            if len(recommended_pool) >= 5:
+                break
+            sid = session.get("session_id")
+            if not sid or sid in seen_ids:
+                continue
+            if not _is_very_recent(session.get("start_time")):
+                continue
+            score = session.get("ai_quality_score")
+            if score is not None and score <= 2:
+                continue
+            user_msgs = session.get("user_messages") or 0
+            assistant_msgs = session.get("assistant_messages") or 0
+            if user_msgs < 2 and assistant_msgs < 2:
+                continue
+            recommended_pool.append(session)
+            seen_ids.add(sid)
+
     five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
-    five_star_recent = [s for s in five_star if _is_recent(s.get("start_time"))]
     five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
-    # Recent first, then older 5-star to top up; never pad below 5 stars.
-    recommended_pool = five_star_recent + five_star_older
+
+    # Tier 3: older approved 5-star backfill — only if we still
+    # haven't reached 5 after tiers 1 and 2.
+    if len(recommended_pool) < 5:
+        for session in five_star_older:
+            if len(recommended_pool) >= 5:
+                break
+            sid = session.get("session_id")
+            if not sid or sid in seen_ids:
+                continue
+            recommended_pool.append(session)
+            seen_ids.add(sid)
+
     recommended_ids = [s["session_id"] for s in recommended_pool[:5]]
 
     return {
@@ -2828,6 +3119,7 @@ def export_share_to_disk(
                 detail = get_session_detail(conn, s["session_id"])
                 if detail:
                     detail, n_redacted, redaction_log = apply_share_redactions(
+                        conn,
                         detail,
                         custom_strings=custom_strings,
                         user_allowlist=allowlist_entries,
@@ -2867,6 +3159,30 @@ def export_share_to_disk(
         "total_redactions": total_redactions,
         "by_type": redaction_types,
     }
+
+    # Mandatory post-redaction scan — independent oracle against our
+    # own redactor. Any finding (or missing binary) blocks the share.
+    from ..redaction import trufflehog as trufflehog_scanner
+
+    trufflehog_report = trufflehog_scanner.scan_file(sessions_file)
+    trufflehog_scanner.write_report(export_dir / "trufflehog.json", trufflehog_report)
+    manifest["redaction_summary"]["trufflehog"] = trufflehog_report.summary()
+
+    if trufflehog_report.blocking:
+        manifest["blocked"] = True
+        manifest["block_reason"] = trufflehog_report.block_reason
+        manifest["block_message"] = trufflehog_scanner.format_block_message(trufflehog_report)
+        with open(export_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        # Record the block on the share row so the UI can surface it,
+        # but do NOT advance status to shared/exported — that would
+        # silently imply the share is clean.
+        conn.execute(
+            "UPDATE shares SET manifest = ? WHERE share_id = ?",
+            (json.dumps(manifest, default=str), share_id),
+        )
+        conn.commit()
+        return export_dir, manifest
 
     with open(export_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, default=str)

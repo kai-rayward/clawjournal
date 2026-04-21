@@ -59,7 +59,7 @@ def get_enabled_engines(config: dict[str, Any] | None = None) -> tuple[str, ...]
     automatically triggers a rescan. Both `regex_pii` and `regex_secrets`
     are wired through the findings pipeline + share-time apply path.
     """
-    default = ("regex_pii", "regex_secrets")
+    default = ("regex_pii", "regex_secrets", "trufflehog")
     if not config:
         return default
     engines = config.get("enabled_findings_engines")
@@ -199,14 +199,27 @@ def compute_findings_revision(
     git_branch, then per-message role/content/thinking, then per-tool
     tool/input/output. Any change flips the revision and forces rebuild.
     """
+    enabled = get_enabled_engines(config)
     parts: list[str] = [
         f"engine_version={ENGINE_VERSION}",
-        f"enabled_engines={','.join(get_enabled_engines(config))}",
+        f"enabled_engines={','.join(enabled)}",
         f"allowlist_entries={_canonical_json((config or {}).get('allowlist_entries', []))}",
         f"display_title={session.get('display_title') or ''}",
         f"project={session.get('project') or ''}",
         f"git_branch={session.get('git_branch') or ''}",
     ]
+    # Fold the TruffleHog binary fingerprint into the revision so
+    # installing the binary (or upgrading it) automatically
+    # invalidates every session's cached findings — a session scanned
+    # when trufflehog was missing or at version X must re-scan once
+    # the presence/version flips.
+    if "trufflehog" in enabled:
+        try:
+            from .redaction.trufflehog import engine_fingerprint  # noqa: PLC0415 — lazy
+
+            parts.append(f"trufflehog_fp={engine_fingerprint()}")
+        except Exception:  # noqa: BLE001 — revision computation must never raise
+            parts.append("trufflehog_fp=error")
 
     messages = session.get("messages") or []
     if isinstance(messages, list):

@@ -111,6 +111,7 @@ function bucketOf(type: string): RedactionBucket {
   if (t.includes('url')) return 'urls';
   if (t.includes('path') || t.includes('username') || t.includes('home')) return 'paths';
   if (t.includes('time') || t.includes('date')) return 'timestamps';
+  if (t.startsWith('trufflehog')) return 'tokens';
   if (t.includes('token') || t.includes('key') || t.includes('secret') || t.includes('jwt') || t.includes('cred') || t.includes('auth')) return 'tokens';
   return 'other';
 }
@@ -190,6 +191,7 @@ interface RedactedSessionData {
   aiPiiFindings?: AiPiiFindingLocal[];
   aiCoverage?: 'full' | 'rules_only';
   buckets?: BucketCounts;
+  trufflehogHits?: number;
 }
 
 const CONFIDENCE_THRESHOLD = 0.85;
@@ -553,7 +555,7 @@ export function Share() {
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
-        api.sessions.list({ status: 'new', sort: 'ai_quality_score', order: 'desc', limit: 10 })
+        api.sessions.list({ status: 'new', sort: 'start_time', order: 'desc', limit: 10 })
           .then(setCandidates)
           .catch(() => setCandidates([]));
       }
@@ -607,7 +609,7 @@ export function Share() {
     api.shareReady({ includeUnapproved: true }).then((stats) => {
       setReadyStats(stats);
       if (stats.sessions.length === 0) {
-        api.sessions.list({ status: 'new', sort: 'ai_quality_score', order: 'desc', limit: 10 })
+        api.sessions.list({ status: 'new', sort: 'start_time', order: 'desc', limit: 10 })
           .then(setCandidates)
           .catch(() => { });
       } else {
@@ -736,6 +738,9 @@ export function Share() {
         for (const entry of report.redaction_log || []) {
           buckets[bucketOf(entry.type)] += 1;
         }
+        const trufflehogHits = (report.redaction_log || [])
+          .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
+          .length;
         setRedactedSessions((prev) => ({
           ...prev,
           [s.session_id]: {
@@ -744,6 +749,7 @@ export function Share() {
             aiPiiFindings: report.ai_pii_findings || [],
             aiCoverage: report.ai_coverage || 'rules_only',
             buckets,
+            trufflehogHits,
           },
         }));
       } catch {
@@ -860,6 +866,9 @@ export function Share() {
     }));
     const buckets = emptyBuckets();
     for (const entry of report.redaction_log || []) buckets[bucketOf(entry.type)] += 1;
+    const trufflehogHits = (report.redaction_log || [])
+      .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
+      .length;
     setRedactedSessions((prev) => ({
       ...prev,
       [id]: {
@@ -868,6 +877,7 @@ export function Share() {
         aiPiiFindings: report.ai_pii_findings || [],
         aiCoverage: report.ai_coverage || 'rules_only',
         buckets,
+        trufflehogHits,
       },
     }));
   };
@@ -1419,9 +1429,17 @@ function QueueStep(p: QueueStepProps) {
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span>{s.tool_uses} tools</span>
                       </>)}
-                      {s.ai_quality_score != null && (<>
+                      {s.ai_quality_score != null ? (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span style={{ color: '#c08a1a', letterSpacing: -1 }}>{scoreBadge(s.ai_quality_score)}</span>
+                      </>) : (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span
+                          style={{ color: colors.gray500, fontStyle: 'italic' }}
+                          title="This session hasn't been scored yet. Click Preview → Score with AI, or run `clawjournal score` from a terminal."
+                        >
+                          unscored
+                        </span>
                       </>)}
                       {s.outcome_badge && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
@@ -1679,8 +1697,9 @@ function RedactStep(p: RedactStepProps) {
     acc.urls += d.buckets.urls;
     acc.other += d.buckets.other;
     if (classify(d) === 'review') acc.flagged += 1;
+    acc.thHits += d.trufflehogHits || 0;
     return acc;
-  }, { ...emptyBuckets(), flagged: 0 });
+  }, { ...emptyBuckets(), flagged: 0, thHits: 0 });
 
   const doneCount = p.queuedSessions.filter((s) => {
     const d = p.redactedSessions[s.session_id];
@@ -1750,7 +1769,10 @@ function RedactStep(p: RedactStepProps) {
         padding: '16px 18px', marginBottom: 20,
         background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8,
       }}>
-        {categoryRow('Secrets & credentials', totals.tokens, Math.max(totals.tokens, 4))}
+        {categoryRow(
+          `Secrets & credentials${totals.thHits > 0 ? ` (incl. ${totals.thHits} via TruffleHog)` : ''}`,
+          totals.tokens, Math.max(totals.tokens, 4),
+        )}
         {categoryRow('Email addresses', totals.emails, Math.max(totals.emails, 4))}
         {categoryRow('File paths & usernames', totals.paths, Math.max(totals.paths, 8))}
         {categoryRow('Timestamps coarsened', totals.timestamps, Math.max(totals.timestamps, 20))}

@@ -44,6 +44,10 @@ from ..redaction.secrets import (
     SECRETS_ENGINE_ID,
     scan_session_for_findings,
 )
+from ..redaction.trufflehog import (
+    TRUFFLEHOG_ENGINE_ID,
+    scan_session_for_trufflehog_findings,
+)
 from .index import read_blob
 
 logger = logging.getLogger(__name__)
@@ -119,6 +123,13 @@ def run_findings_pipeline(
         raw.extend(scan_session_for_findings(session_blob, user_allowlist=user_allowlist))
     if PII_ENGINE_ID in enabled:
         raw.extend(scan_session_for_pii_findings(session_blob, user_allowlist=user_allowlist))
+    if TRUFFLEHOG_ENGINE_ID in enabled:
+        try:
+            raw.extend(scan_session_for_trufflehog_findings(session_blob, user_allowlist=user_allowlist))
+        except Exception:
+            # Fail-soft: a flaky subprocess shouldn't abort the whole
+            # findings rebuild — regex + PII layers still ran.
+            logger.warning("TruffleHog engine errored during scan", exc_info=True)
 
     conn.execute("BEGIN IMMEDIATE")
     try:

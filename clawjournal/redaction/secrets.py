@@ -3,8 +3,8 @@
 Two surfaces coexist:
 
 1. **Legacy mutate-in-place API** (`scan_text`, `redact_session`, etc.).
-   Still used by the parse path and by `apply_share_redactions` during
-   the transition. Works on session dicts directly, returns the
+   Still used by the parse path and by older direct-redaction helpers.
+   Works on session dicts directly, returns the
    redacted copy plus a metadata-only log.
 
 2. **DB-backed findings API** (`scan_session_for_findings`,
@@ -823,6 +823,14 @@ def apply_findings_to_blob(
 
     # Lazy import to avoid pii.py → secrets.py import cycle.
     from .pii import pii_secret_map_from_text_decisions
+    from .trufflehog import trufflehog_secret_map_from_blob
+
+    # TruffleHog is a subprocess-backed engine — run it once on the
+    # original blob rather than inside the per-pass loop. The raws it
+    # finds don't change after the first replacement, so re-scanning
+    # on every pass would pay N× the subprocess cost for zero new
+    # information.
+    trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
 
     total = 0
     for pass_num in range(max_passes):
@@ -835,6 +843,13 @@ def apply_findings_to_blob(
             secret_map.update(
                 pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
             )
+        secret_map.update(trufflehog_map)
+        # Note on loop termination: once trufflehog_map is non-empty the
+        # `not secret_map` guard never fires, so the pass loop now
+        # relies on the `pass_count == 0 and pass_num > 0` guard below
+        # to exit. That guard still works because the second pass's
+        # `_apply_redaction_set` finds nothing to replace (the raws are
+        # already gone from the blob) and returns 0.
         if not secret_map:
             break
 

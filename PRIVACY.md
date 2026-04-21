@@ -52,12 +52,39 @@ That second layer can catch identifying text such as:
 
 Review is still your responsibility before publishing anything.
 
+## Mandatory post-redaction scan (TruffleHog)
+
+Every share export runs an independent secrets scanner — [TruffleHog](https://github.com/trufflesecurity/trufflehog) — on the already-redacted `sessions.jsonl` before the export is considered complete. TruffleHog is a separate project with its own ~800 credential detectors and optional live-verification step. It acts as a backstop: if our layered redaction misses something, TruffleHog's independent detectors should catch it.
+
+The scan is mandatory. Outcomes:
+
+- **clean** — export proceeds, summary embedded in `manifest.json` under `redaction_summary.trufflehog`, full report written to `trufflehog.json`.
+- **any finding** (verified, unverified, or unknown) — export is blocked. The share's status is **not** advanced; the directory is preserved with `manifest.blocked=true` and masked examples so you can debug.
+- **binary not installed** — export is blocked with an install hint.
+
+Install:
+
+```bash
+# macOS
+brew install trufflehog
+
+# Linux / Windows
+# https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
+```
+
+For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
+
+One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
+
+An escape hatch exists for CI and development: setting `CLAWJOURNAL_SKIP_TRUFFLEHOG=1` disables the gate. This is recorded in the manifest (`redaction_summary.trufflehog.bypassed=true`) so reviewers can tell scanned shares from bypassed ones. Do not use it for real shares.
+
 ## What a local bundle contains
 
 `clawjournal bundle-export <bundle_id>` writes:
 
 - `sessions.jsonl`
 - `manifest.json`
+- `trufflehog.json` (scan report)
 
 Depending on how you export, bundle content can include user messages, assistant messages, tool calls, model metadata, token counts, and timestamps. Extended thinking can be excluded from regular exports with `--no-thinking`.
 

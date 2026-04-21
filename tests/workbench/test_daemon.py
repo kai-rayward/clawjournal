@@ -493,6 +493,28 @@ def _share_config(**overrides):
     return config
 
 
+def _mock_trufflehog_clean(monkeypatch):
+    """Share-upload tests need to simulate a real, clean TruffleHog scan.
+
+    The suite-wide autouse fixture bypasses TruffleHog for every test,
+    and the upload path now (correctly) refuses bypassed shares. Unset
+    the bypass and install a mock scan that reports zero findings.
+    """
+    from clawjournal.redaction import trufflehog
+
+    monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+    monkeypatch.setattr(
+        trufflehog,
+        "scan_file",
+        lambda path: trufflehog.TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256="sha256:0",
+        ),
+    )
+    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+
+
 class TestVerifyEmailAPI:
     def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
         from clawjournal.workbench.daemon import confirm_email_verification
@@ -526,6 +548,13 @@ class TestVerifyEmailAPI:
 class TestShareAPI:
     """Tests for the share-to-GCS HTTP upload flow."""
 
+    @pytest.fixture(autouse=True)
+    def _trufflehog_clean_for_uploads(self, monkeypatch):
+        """The upload path refuses bypassed TruffleHog scans by design.
+        All share-API tests want the clean-upload scenario, so install
+        a no-op mock here rather than repeating it in every test."""
+        _mock_trufflehog_clean(monkeypatch)
+
     def _create_and_export_share(self, port):
         """Helper: create a share and export it, return share_id.
 
@@ -553,6 +582,40 @@ class TestShareAPI:
         assert status == 200
         assert data["ok"] is True
         return share_id
+
+    def test_upload_refuses_when_trufflehog_bypassed(self, server, monkeypatch):
+        """CLAWJOURNAL_SKIP_TRUFFLEHOG is a dev/CI escape hatch for
+        local bundle-export. Uploading an unscanned share to a remote
+        endpoint must fail closed — otherwise the escape hatch is a
+        one-flag ``--ship-secrets-anyway``."""
+        from clawjournal.redaction import trufflehog
+
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        # Unwind the class-level clean mock: simulate an actual bypass.
+        monkeypatch.setenv(trufflehog.SKIP_ENV_VAR, "1")
+        # Ensure scan_file observes the bypass by exercising the real
+        # path (short-circuits to bypassed=True) rather than the clean
+        # stub from the autouse fixture.
+        from pathlib import Path as _Path
+
+        def _real_bypass_scan(path):
+            return trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+                bypassed=True,
+            )
+
+        monkeypatch.setattr(trufflehog, "scan_file", _real_bypass_scan)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 422, data
+        assert data.get("block_reason") == "trufflehog-bypassed"
+        assert "CLAWJOURNAL_SKIP_TRUFFLEHOG" in data.get("error", "")
 
     def test_share_success(self, server, monkeypatch):
         """Full success path: create, export, share via HTTP."""
@@ -796,6 +859,28 @@ class TestShareAPI:
         ).fetchone()
         conn.close()
         assert row["status"] == "shared"
+
+    def test_download_bundle_includes_trufflehog_report(self, server):
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0"],
+            "note": "Download report test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            names = set(archive.namelist())
+            assert "sessions.jsonl" in names
+            assert "manifest.json" in names
+            assert "trufflehog.json" in names
+            report = json.loads(archive.read("trufflehog.json").decode("utf-8"))
+
+        assert report["summary"]["findings"] == 0
+        assert report["summary"]["bypassed"] is False
 
     def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
         monkeypatch.setattr(
