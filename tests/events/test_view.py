@@ -274,6 +274,9 @@ def test_write_hook_override_raises_on_unknown_session(conn):
         (dict(confidence="medium-high"), "confidence"),
         (dict(lossiness="weird"), "lossiness"),
         (dict(event_key=""), "event_key"),
+        (dict(payload_json="not json at all"), "payload_json"),
+        (dict(payload_json=""), "payload_json"),
+        (dict(payload_json=None), "payload_json must be a JSON string"),
     ],
 )
 def test_write_hook_override_validation(conn, kwargs, match):
@@ -699,6 +702,16 @@ def test_fetch_vendor_line_enforces_safety_cap(tmp_path, monkeypatch):
     path = tmp_path / "huge.jsonl"
     # 32 bytes with no newline — well past the 8-byte cap.
     path.write_bytes(b"x" * 32)
+    assert fetch_vendor_line(path, 0) is None
+
+
+def test_fetch_vendor_line_rejects_newline_beyond_safety_cap(tmp_path, monkeypatch):
+    from clawjournal.events import view as view_module
+
+    monkeypatch.setattr(view_module, "_MAX_LINE_BYTES", 8)
+    monkeypatch.setattr(view_module, "_FETCH_CHUNK", 32)
+    path = tmp_path / "beyond-cap.jsonl"
+    path.write_bytes(b"123456789\n")
     assert fetch_vendor_line(path, 0) is None
 
 

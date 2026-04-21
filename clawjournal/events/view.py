@@ -23,6 +23,7 @@ Exposes:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -153,6 +154,12 @@ def write_hook_override(
         raise ValueError(f"Unsupported lossiness: {lossiness}")
     if not event_key:
         raise ValueError("event_key is required for overrides")
+    if not isinstance(payload_json, str):
+        raise ValueError("payload_json must be a JSON string")
+    try:
+        json.loads(payload_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("payload_json must be valid JSON") from exc
 
     session_id = _resolve_session_id(conn, session_key)
     if session_id is None:
@@ -398,8 +405,10 @@ def fetch_vendor_line(source_path: str | Path, source_offset: int) -> str | None
     - no terminating newline exists between source_offset and EOF
       (partial trailing line — matches 01's "skip incomplete lines"
       semantics);
-    - the line would exceed `_MAX_LINE_BYTES` (defends against a
-      corrupted or adversarial file where no newline ever appears).
+    - the line would exceed `_MAX_LINE_BYTES`, whether because no
+      newline appears within the cap or because the terminating
+      newline sits past it (defends against a very long or adversarial
+      line).
 
     Does NOT detect rotation / replacement — the file at source_path may
     have been swapped since the event was ingested. Phase 1 accepts this
@@ -416,15 +425,18 @@ def fetch_vendor_line(source_path: str | Path, source_offset: int) -> str | None
                     return None  # partial line — EOF with no newline
                 newline_pos = block.find(b"\n")
                 if newline_pos >= 0:
-                    chunks.append(block)
                     absolute_newline = total + newline_pos
+                    if absolute_newline > _MAX_LINE_BYTES:
+                        return None  # newline exists, but only after the safety cap
+                    chunks.append(block)
                     complete = b"".join(chunks)[:absolute_newline]
                     if complete.endswith(b"\r"):
                         complete = complete[:-1]
                     return complete.decode("utf-8", errors="replace")
-                total += len(block)
-                if total > _MAX_LINE_BYTES:
+                next_total = total + len(block)
+                if next_total > _MAX_LINE_BYTES:
                     return None  # pathological: no newline within safety cap
+                total = next_total
                 chunks.append(block)
     except (FileNotFoundError, IsADirectoryError):
         return None
