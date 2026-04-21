@@ -36,6 +36,16 @@ VALID_SOURCES = {
 VALID_CONFIDENCE = {"high", "medium", "low", "missing"}
 VALID_LOSSINESS = {"none", "partial", "unknown", "compacted"}
 
+# `missing` is a read-time presentation state (produced by capability_join)
+# and never persisted. Included here with rank 0 so comparisons against
+# hypothetical missing inputs stay well-defined; writers reject it upstream.
+CONFIDENCE_RANK: dict[str, int] = {
+    "high": 3,
+    "medium": 2,
+    "low": 1,
+    "missing": 0,
+}
+
 
 class ClassifiedEvent(NamedTuple):
     type: str
