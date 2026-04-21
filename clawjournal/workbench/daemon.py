@@ -715,6 +715,21 @@ def upload_share(
             "trufflehog_summary": post_pii_report.summary(),
             "status": 422,
         }
+    # Bypass is allowed locally (bundle-export with CLAWJOURNAL_SKIP_
+    # TRUFFLEHOG=1 still writes files), but uploading an unscanned
+    # share to a remote endpoint should fail closed — the gate exists
+    # specifically to catch surviving secrets before they leave the
+    # machine.
+    if post_pii_report.bypassed:
+        return {
+            "error": (
+                "Refusing to upload: TruffleHog was bypassed via "
+                "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and "
+                "retry, or use bundle-export for local-only output."
+            ),
+            "block_reason": "trufflehog-bypassed",
+            "status": 422,
+        }
 
     if manifest and isinstance(manifest.get("redaction_summary"), dict):
         with open(manifest_file, "w") as f:

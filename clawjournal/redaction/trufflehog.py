@@ -31,6 +31,23 @@ TRUFFLEHOG_ENGINE_ID = "trufflehog"
 
 SKIP_ENV_VAR = "CLAWJOURNAL_SKIP_TRUFFLEHOG"
 
+_MAX_SCAN_BYTES = 200 * 1024 * 1024  # 200 MB — cap on engine-path payload
+
+
+def _scrubbed_subprocess_env() -> dict[str, str]:
+    """Minimal env for TruffleHog subprocess invocations.
+
+    The parent process may hold API keys and cloud credentials
+    (ANTHROPIC_API_KEY, OPENAI_API_KEY, GCS service-account JSON, …).
+    A malicious ``trufflehog`` binary on PATH would inherit all of
+    them by default. Restrict to what the binary genuinely needs:
+    ``PATH`` to exec helpers, ``HOME`` to find its config/cache dir,
+    ``TMPDIR`` for its own workspace, and the locale env so it
+    decodes stdin as UTF-8.
+    """
+    keep = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
+    return {k: os.environ[k] for k in keep if k in os.environ}
+
 # Detectors we ask TruffleHog to skip. The gate's "any finding blocks"
 # contract is deliberately strict, so this list exists only for detectors
 # that collide with structural content in agent session files.
@@ -118,6 +135,49 @@ class TruffleHogReport:
 
 def is_available() -> bool:
     return shutil.which("trufflehog") is not None
+
+
+_version_cache: str | None = None
+
+
+def engine_fingerprint() -> str:
+    """Return a short fingerprint folded into ``findings_revision``.
+
+    Captures presence + version so cached revisions invalidate when
+    the user installs or upgrades TruffleHog. Missing binary reports
+    ``"missing"``; timeouts / errors report ``"unknown"``. Result is
+    memoized for the process lifetime — the scanner can call this
+    once per session without re-forking the binary.
+    """
+    global _version_cache
+    if _version_cache is not None:
+        return _version_cache
+    if not is_available():
+        _version_cache = "missing"
+        return _version_cache
+    try:
+        result = subprocess.run(
+            ["trufflehog", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            stdin=subprocess.DEVNULL,
+            env=_scrubbed_subprocess_env(),
+        )
+        # TruffleHog writes the version to stderr in some releases,
+        # stdout in others — accept either.
+        out = (result.stdout or result.stderr or "").strip().splitlines()
+        _version_cache = out[0] if out else "unknown"
+    except (subprocess.TimeoutExpired, OSError):
+        _version_cache = "unknown"
+    return _version_cache
+
+
+def reset_version_cache() -> None:
+    """Clear the cached version fingerprint — for tests only."""
+    global _version_cache
+    _version_cache = None
 
 
 def is_bypassed() -> bool:
@@ -227,7 +287,8 @@ def scan_file(path: Path) -> TruffleHogReport:
 
     # Hard-limit the subprocess so a hung scan can't wedge the share
     # export. DEVNULL on stdin prevents any interactive prompt from
-    # deadlocking a non-interactive runner.
+    # deadlocking a non-interactive runner. Scrubbed env keeps the
+    # parent process's API keys out of the child.
     result = subprocess.run(
         args,
         capture_output=True,
@@ -235,6 +296,7 @@ def scan_file(path: Path) -> TruffleHogReport:
         check=False,
         timeout=60,
         stdin=subprocess.DEVNULL,
+        env=_scrubbed_subprocess_env(),
     )
     # TruffleHog exits 0 on clean and 183 on findings in some versions;
     # accept either as a successful scan.
@@ -312,7 +374,10 @@ def scan_text(text: str) -> TruffleHogReport:
 
 def write_report(path: Path, report: TruffleHogReport) -> None:
     payload = {
-        "scanned_path": report.scanned_path,
+        # Record only the basename so tempfile paths (e.g., /var/folders/...
+        # on macOS) don't leak the user's tmpdir structure into the
+        # manifest bundle.
+        "scanned_path": Path(report.scanned_path).name,
         "scanned_sha256": report.scanned_sha256,
         "bypassed": report.bypassed,
         "binary_missing": report.binary_missing,
@@ -347,83 +412,80 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
     if is_bypassed() or not is_available() or not text.strip():
         return []
 
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
-    ) as tf:
-        tf.write(text)
-        tmp_path = tf.name
     try:
-        args = [
-            "trufflehog",
-            "filesystem",
-            tmp_path,
-            "-j",
-            "--results=verified,unknown,unverified",
-            "--no-color",
-            "--no-update",
-        ]
-        if EXCLUDED_DETECTORS:
-            args.append(f"--exclude-detectors={','.join(EXCLUDED_DETECTORS)}")
-        # Hard-limit the subprocess: a hung TruffleHog must not block
-        # the findings pipeline indefinitely, and DEVNULL on stdin
-        # prevents any interactive prompt from deadlocking the scan.
-        try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-                stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired:
-            return []
-        if result.returncode not in (0, 183):
-            # Engine path intentionally fails soft — a broken scan
-            # shouldn't block the whole findings rebuild.
-            return []
+        encoded = text.encode("utf-8", errors="replace")
+    except (UnicodeError, AttributeError):
+        return []
+    if len(encoded) > _MAX_SCAN_BYTES:
+        return []
 
-        out: list[dict] = []
-        seen: set[tuple] = set()
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            detector = parsed.get("DetectorName")
-            raw = parsed.get("Raw")
-            if not isinstance(detector, str) or not isinstance(raw, str) or not raw:
-                continue
-            if parsed.get("Verified") is True:
-                status = "verified"
-            else:
-                extra = parsed.get("ExtraData") if isinstance(parsed.get("ExtraData"), dict) else None
-                has_err = False
-                if extra:
-                    for key in ("verification_error", "verificationError", "error"):
-                        v = extra.get(key)
-                        if isinstance(v, str) and v.strip():
-                            has_err = True
-                            break
-                status = "unknown" if has_err else "unverified"
-            key = (detector, raw)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"raw": raw, "detector": detector, "status": status})
-        return out
-    finally:
+    args = [
+        "trufflehog",
+        "stdin",
+        "-j",
+        "--results=verified,unknown,unverified",
+        "--no-color",
+        "--no-update",
+    ]
+    if EXCLUDED_DETECTORS:
+        args.append(f"--exclude-detectors={','.join(EXCLUDED_DETECTORS)}")
+
+    # Stream the payload via stdin — no tempfile on disk means a
+    # SIGKILL between scan and cleanup cannot leave plaintext secrets
+    # behind. Scrubbed env prevents a malicious binary on PATH from
+    # seeing the parent process's API keys / credentials. Hard
+    # timeout so a hung scan can't block the findings pipeline.
+    try:
+        result = subprocess.run(
+            args,
+            input=encoded,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=_scrubbed_subprocess_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode not in (0, 183):
+        # Engine path intentionally fails soft — a broken scan
+        # shouldn't block the whole findings rebuild.
+        return []
+
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            Path(tmp_path).unlink()
-        except FileNotFoundError:
-            pass
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        detector = parsed.get("DetectorName")
+        raw = parsed.get("Raw")
+        if not isinstance(detector, str) or not isinstance(raw, str) or not raw:
+            continue
+        if parsed.get("Verified") is True:
+            status = "verified"
+        else:
+            extra = parsed.get("ExtraData") if isinstance(parsed.get("ExtraData"), dict) else None
+            has_err = False
+            if extra:
+                for key in ("verification_error", "verificationError", "error"):
+                    v = extra.get(key)
+                    if isinstance(v, str) and v.strip():
+                        has_err = True
+                        break
+            status = "unknown" if has_err else "unverified"
+        key = (detector, raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"raw": raw, "detector": detector, "status": status})
+    return out
 
 
 def placeholder_for_detector(detector: str) -> str:

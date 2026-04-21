@@ -554,6 +554,106 @@ class TestFieldNameConsistency:
         assert any(f and f.startswith("tool_uses[0].input") for f in fields), fields
 
 
+class TestSubprocessHardening:
+    """Locks the security-critical invocation details: env scrub,
+    stdin streaming, oversized-payload short-circuit."""
+
+    def test_scrubbed_env_excludes_secrets(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-mustnotleak")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-mustnotleak")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("HOME", "/home/u")
+        env = trufflehog._scrubbed_subprocess_env()
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert env.get("PATH") == "/usr/bin:/bin"
+        assert env.get("HOME") == "/home/u"
+
+    def test_payload_streams_via_stdin_not_tempfile(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+
+        captured: dict = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["input"] = kwargs.get("input")
+            captured["env"] = kwargs.get("env")
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        trufflehog._scan_text_for_raw_matches("hello world payload")
+        assert captured["args"][0] == "trufflehog"
+        # stdin mode, not filesystem — no on-disk payload.
+        assert "stdin" in captured["args"]
+        assert "filesystem" not in captured["args"]
+        assert captured["input"] == b"hello world payload"
+        # Env must be the scrubbed one, not None (None → inherit parent).
+        assert isinstance(captured["env"], dict)
+
+    def test_oversized_payload_returns_empty(self, monkeypatch):
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        calls = {"n": 0}
+
+        def fake_run(*a, **k):
+            calls["n"] += 1
+            return subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Just over the 200 MB cap.
+        huge = "x" * (trufflehog._MAX_SCAN_BYTES + 1)
+        assert trufflehog._scan_text_for_raw_matches(huge) == []
+        # Short-circuit must fire before any subprocess is spawned.
+        assert calls["n"] == 0
+
+    def test_timeout_returns_empty(self, monkeypatch):
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+
+        def fake_run(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert trufflehog._scan_text_for_raw_matches("some text with a token") == []
+
+
+class TestEngineFingerprint:
+    """engine_fingerprint feeds into findings_revision so cached
+    scans invalidate when the user installs or upgrades trufflehog."""
+
+    def test_missing_binary_reports_missing(self, monkeypatch):
+        trufflehog.reset_version_cache()
+        monkeypatch.setattr(trufflehog, "is_available", lambda: False)
+        assert trufflehog.engine_fingerprint() == "missing"
+
+    def test_version_captured_when_available(self, monkeypatch):
+        trufflehog.reset_version_cache()
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout="trufflehog 3.94.3\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        fp = trufflehog.engine_fingerprint()
+        assert "3.94.3" in fp
+
+    def test_memoized_across_calls(self, monkeypatch):
+        trufflehog.reset_version_cache()
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        calls = {"n": 0}
+
+        def fake_run(args, **kwargs):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(args, 0, stdout="trufflehog 3.94.3\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        trufflehog.engine_fingerprint()
+        trufflehog.engine_fingerprint()
+        trufflehog.engine_fingerprint()
+        assert calls["n"] == 1
+
+
 class TestFormatBlockMessage:
     def test_missing_binary_includes_install_hint(self):
         report = trufflehog.TruffleHogReport(

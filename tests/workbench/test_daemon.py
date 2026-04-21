@@ -493,6 +493,28 @@ def _share_config(**overrides):
     return config
 
 
+def _mock_trufflehog_clean(monkeypatch):
+    """Share-upload tests need to simulate a real, clean TruffleHog scan.
+
+    The suite-wide autouse fixture bypasses TruffleHog for every test,
+    and the upload path now (correctly) refuses bypassed shares. Unset
+    the bypass and install a mock scan that reports zero findings.
+    """
+    from clawjournal.redaction import trufflehog
+
+    monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+    monkeypatch.setattr(
+        trufflehog,
+        "scan_file",
+        lambda path: trufflehog.TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256="sha256:0",
+        ),
+    )
+    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+
+
 class TestVerifyEmailAPI:
     def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
         from clawjournal.workbench.daemon import confirm_email_verification
@@ -525,6 +547,13 @@ class TestVerifyEmailAPI:
 
 class TestShareAPI:
     """Tests for the share-to-GCS HTTP upload flow."""
+
+    @pytest.fixture(autouse=True)
+    def _trufflehog_clean_for_uploads(self, monkeypatch):
+        """The upload path refuses bypassed TruffleHog scans by design.
+        All share-API tests want the clean-upload scenario, so install
+        a no-op mock here rather than repeating it in every test."""
+        _mock_trufflehog_clean(monkeypatch)
 
     def _create_and_export_share(self, port):
         """Helper: create a share and export it, return share_id.
