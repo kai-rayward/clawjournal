@@ -48,14 +48,25 @@ def collect_advisor_stats(
     # have no real model/cost and would trivially win Most Efficient
     # (cost/session = 0) and can sneak into Highest Quality too. The
     # export path already filters them at `cli.py:479`; mirror that here.
+    # Same-model traffic at different reasoning-effort tiers (e.g.
+    # `gpt-5.4 @ high` vs `gpt-5.4 @ xhigh`) is split into separate rows
+    # so "Most efficient" and "Highest quality" picks a specific tier.
+    # Numerator matches the normalized `resolved` bucket in
+    # workbench.index (AI `resolved` or heuristic `tests_passed`).
+    # Dropping heuristic `completed` from the success set — it's the
+    # "no signal either way" fallback and overstated quality.
     rows = conn.execute(
-        "SELECT model, COUNT(*) as sessions, "
+        "SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        "       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        "COUNT(*) as sessions, "
         "SUM(estimated_cost_usd) as cost, "
         "AVG(ai_quality_score) as avg_score, "
-        "SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
+        "SUM(CASE WHEN ai_outcome_badge = 'resolved' "
+        "          OR (ai_outcome_badge IS NULL AND outcome_badge = 'tests_passed') "
+        "         THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
         "AND model IS NOT NULL AND model != '<synthetic>' "
-        "GROUP BY model ORDER BY cost DESC",
+        "GROUP BY 1 ORDER BY cost DESC",
         (start_str, end_str),
     ).fetchall()
     result["by_model"] = [
@@ -146,9 +157,13 @@ def collect_advisor_stats(
     ).fetchone()
     result["short_sessions_with_high_score"] = row["count"] or 0
 
-    # Model downgrade candidates: expensive models used for simple tasks
+    # Model downgrade candidates: expensive models used for simple tasks.
+    # Label includes effort so the rec text can say e.g. "gpt-5.4 @ xhigh".
     rows = conn.execute(
-        "SELECT session_id, model, COALESCE(ai_task_type, task_type) as task_type, "
+        "SELECT session_id, "
+        "CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        "     THEN model || ' @ ' || model_effort ELSE model END as model, "
+        "COALESCE(ai_task_type, task_type) as task_type, "
         "ai_quality_score as score, estimated_cost_usd as cost "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
         "AND estimated_cost_usd > 1.0 "
@@ -170,13 +185,15 @@ def collect_advisor_stats(
         for r in rows
     ]
 
-    # Interrupt patterns by model
+    # Interrupt patterns by model@effort
     int_rows = conn.execute(
-        "SELECT model, AVG(CAST(user_interrupts AS REAL)) as avg_interrupts, "
+        "SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        "       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        "AVG(CAST(user_interrupts AS REAL)) as avg_interrupts, "
         "COUNT(*) as sessions, SUM(tool_uses) as total_tool_uses "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ? "
         "AND user_interrupts > 0 AND model IS NOT NULL AND model != '<synthetic>' "
-        "GROUP BY model ORDER BY avg_interrupts DESC",
+        "GROUP BY 1 ORDER BY avg_interrupts DESC",
         (start_str, end_str),
     ).fetchall()
     result["interrupt_patterns"] = [

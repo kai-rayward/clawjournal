@@ -63,7 +63,7 @@ class ScoringResult:
     display_title: str = ""              # LLM-generated concise title
     summary: str = ""                    # 1-3 sentence session summary
     task_type: str = "unknown"           # LLM-classified task type
-    outcome_label: str = "unknown"       # resolution label (resolved/partial/failed/etc.)
+    outcome_label: str = ""              # resolution label; "" means judge gave no valid label
     value_labels: list[str] = field(default_factory=list)  # session tags
     risk_level: list[str] = field(default_factory=list)     # privacy flags
     effort_estimate: float = 0.0         # 0.0-1.0 effort estimate
@@ -802,6 +802,21 @@ def _validate_snake_list(raw: Any) -> list[str]:
 
 _VALID_RESOLUTIONS = {"resolved", "partial", "failed", "abandoned", "exploratory", "trivial"}
 
+# Old-schema outcome_label values that predate the six-value resolution set.
+# Judges (and their prompts) from before the schema migration returned
+# tool-output-derived badges. Translate them into the nearest
+# new-schema resolution so backward-compatible judge outputs don't
+# silently map to "" and lose their signal. Mirrors the SQL
+# normalization in workbench/index.py._OUTCOME_NORMALIZE_SQL.
+_LEGACY_RESOLUTION_MAP = {
+    "tests_passed": "resolved",
+    "completed": "resolved",
+    "tests_failed": "failed",
+    "build_failed": "failed",
+    "errored": "failed",
+    "analysis_only": "exploratory",
+}
+
 
 def _validate_judge_result(result: dict) -> dict:
     """Parse judge result safely. Handles both new (substance) and old (quality) schemas."""
@@ -810,13 +825,21 @@ def _validate_judge_result(result: dict) -> dict:
     if not isinstance(substance, int) or not (1 <= substance <= 5):
         substance = 3  # safety net: invalid defaults to middle
 
-    # Resolution (new) or fall back from old outcome_label
-    resolution = result.get("resolution") if "resolution" in result else result.get("outcome_label", "unknown")
+    # Resolution (new) or fall back from old outcome_label. The judge
+    # sometimes returns values outside _VALID_RESOLUTIONS (historically
+    # `unknown`, typos, or old-schema labels like `completed`). Those
+    # used to be stored verbatim and leaked onto the dashboard as a
+    # separate bucket. Now: anything outside the valid set is coerced
+    # to an empty string, which the persist path treats as "no label"
+    # so the sessions fall back to the heuristic badge until rescored.
+    resolution = result.get("resolution") if "resolution" in result else result.get("outcome_label", "")
     if not isinstance(resolution, str) or not resolution.strip():
-        resolution = "unknown"
-    resolution = _normalize_snake_case(resolution)
-    # Allow old outcome_label values through (backward compat) but normalize
-    # known new-schema values for consistency.
+        resolution = ""
+    else:
+        resolution = _normalize_snake_case(resolution)
+        if resolution not in _VALID_RESOLUTIONS:
+            # Translate old-schema tool-output labels; drop anything else.
+            resolution = _LEGACY_RESOLUTION_MAP.get(resolution, "")
 
     # Summary (new field, may be absent in old schema)
     summary = result.get("summary", "")

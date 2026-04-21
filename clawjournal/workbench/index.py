@@ -28,12 +28,40 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 SECURITY_SCHEMA_VERSION = 2
 BACKFILL_WINDOW = 100
 
+# Display-only normalization from the mixed AI/heuristic outcome vocabulary
+# onto a single coherent label set. Prevents the duplicate-meaning rows we
+# used to get (AI `resolved` next to heuristic `tests_passed`; AI `partial`
+# colliding with heuristic `partial` that means "user spoke last"). AI
+# labels take precedence when present; invalid judge output maps to
+# `unknown` (validation at the write path now prevents this from growing).
+# Keep columns selectable everywhere by wrapping in `({_OUTCOME_NORMALIZE_SQL}) as outcome_label`.
+_OUTCOME_NORMALIZE_SQL = (
+    "CASE "
+    "WHEN ai_outcome_badge = 'resolved'    THEN 'resolved' "
+    "WHEN ai_outcome_badge = 'partial'     THEN 'partial' "
+    "WHEN ai_outcome_badge = 'failed'      THEN 'failed' "
+    "WHEN ai_outcome_badge = 'abandoned'   THEN 'abandoned' "
+    "WHEN ai_outcome_badge = 'exploratory' THEN 'exploratory' "
+    "WHEN ai_outcome_badge = 'trivial'     THEN 'trivial' "
+    "WHEN ai_outcome_badge IS NOT NULL     THEN 'unknown' "
+    "WHEN outcome_badge = 'tests_passed'   THEN 'resolved' "
+    "WHEN outcome_badge = 'tests_failed'   THEN 'failed' "
+    "WHEN outcome_badge = 'build_failed'   THEN 'failed' "
+    "WHEN outcome_badge = 'errored'        THEN 'failed' "
+    "WHEN outcome_badge = 'completed'      THEN 'inconclusive' "
+    "WHEN outcome_badge = 'partial'        THEN 'interrupted' "
+    "WHEN outcome_badge = 'analysis_only'  THEN 'exploratory' "
+    "ELSE 'unscored' "
+    "END"
+)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id         TEXT PRIMARY KEY,
     project            TEXT NOT NULL,
     source             TEXT NOT NULL,
     model              TEXT,
+    model_effort       TEXT,
     start_time         TEXT,
     end_time           TEXT,
     duration_seconds   INTEGER,
@@ -43,6 +71,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     tool_uses          INTEGER DEFAULT 0,
     input_tokens       INTEGER DEFAULT 0,
     output_tokens      INTEGER DEFAULT 0,
+    cache_read_tokens       INTEGER DEFAULT 0,
+    cache_creation_tokens   INTEGER DEFAULT 0,
     display_title      TEXT,
     outcome_badge      TEXT,
     value_badges       TEXT,
@@ -242,6 +272,12 @@ def open_index() -> sqlite3.Connection:
         ("ai_summary", "TEXT"),           # replaces ai_quality_tier
         ("tool_counts", "TEXT"),
         ("user_interrupts", "INTEGER"),
+        ("model_effort", "TEXT"),   # Codex-style reasoning effort ("medium"/"high"/"xhigh")
+        # Cached-input token buckets. Previously tracked only in the in-memory
+        # stats dict (and used for cost estimation), not persisted. Without
+        # them the Token Usage chart under-counts Claude input by ~50x.
+        ("cache_read_tokens", "INTEGER DEFAULT 0"),
+        ("cache_creation_tokens", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -263,6 +299,18 @@ def open_index() -> sqlite3.Connection:
                 raise
 
     _migrate_security_refactor(conn)
+
+    # Clean up ai_outcome_badge values that the judge wrote before the
+    # resolution validator rejected invalid labels. Idempotent: after
+    # the first cleanup this UPDATE matches zero rows. Keeps the
+    # normalized outcome chart free of silent "unknown" buckets.
+    conn.execute(
+        "UPDATE sessions SET ai_outcome_badge = NULL "
+        "WHERE ai_outcome_badge IS NOT NULL "
+        "AND ai_outcome_badge NOT IN "
+        "('resolved', 'partial', 'failed', 'abandoned', 'exploratory', 'trivial')"
+    )
+    conn.commit()
 
     return conn
 
@@ -1102,11 +1150,12 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         # are simply absent from the SET clause.
         conn.execute(
             """INSERT INTO sessions (
-                session_id, project, source, model,
+                session_id, project, source, model, model_effort,
                 start_time, end_time, duration_seconds,
                 git_branch,
                 user_messages, assistant_messages, tool_uses,
                 input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens,
                 display_title,
                 outcome_badge, value_badges, risk_badges,
                 sensitivity_score, task_type,
@@ -1128,10 +1177,11 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 tool_counts, user_interrupts,
                 hold_state
             ) VALUES (
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?,
                 ?,
                 ?, ?, ?,
+                ?, ?,
                 ?, ?,
                 ?,
                 ?, ?, ?,
@@ -1158,6 +1208,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 project = excluded.project,
                 source = excluded.source,
                 model = excluded.model,
+                model_effort = excluded.model_effort,
                 start_time = excluded.start_time,
                 end_time = excluded.end_time,
                 duration_seconds = excluded.duration_seconds,
@@ -1167,6 +1218,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 tool_uses = excluded.tool_uses,
                 input_tokens = excluded.input_tokens,
                 output_tokens = excluded.output_tokens,
+                cache_read_tokens = excluded.cache_read_tokens,
+                cache_creation_tokens = excluded.cache_creation_tokens,
                 display_title = excluded.display_title,
                 outcome_badge = excluded.outcome_badge,
                 value_badges = excluded.value_badges,
@@ -1191,7 +1244,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 user_interrupts = excluded.user_interrupts
             """,
             (
-                session_id, project, source, session.get("model"),
+                session_id, project, source, session.get("model"), session.get("model_effort"),
                 session.get("start_time"), session.get("end_time"), duration,
                 session.get("git_branch"),
                 stats.get("user_messages", 0),
@@ -1199,6 +1252,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 stats.get("tool_uses", 0),
                 in_tok,
                 out_tok,
+                cache_read,
+                cache_create,
                 display_title,
                 badges["outcome_badge"],
                 json.dumps(badges["value_badges"]),
@@ -1327,7 +1382,7 @@ def query_sessions(
     # Validate sort column to prevent SQL injection
     allowed_sort_columns = {
         "start_time", "end_time", "indexed_at", "updated_at",
-        "project", "source", "model", "review_status", "task_type",
+        "project", "source", "model", "model_effort", "review_status", "task_type",
         "user_messages", "assistant_messages", "tool_uses",
         "input_tokens", "output_tokens", "duration_seconds",
         "sensitivity_score", "ai_quality_score",
@@ -1851,10 +1906,13 @@ def get_dashboard_analytics(
         base_clauses=["start_time IS NOT NULL"],
     )
 
-    # Summary
+    # Summary. `total_tokens` sums all input buckets (including cached reads
+    # and cache creation) plus output, matching how billing reports it.
+    # Omitting cache_* under-counts Claude by ~50x.
     row = conn.execute(
         "SELECT COUNT(*) as total_sessions, "
-        "SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as total_tokens, "
+        "SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        "  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as total_tokens, "
         "COUNT(DISTINCT project) as unique_projects, "
         "COUNT(DISTINCT source) as unique_sources, "
         "SUM(estimated_cost_usd) as total_cost "
@@ -1871,14 +1929,19 @@ def get_dashboard_analytics(
 
     # Resolve rate with previous-period comparison for trend coloring
     def _compute_resolve_rate(rr_start: str | None, rr_end: str | None) -> float | None:
+        # Denominator excludes sessions that normalize to `unscored` (no
+        # label at all). Numerator is the normalized `resolved` bucket —
+        # AI `resolved` plus heuristic `tests_passed`. The previous
+        # formula folded heuristic `completed` into "resolved" too, but
+        # `completed` is now `inconclusive` (no-signal fallback), which
+        # would overstate success.
         rr_where, rr_params = _build_start_time_where(
             start=rr_start, end=rr_end,
-            base_clauses=["COALESCE(ai_outcome_badge, outcome_badge) IS NOT NULL"],
+            base_clauses=[f"({_OUTCOME_NORMALIZE_SQL}) != 'unscored'"],
         )
         r = conn.execute(
             "SELECT COUNT(*) as total, "
-            "SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) "
-            "IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) as resolved "
+            f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) as resolved "
             f"FROM sessions {rr_where}",
             rr_params,
         ).fetchone()
@@ -1953,15 +2016,18 @@ def get_dashboard_analytics(
     ).fetchall()
     result["activity"] = [dict(r) for r in rows]
 
-    # Outcome badge distribution (prefer LLM classification)
+    # Outcome distribution — normalized to the clean dashboard vocabulary
+    # so we don't show AI `resolved` next to heuristic `tests_passed`
+    # (same underlying fact) or collide AI `partial` (progress made)
+    # with heuristic `partial` (user interrupted the session).
     outcome_where, outcome_params = _build_start_time_where(
         start=start, end=end,
-        base_clauses=["COALESCE(ai_outcome_badge, outcome_badge) IS NOT NULL"],
+        base_clauses=[f"({_OUTCOME_NORMALIZE_SQL}) != 'unscored'"],
     )
     rows = conn.execute(
-        "SELECT COALESCE(ai_outcome_badge, outcome_badge) as outcome_label, "
+        f"SELECT ({_OUTCOME_NORMALIZE_SQL}) as outcome_label, "
         f"COUNT(*) as count FROM sessions {outcome_where} "
-        "GROUP BY outcome_label",
+        "GROUP BY 1",
         outcome_params,
     ).fetchall()
     result["by_outcome_label"] = [dict(r) for r in rows]
@@ -1989,10 +2055,16 @@ def get_dashboard_analytics(
         start=start, end=end,
         base_clauses=["COALESCE(ai_task_type, task_type) IS NOT NULL"],
     )
+    # NOTE: Must GROUP BY 1 (ordinal), not by the alias. SQLite resolves
+    # `GROUP BY task_type` to the raw `task_type` column, not the
+    # COALESCE expression, because the alias name collides with a real
+    # column — producing multiple rows for the same displayed label
+    # (e.g. two "unknown" rows when ai_task_type='unknown' differs from
+    # the raw task_type).
     rows = conn.execute(
         "SELECT COALESCE(ai_task_type, task_type) as task_type, "
         f"COUNT(*) as count FROM sessions {task_where} "
-        "GROUP BY task_type ORDER BY count DESC",
+        "GROUP BY 1 ORDER BY count DESC",
         task_params,
     ).fetchall()
     result["by_task_type"] = [dict(r) for r in rows]
@@ -2003,16 +2075,25 @@ def get_dashboard_analytics(
         start=start, end=end,
         base_clauses=["model IS NOT NULL", "model != '<synthetic>'"],
     )
+    # Split same-model traffic across effort tiers (e.g. "gpt-5.4 @ high"
+    # vs "gpt-5.4 @ xhigh"); fall back to bare model when effort is NULL.
     rows = conn.execute(
-        "SELECT model, COUNT(*) as count FROM sessions "
-        f"{model_where} GROUP BY model ORDER BY count DESC",
+        "SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        "       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        "COUNT(*) as count FROM sessions "
+        f"{model_where} GROUP BY 1 ORDER BY count DESC",
         model_params,
     ).fetchall()
     result["by_model"] = [dict(r) for r in rows]
 
-    # Tokens by source
+    # Tokens by source. `input_tokens` holds the fresh non-cached bucket
+    # only; Claude's heavy prompt caching means the full input seen by
+    # the model is input + cache_read + cache_creation. Sum all three
+    # for the display bar so Claude's input doesn't look artificially
+    # 50x smaller than output.
     rows = conn.execute(
-        "SELECT source, SUM(input_tokens) as input_tokens, "
+        "SELECT source, "
+        "SUM(input_tokens) + SUM(COALESCE(cache_read_tokens, 0)) + SUM(COALESCE(cache_creation_tokens, 0)) as input_tokens, "
         "SUM(output_tokens) as output_tokens "
         f"FROM sessions{filtered_where} GROUP BY source",
         filtered_params,
@@ -2353,7 +2434,8 @@ def get_insights(
         f"SELECT DATE(start_time) as day, "
         f"CAST(strftime('%H', start_time) AS INTEGER) as hour, "
         f"COUNT(*) as sessions, "
-        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as tokens, "
+        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        f"  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as tokens, "
         f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} "
         f"GROUP BY day, hour ORDER BY day, hour",
@@ -2364,7 +2446,8 @@ def get_insights(
     # Focus: sessions by project with cost and task type breakdown
     rows = conn.execute(
         f"SELECT project, COUNT(*) as sessions, "
-        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) as tokens, "
+        f"SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) "
+        f"  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as tokens, "
         f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} "
         f"GROUP BY project ORDER BY sessions DESC LIMIT 20",
@@ -2385,10 +2468,15 @@ def get_insights(
         focus.append(proj)
     result["focus"] = focus
 
-    # Productivity: duration vs score
+    # Productivity: duration vs score. Returns the normalized resolution
+    # (`resolved` / `failed` / `partial` / etc.) so the frontend scatter
+    # plot only has to color-code one vocabulary. Before normalization,
+    # heuristic badges like `tests_failed` / `build_failed` / `errored`
+    # fell into the color map's default gray "Other" bucket instead of
+    # red failures.
     rows = conn.execute(
         f"SELECT session_id, duration_seconds, ai_quality_score, "
-        f"COALESCE(ai_outcome_badge, outcome_badge) as resolution, "
+        f"({_OUTCOME_NORMALIZE_SQL}) as resolution, "
         f"estimated_cost_usd as cost "
         f"FROM sessions {where} "
         f"AND duration_seconds IS NOT NULL AND ai_quality_score IS NOT NULL "
@@ -2401,13 +2489,15 @@ def get_insights(
     # same rationale as scoring/insights.py:55 and the cli.py:479 export
     # filter. These sessions have no real model/cost and pollute the table.
     rows = conn.execute(
-        f"SELECT model, COUNT(*) as sessions, "
+        f"SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        f"COUNT(*) as sessions, "
         f"AVG(ai_quality_score) as avg_score, "
-        f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
+        f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"SUM(estimated_cost_usd) as total_cost "
         f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
-        f"GROUP BY model ORDER BY sessions DESC",
+        f"GROUP BY 1 ORDER BY sessions DESC",
         params_base,
     ).fetchall()
     result["model_effectiveness"] = [
@@ -2415,12 +2505,16 @@ def get_insights(
         for r in rows
     ]
 
-    # Tool usage
+    # Tool usage. Uses `tool_counts` (JSON map of tool-name → call-count)
+    # rather than `commands_run` (list of raw shell strings). The prior
+    # query summed bash command lines like "ls /Users/..." and displayed
+    # them as the top tool, which was nonsensical. Mirrors the dashboard
+    # top_tools query.
     rows = conn.execute(
-        f"SELECT j.value as tool, COUNT(*) as calls "
-        f"FROM sessions, json_each(COALESCE(commands_run, '[]')) j "
-        f"{where} AND commands_run IS NOT NULL AND commands_run != '[]' "
-        f"GROUP BY tool ORDER BY calls DESC LIMIT 20",
+        f"SELECT key as tool, SUM(value) as calls "
+        f"FROM sessions, json_each(tool_counts) "
+        f"{where} AND tool_counts IS NOT NULL AND tool_counts != '{{}}' "
+        f"GROUP BY key ORDER BY calls DESC LIMIT 20",
         params_base,
     ).fetchall()
     result["tool_usage"] = [dict(r) for r in rows]
@@ -2431,7 +2525,7 @@ def get_insights(
         f"COUNT(*) as sessions, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"AVG(duration_seconds) as avg_duration, "
-        f"SUM(CASE WHEN COALESCE(ai_outcome_badge, outcome_badge) IN ('resolved', 'completed', 'tests_passed') THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
+        f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate "
         f"FROM sessions {where} "
         f"GROUP BY day ORDER BY day",
         params_base,
@@ -2456,11 +2550,14 @@ def get_insights(
     ).fetchall()
     result["effort_distribution"] = [dict(r) for r in rows]
 
-    # Cost breakdown (excludes `<synthetic>` — same rationale).
+    # Cost breakdown (excludes `<synthetic>` — same rationale). Splits
+    # same-model spend across effort tiers.
     rows = conn.execute(
-        f"SELECT model, COALESCE(SUM(estimated_cost_usd), 0) as cost "
+        f"SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
+        f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
+        f"COALESCE(SUM(estimated_cost_usd), 0) as cost "
         f"FROM sessions {where} AND model IS NOT NULL AND model != '<synthetic>' "
-        f"GROUP BY model ORDER BY cost DESC",
+        f"GROUP BY 1 ORDER BY cost DESC",
         params_base,
     ).fetchall()
     result["cost_by_model"] = [dict(r) for r in rows]

@@ -13,6 +13,7 @@ from clawjournal.parsing.parser import (
     _build_tool_result_map,
     _build_codex_tool_result_map,
     _extract_assistant_content,
+    _extract_model_effort,
     _extract_user_content,
     _find_subagent_only_sessions,
     _normalize_timestamp,
@@ -27,6 +28,38 @@ from clawjournal.parsing.parser import (
     _parse_codex_session_file,
     _parse_openclaw_session_file,
 )
+
+
+class TestExtractModelEffort:
+    def test_codex_alias(self):
+        assert _extract_model_effort({"effort": "high"}) == "high"
+
+    def test_openai_sdk_alias(self):
+        assert _extract_model_effort({"reasoningEffort": "medium"}) == "medium"
+
+    def test_python_sdk_alias(self):
+        assert _extract_model_effort({"reasoning_effort": "xhigh"}) == "xhigh"
+
+    def test_nested_in_options(self):
+        assert _extract_model_effort({"options": {"reasoningEffort": "low"}}) == "low"
+
+    def test_nested_in_provider_options(self):
+        assert _extract_model_effort({"providerOptions": {"effort": "high"}}) == "high"
+
+    def test_strips_whitespace(self):
+        assert _extract_model_effort({"effort": "  high  "}) == "high"
+
+    def test_missing(self):
+        assert _extract_model_effort({"model": "gpt-5"}) is None
+
+    def test_non_dict(self):
+        assert _extract_model_effort("high") is None
+        assert _extract_model_effort(None) is None
+        assert _extract_model_effort(["high"]) is None
+
+    def test_empty_string_treated_as_missing(self):
+        assert _extract_model_effort({"effort": ""}) is None
+        assert _extract_model_effort({"effort": "   "}) is None
 
 
 # --- _build_project_name ---
@@ -654,6 +687,17 @@ class TestDiscoverProjects:
                     "turn_id": "turn-1",
                     "cwd": "/Users/testuser/Documents/myrepo",
                     "model": "gpt-5.3-codex",
+                    "effort": "high",
+                },
+            },
+            {
+                "timestamp": "2026-02-24T16:09:59.569Z",
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "turn-2",
+                    "cwd": "/Users/testuser/Documents/myrepo",
+                    "model": "gpt-5.3-codex",
+                    "effort": "medium",
                 },
             },
             {
@@ -714,6 +758,9 @@ class TestDiscoverProjects:
         assert len(sessions) == 1
         assert sessions[0]["project"] == "codex:myrepo"
         assert sessions[0]["model"] == "gpt-5.3-codex"
+        # First turn_context wins — we attribute the session to the mode
+        # it was launched in, not whatever it was switched to later.
+        assert sessions[0]["model_effort"] == "high"
         # OpenAI input_tokens (120) includes cached_input_tokens (30) as subset
         assert sessions[0]["stats"]["input_tokens"] == 90  # 120 - 30 non-cached
         assert sessions[0]["stats"]["cache_read_tokens"] == 30

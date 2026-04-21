@@ -199,15 +199,19 @@ def _fmt_or_dash(value: Any) -> str:
     return str(value)
 
 
-def _fmt_source(source: Any, model: Any) -> str:
+def _fmt_source(source: Any, model: Any, model_effort: Any = None) -> str:
     s = str(source or "").strip()
     m = str(model or "").strip()
-    if s and m:
-        return f"{s} (`{m}`)"
+    e = str(model_effort or "").strip()
+    model_part = f"`{m}`" if m else ""
+    if m and e:
+        model_part = f"`{m}` @ {e}"
+    if s and model_part:
+        return f"{s} ({model_part})"
     if s:
         return s
-    if m:
-        return f"`{m}`"
+    if model_part:
+        return model_part
     return "—"
 
 
@@ -231,7 +235,9 @@ def render_trace_note(
     title = session.get("display_title") or session_id or "untitled"
 
     project = _fmt_or_dash(session.get("project"))
-    source = _fmt_source(session.get("source"), session.get("model"))
+    source = _fmt_source(
+        session.get("source"), session.get("model"), session.get("model_effort")
+    )
     when = _fmt_when(
         session.get("start_time"),
         session.get("end_time"),

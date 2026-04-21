@@ -417,7 +417,11 @@ class TestValidateJudgeResultBackwardCompat:
         }
         validated = _validate_judge_result(old_result)
         assert validated["substance"] == 4
-        assert validated["resolution"] == "tests_passed"  # falls back from outcome_label
+        # Old-schema outcome_label=tests_passed is translated into the
+        # new-schema `resolved` bucket (tool-output "tests passed" ≈ goal
+        # achieved). Anything outside the legacy map gets dropped so it
+        # can't leak onto the dashboard as a ghost label.
+        assert validated["resolution"] == "resolved"
         assert validated["session_tags"] == ["tool_rich"]  # falls back from value_labels
         assert validated["privacy_flags"] == ["secrets_detected"]  # falls back from risk_level
         assert validated["summary"] == ""  # not present in old schema
