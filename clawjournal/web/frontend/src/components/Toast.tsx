@@ -1,14 +1,26 @@
 import { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { colors } from '../theme.ts';
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
+export interface ToastOptions {
+  type?: 'success' | 'error' | 'info';
+  duration?: number;          // ms, default 3500
+  action?: ToastAction;
+}
+
 interface ToastItem {
   id: number;
   message: string;
   type: 'success' | 'error' | 'info';
+  action?: ToastAction;
 }
 
 interface ToastCtx {
-  toast: (message: string, type?: 'success' | 'error' | 'info') => void;
+  toast: (message: string, typeOrOptions?: 'success' | 'error' | 'info' | ToastOptions) => void;
 }
 
 const Ctx = createContext<ToastCtx>({ toast: () => {} });
@@ -21,10 +33,18 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const counter = useRef(0);
 
-  const toast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
+  const toast = useCallback((
+    message: string,
+    typeOrOptions?: 'success' | 'error' | 'info' | ToastOptions,
+  ) => {
+    const opts: ToastOptions =
+      typeof typeOrOptions === 'string' ? { type: typeOrOptions }
+      : typeOrOptions ?? {};
     const id = ++counter.current;
-    setItems(prev => [...prev, { id, message, type }]);
-    setTimeout(() => setItems(prev => prev.filter(t => t.id !== id)), 3500);
+    const type = opts.type ?? 'info';
+    const duration = opts.duration ?? 3500;
+    setItems(prev => [...prev, { id, message, type, action: opts.action }]);
+    setTimeout(() => setItems(prev => prev.filter(t => t.id !== id)), duration);
   }, []);
 
   const bgMap = { success: colors.green700, error: colors.red500, info: colors.gray800 };
@@ -55,7 +75,29 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             pointerEvents: 'auto',
             maxWidth: 360,
           }}>
-            {t.message}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span>{t.message}</span>
+              {t.action && (
+                <button
+                  onClick={() => {
+                    t.action!.onClick();
+                    setItems(prev => prev.filter(x => x.id !== t.id));
+                  }}
+                  style={{
+                    background: 'transparent',
+                    border: '1px solid rgba(255,255,255,0.35)',
+                    color: colors.white,
+                    borderRadius: 6,
+                    padding: '4px 10px',
+                    fontSize: 13,
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {t.action.label}
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>

@@ -106,6 +106,9 @@ const formatTokens = (t: number) => t >= 1_000_000 ? `${(t / 1_000_000).toFixed(
 const sessionTotalTokens = (s: { input_tokens?: number; output_tokens?: number }) =>
   (s.input_tokens || 0) + (s.output_tokens || 0);
 
+const truncateTitle = (s: string, max = 48) =>
+  s.length > max ? s.slice(0, max - 1) + '…' : s;
+
 // Map raw redaction-log `type` strings into a small set of buckets the UI
 // surfaces on Redact and Review. Everything else collapses to `other`.
 type RedactionBucket = 'tokens' | 'emails' | 'paths' | 'timestamps' | 'urls' | 'other';
@@ -162,6 +165,13 @@ interface ReadySession {
   runtime_channel?: string | null;
   start_time?: string | null;
   review_status?: string;
+}
+
+interface RemovedEntry {
+  id: string;
+  title: string;
+  removedAt: number;
+  originalIndex: number;
 }
 
 interface ShareReadyStats {
@@ -519,6 +529,7 @@ export function Share() {
   // Review state
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
   const [expandedReviewIds, setExpandedReviewIds] = useState<Set<string>>(new Set());
+  const [removedSessions, setRemovedSessions] = useState<RemovedEntry[]>([]);
 
   // Package state
   const [packagedShareId, setPackagedShareId] = useState<string | null>(
@@ -588,13 +599,17 @@ export function Share() {
     }, { replace: true });
   }, [activeStep, queueOrder, note, packagedShareId, setSearchParams]);
 
-  // Drop cached redacted entries when sessions leave the queue.
+  // Drop cached redacted entries and approvals when sessions leave the queue
+  // AND are not sitting in the removed-drawer waiting for restore.
   useEffect(() => {
+    const removedIds = new Set(removedSessions.map((e) => e.id));
+    const keep = (sid: string) => queueSet.has(sid) || removedIds.has(sid);
+
     setRedactedSessions((prev) => {
       let changed = false;
       const next: Record<string, RedactedSessionData> = {};
       for (const [sid, data] of Object.entries(prev)) {
-        if (queueSet.has(sid)) next[sid] = data;
+        if (keep(sid)) next[sid] = data;
         else changed = true;
       }
       return changed ? next : prev;
@@ -603,12 +618,12 @@ export function Share() {
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
-        if (queueSet.has(id)) next.add(id);
+        if (keep(id)) next.add(id);
         else changed = true;
       }
       return changed ? next : prev;
     });
-  }, [queueSet]);
+  }, [queueSet, removedSessions]);
 
   const reload = () => {
     api.shareReady({ includeUnapproved: true }).then((stats) => {
@@ -640,7 +655,53 @@ export function Share() {
   // =================================================
 
   const removeFromQueue = (id: string) => {
+    const originalIndex = queueOrder.indexOf(id);
+    const session = sessionById[id];
+    const title = session?.display_title || id;
     setQueueOrder((prev) => prev.filter((x) => x !== id));
+    if (originalIndex >= 0) {
+      setRemovedSessions((prev) => [
+        ...prev,
+        { id, title, removedAt: Date.now(), originalIndex },
+      ]);
+    }
+    toast(`Removed "${truncateTitle(title)}"`, {
+      type: 'info',
+      duration: 8000,
+      action: { label: 'Undo', onClick: () => restoreSession(id) },
+    });
+  };
+
+  const restoreSession = (id: string) => {
+    setRemovedSessions((prev) => {
+      const entry = prev.find((e) => e.id === id);
+      if (!entry) return prev;
+      setQueueOrder((q) => {
+        if (q.includes(id)) return q;
+        const clamped = Math.min(entry.originalIndex, q.length);
+        const next = [...q];
+        next.splice(clamped, 0, id);
+        return next;
+      });
+      return prev.filter((e) => e.id !== id);
+    });
+  };
+
+  const restoreAll = () => {
+    if (removedSessions.length === 0) return;
+    // Sort by originalIndex asc so earlier-indexed items go first; later ones
+    // get clamped correctly as the queue grows.
+    const sorted = [...removedSessions].sort((a, b) => a.originalIndex - b.originalIndex);
+    setQueueOrder((q) => {
+      const next = [...q];
+      for (const entry of sorted) {
+        if (next.includes(entry.id)) continue;
+        const clamped = Math.min(entry.originalIndex, next.length);
+        next.splice(clamped, 0, entry.id);
+      }
+      return next;
+    });
+    setRemovedSessions([]);
   };
 
   const addToQueue = (id: string) => {
@@ -830,13 +891,63 @@ export function Share() {
   };
 
   const approveAllClean = () => {
+    const candidates = queuedSessions
+      .filter((s) =>
+        !approvedIds.has(s.session_id) &&
+        classify(redactedSessions[s.session_id]) === 'clear'
+      )
+      .map((s) => s.session_id);
+    if (candidates.length === 0) return;
     setApprovedIds((prev) => {
-      const n = new Set(prev);
-      queuedSessions.forEach((s) => {
-        if (classify(redactedSessions[s.session_id]) === 'clear') n.add(s.session_id);
-      });
-      return n;
+      const next = new Set(prev);
+      for (const id of candidates) next.add(id);
+      return next;
     });
+    toast(
+      `Included ${candidates.length} clean trace${candidates.length === 1 ? '' : 's'}`,
+      {
+        type: 'info',
+        duration: 8000,
+        action: {
+          label: 'Undo',
+          onClick: () => setApprovedIds((prev) => {
+            const next = new Set(prev);
+            for (const id of candidates) next.delete(id);
+            return next;
+          }),
+        },
+      },
+    );
+  };
+
+  const approveAllWithFlags = () => {
+    const candidates = queuedSessions
+      .filter((s) =>
+        !approvedIds.has(s.session_id) &&
+        classify(redactedSessions[s.session_id]) !== 'clear'
+      )
+      .map((s) => s.session_id);
+    if (candidates.length === 0) return;
+    setApprovedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of candidates) next.add(id);
+      return next;
+    });
+    toast(
+      `Included ${candidates.length} flagged trace${candidates.length === 1 ? '' : 's'}`,
+      {
+        type: 'info',
+        duration: 8000,
+        action: {
+          label: 'Undo',
+          onClick: () => setApprovedIds((prev) => {
+            const next = new Set(prev);
+            for (const id of candidates) next.delete(id);
+            return next;
+          }),
+        },
+      },
+    );
   };
 
   const retryAiReview = async (id: string) => {
@@ -1020,6 +1131,7 @@ export function Share() {
     if (activeStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed) {
       setCompletedKeys((prev) => new Set([...prev, 'package']));
       setActiveStep('done');
+      setRemovedSessions([]);
     }
   }, [activeStep, packagedShareId, packageProgress, packagingFailed]);
 
@@ -1109,6 +1221,9 @@ export function Share() {
         showHelp={showHelp}
         setShowHelp={setShowHelp}
         toast={toast}
+        removedSessions={removedSessions}
+        onRestore={restoreSession}
+        onRestoreAll={restoreAll}
       />
     );
   }
@@ -1146,6 +1261,10 @@ export function Share() {
         onToggleExpand={toggleReviewExpand}
         onApprove={approveTrace}
         onApproveAllClean={approveAllClean}
+        onApproveAllWithFlags={approveAllWithFlags}
+        removedSessions={removedSessions}
+        onRestore={restoreSession}
+        onRestoreAll={restoreAll}
         onRemove={removeFromQueue}
         onRetryAi={retryAiReview}
         onBack={() => setActiveStep('redact')}
@@ -1230,6 +1349,9 @@ interface QueueStepProps {
   showHelp: boolean;
   setShowHelp: (b: boolean) => void;
   toast: (msg: string, kind?: 'success' | 'error') => void;
+  removedSessions: RemovedEntry[];
+  onRestore: (id: string) => void;
+  onRestoreAll: () => void;
 }
 
 function QueueStep(p: QueueStepProps) {
@@ -1360,6 +1482,11 @@ function QueueStep(p: QueueStepProps) {
               </button>
             </div>
           )}
+          <RemovedDrawer
+            entries={p.removedSessions}
+            onRestore={p.onRestore}
+            onRestoreAll={p.onRestoreAll}
+          />
         </>
       ) : (
         <>
@@ -1575,6 +1702,12 @@ function QueueStep(p: QueueStepProps) {
               </div>
             )}
           </div>
+
+          <RemovedDrawer
+            entries={p.removedSessions}
+            onRestore={p.onRestore}
+            onRestoreAll={p.onRestoreAll}
+          />
 
           {/* Note */}
           <div style={{ marginBottom: 18 }}>
@@ -1926,6 +2059,10 @@ interface ReviewStepProps {
   onToggleExpand: (id: string) => void;
   onApprove: (id: string) => void;
   onApproveAllClean: () => void;
+  onApproveAllWithFlags: () => void;
+  removedSessions: RemovedEntry[];
+  onRestore: (id: string) => void;
+  onRestoreAll: () => void;
   onRemove: (id: string) => void;
   onRetryAi: (id: string) => void;
   onBack: () => void;
@@ -1949,6 +2086,25 @@ function ReviewStep(p: ReviewStepProps) {
   const cleanUnapprovedCount = p.queuedSessions.filter((s) => (
     classify(p.redactedSessions[s.session_id]) === 'clear' && !p.approvedIds.has(s.session_id)
   )).length;
+
+  const flaggedUnapprovedCount = p.queuedSessions.filter((s) => (
+    classify(p.redactedSessions[s.session_id]) !== 'clear' && !p.approvedIds.has(s.session_id)
+  )).length;
+
+  const flagBreakdown = (() => {
+    let ai = 0;
+    let residual = 0;
+    for (const s of p.queuedSessions) {
+      if (p.approvedIds.has(s.session_id)) continue;
+      const d = p.redactedSessions[s.session_id];
+      if (!d) continue;
+      if (classify(d) === 'clear') continue;
+      const hasAi = (d.buckets?.other ?? 0) > 0 || ((d.aiPiiFindings ?? []).length > 0);
+      if (hasAi) ai += 1;
+      else residual += 1;
+    }
+    return { ai, residual };
+  })();
 
   return (
     <div style={{ padding: '24px', maxWidth: '960px', margin: '0 auto' }}>
@@ -2001,6 +2157,59 @@ function ReviewStep(p: ReviewStepProps) {
         >
           Include all clean ({cleanUnapprovedCount})
         </button>
+
+        <div
+          style={{ position: 'relative', display: 'inline-block' }}
+          onMouseEnter={(e) => {
+            const tt = e.currentTarget.querySelector('[data-ttip]') as HTMLElement | null;
+            if (tt) tt.style.opacity = '1';
+          }}
+          onMouseLeave={(e) => {
+            const tt = e.currentTarget.querySelector('[data-ttip]') as HTMLElement | null;
+            if (tt) tt.style.opacity = '0';
+          }}
+        >
+          <button
+            onClick={p.onApproveAllWithFlags}
+            disabled={flaggedUnapprovedCount === 0}
+            style={{
+              ...btnSecondary, padding: '6px 12px', fontSize: 12.5,
+              opacity: flaggedUnapprovedCount === 0 ? 0.4 : 1,
+              cursor: flaggedUnapprovedCount === 0 ? 'not-allowed' : 'pointer',
+            }}
+          >
+            Include all with flags ({flaggedUnapprovedCount})
+            <span style={{ marginLeft: 6 }}>⚠</span>
+          </button>
+          {flaggedUnapprovedCount > 0 && (
+            <div
+              data-ttip
+              style={{
+                position: 'absolute', bottom: 'calc(100% + 8px)', right: 0,
+                minWidth: 240, padding: '10px 12px',
+                background: colors.gray900, color: colors.white,
+                borderRadius: 6, fontSize: 12, lineHeight: 1.5,
+                boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                opacity: 0, pointerEvents: 'none',
+                transition: 'opacity 0.15s',
+                zIndex: 10,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                {flaggedUnapprovedCount} trace{flaggedUnapprovedCount === 1 ? '' : 's'} with review items:
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {flagBreakdown.ai > 0 && (
+                  <li>{flagBreakdown.ai} AI-flagged (names, orgs, etc.)</li>
+                )}
+                {flagBreakdown.residual > 0 && (
+                  <li>{flagBreakdown.residual} with residual redactions</li>
+                )}
+              </ul>
+            </div>
+          )}
+        </div>
       </div>
 
       <div>
@@ -2018,6 +2227,12 @@ function ReviewStep(p: ReviewStepProps) {
           />
         ))}
       </div>
+
+      <RemovedDrawer
+        entries={p.removedSessions}
+        onRestore={p.onRestore}
+        onRestoreAll={p.onRestoreAll}
+      />
 
       <div style={{
         position: 'sticky', bottom: 0, marginTop: 14, paddingTop: 14,
@@ -2326,6 +2541,93 @@ function ReviewRow({
               </button>
             )}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatRelative(ts: number): string {
+  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (sec < 30) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)} min ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+function RemovedDrawer({
+  entries,
+  onRestore,
+  onRestoreAll,
+}: {
+  entries: RemovedEntry[];
+  onRestore: (id: string) => void;
+  onRestoreAll: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  if (entries.length === 0) return null;
+  return (
+    <div style={{
+      border: `1px solid ${colors.gray200}`,
+      borderRadius: 8,
+      background: colors.gray50,
+      margin: '14px 0',
+      overflow: 'hidden',
+    }}>
+      <div style={{
+        padding: '10px 14px',
+        fontSize: 13,
+        color: colors.gray700,
+        userSelect: 'none',
+        display: 'flex', alignItems: 'center', gap: 8,
+      }}>
+        <span
+          onClick={() => setOpen((v) => !v)}
+          style={{
+            cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: 8,
+            flex: 1,
+          }}
+        >
+          <span style={{
+            display: 'inline-block',
+            transition: 'transform 0.15s',
+            transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+          }}>▸</span>
+          <strong>{entries.length} removed from bundle</strong>
+        </span>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onRestoreAll();
+          }}
+          style={{ ...btnSecondary, padding: '4px 12px', fontSize: 12.5 }}
+        >
+          Restore all
+        </button>
+      </div>
+      {open && (
+        <div style={{ padding: '0 14px 14px' }}>
+          {entries.map((e) => (
+            <div key={e.id} style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '10px 0',
+              borderTop: `1px solid ${colors.gray200}`,
+              fontSize: 13,
+            }}>
+              <span style={{ flex: 1, color: colors.gray900 }}>{e.title}</span>
+              <span style={{ fontSize: 12, color: colors.gray500, marginRight: 12 }}>
+                {formatRelative(e.removedAt)}
+              </span>
+              <button
+                onClick={() => onRestore(e.id)}
+                style={{ ...btnSecondary, padding: '4px 12px', fontSize: 12.5 }}
+              >
+                Restore
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </div>
