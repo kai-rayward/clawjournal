@@ -225,11 +225,16 @@ def scan_file(path: Path) -> TruffleHogReport:
     if EXCLUDED_DETECTORS:
         args.append(f"--exclude-detectors={','.join(EXCLUDED_DETECTORS)}")
 
+    # Hard-limit the subprocess so a hung scan can't wedge the share
+    # export. DEVNULL on stdin prevents any interactive prompt from
+    # deadlocking a non-interactive runner.
     result = subprocess.run(
         args,
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
     )
     # TruffleHog exits 0 on clean and 183 on findings in some versions;
     # accept either as a successful scan.
@@ -345,7 +350,7 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
     import tempfile
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
     ) as tf:
         tf.write(text)
         tmp_path = tf.name
@@ -361,7 +366,20 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
         ]
         if EXCLUDED_DETECTORS:
             args.append(f"--exclude-detectors={','.join(EXCLUDED_DETECTORS)}")
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        # Hard-limit the subprocess: a hung TruffleHog must not block
+        # the findings pipeline indefinitely, and DEVNULL on stdin
+        # prevents any interactive prompt from deadlocking the scan.
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return []
         if result.returncode not in (0, 183):
             # Engine path intentionally fails soft — a broken scan
             # shouldn't block the whole findings rebuild.
@@ -518,7 +536,10 @@ def apply_trufflehog_pass(
         return 0, []
 
     detector_by_raw: dict[str, tuple[str, str]] = {}
-    for match in matches:
+    # Sort (detector, raw) so overlapping detectors pick a placeholder
+    # deterministically across runs — e.g. ("AWS", raw) wins over
+    # ("Generic", raw) rather than whichever arrived first.
+    for match in sorted(matches, key=lambda m: (m["detector"], m["raw"])):
         raw = match["raw"]
         if len(raw) < 3:
             continue
@@ -615,10 +636,17 @@ def trufflehog_secret_map_from_blob(
     """Apply-path contribution: map ``raw → placeholder`` for each
     surviving TruffleHog hit that is not ``ignored``.
 
-    Intentionally re-runs the subprocess on the blob's current state
-    so repeat passes of ``apply_findings_to_blob`` see the latest
-    content; if the binary is unavailable the engine produces no
-    replacements (and the other engines still run).
+    The caller (``apply_findings_to_blob`` in ``secrets.py``) hoists
+    this call *outside* its per-pass loop, so this function runs
+    exactly once per apply — the raws TruffleHog finds don't change
+    after their first replacement, and paying the subprocess cost
+    on every pass would be pure waste. When the binary is
+    unavailable the engine produces no replacements and the other
+    engines still run.
+
+    When two detectors flag the same raw, placeholder selection is
+    stabilized by sorting matches ``(detector, raw)`` ascending so
+    the tiebreaker is deterministic across runs.
     """
     from ..findings import hash_entity  # noqa: PLC0415 — lazy
 
@@ -628,7 +656,7 @@ def trufflehog_secret_map_from_blob(
         return {}
 
     out: dict[str, str] = {}
-    for match in matches:
+    for match in sorted(matches, key=lambda m: (m["detector"], m["raw"])):
         raw = match["raw"]
         if len(raw) < 3:
             continue

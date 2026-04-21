@@ -72,7 +72,7 @@ brew install trufflehog
 # https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
 ```
 
-For the upload path, the scan runs **twice**: once inside `export_share_to_disk`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload.
+For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
 
 One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
 

@@ -449,6 +449,79 @@ class TestApplyPathIntegration:
             conn.close()
 
 
+class TestApplyLoopExit:
+    """Loop in apply_findings_to_blob now relies on the
+    ``pass_count == 0 and pass_num > 0`` guard to exit when
+    trufflehog_map is non-empty. Guard has to actually fire for any
+    max_passes >= 2 or we'd spin."""
+
+    def test_exits_within_two_passes_when_trufflehog_map_is_sticky(self, tmp_path, monkeypatch):
+        from clawjournal.findings import reset_salt_cache
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+        from clawjournal.workbench.index import open_index, upsert_sessions
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+        reset_salt_cache()
+
+        conn = open_index()
+        try:
+            raw = "sk_live_exit_guard_probe_0123456789"
+            upsert_sessions(conn, [{
+                "session_id": "sess-exit",
+                "display_title": "t", "project": "p", "source": "claude",
+                "start_time": "2026-04-20T00:00:00", "end_time": "2026-04-20T00:10:00",
+                "messages": [{"role": "user", "content": f"hi {raw}", "thinking": "", "tool_uses": []}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0,
+                          "input_tokens": 1, "output_tokens": 0},
+            }])
+            conn.commit()
+
+            monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+            monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+            monkeypatch.setattr(
+                trufflehog, "_scan_text_for_raw_matches",
+                lambda text: [{"raw": raw, "detector": "Stripe", "status": "verified"}],
+            )
+
+            blob = {
+                "session_id": "sess-exit",
+                "display_title": "t", "project": "p", "git_branch": "",
+                "messages": [{"content": f"hi {raw}", "thinking": "", "tool_uses": []}],
+            }
+            # max_passes=5: no infinite loop; should finish quickly.
+            redacted, n = apply_findings_to_blob(blob, conn, "sess-exit", max_passes=5)
+            assert n >= 1
+            assert raw not in redacted["messages"][0]["content"]
+        finally:
+            conn.close()
+
+
+class TestDeterministicPlaceholder:
+    """When two detectors flag the same raw, the chosen placeholder
+    must be stable across runs. Sort key is ``(detector, raw)``."""
+
+    def test_multi_detector_same_raw_stable_order(self, monkeypatch):
+        raw = "stable_key_xyz_0123456789abcdef"
+        # Return detectors in reverse alphabetical order — if the code
+        # trusted input order the placeholder would come from "Zeta".
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(
+            trufflehog, "_scan_text_for_raw_matches",
+            lambda text: [
+                {"raw": raw, "detector": "Zeta", "status": "unverified"},
+                {"raw": raw, "detector": "Alpha", "status": "verified"},
+            ],
+        )
+        session = {"messages": [{"content": f"x {raw} y", "tool_uses": []}]}
+        total, log = trufflehog.apply_trufflehog_pass(session)
+        assert total == 1
+        assert session["messages"][0]["content"] == "x [REDACTED_ALPHA] y"
+        assert all(e["type"] == "trufflehog_alpha" for e in log)
+
+
 class TestFieldNameConsistency:
     """The scan-time engine (scan_session_for_trufflehog_findings) and
     the legacy apply pass (apply_trufflehog_pass) must use the same

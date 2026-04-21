@@ -844,6 +844,12 @@ def apply_findings_to_blob(
                 pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
             )
         secret_map.update(trufflehog_map)
+        # Note on loop termination: once trufflehog_map is non-empty the
+        # `not secret_map` guard never fires, so the pass loop now
+        # relies on the `pass_count == 0 and pass_num > 0` guard below
+        # to exit. That guard still works because the second pass's
+        # `_apply_redaction_set` finds nothing to replace (the raws are
+        # already gone from the blob) and returns 0.
         if not secret_map:
             break
 
