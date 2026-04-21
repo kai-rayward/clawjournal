@@ -688,3 +688,24 @@ def test_fetch_vendor_line_handles_utf8(tmp_path):
     result = fetch_vendor_line(path, 0)
     assert result is not None
     assert json.loads(result) == payload
+
+
+def test_fetch_vendor_line_enforces_safety_cap(tmp_path, monkeypatch):
+    """A file with no newline within the safety cap returns None rather
+    than reading the whole blob into memory."""
+    from clawjournal.events import view as view_module
+
+    monkeypatch.setattr(view_module, "_MAX_LINE_BYTES", 8)
+    path = tmp_path / "huge.jsonl"
+    # 32 bytes with no newline — well past the 8-byte cap.
+    path.write_bytes(b"x" * 32)
+    assert fetch_vendor_line(path, 0) is None
+
+
+def test_fetch_vendor_line_short_line_under_cap_still_works(tmp_path, monkeypatch):
+    from clawjournal.events import view as view_module
+
+    monkeypatch.setattr(view_module, "_MAX_LINE_BYTES", 1024)
+    path = tmp_path / "small.jsonl"
+    path.write_bytes(b'{"ok":1}\n')
+    assert fetch_vendor_line(path, 0) == '{"ok":1}'

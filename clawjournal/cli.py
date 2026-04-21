@@ -3211,6 +3211,14 @@ def main() -> None:
     events_inspect.add_argument("--session", help="session_key (with --event-key)")
     events_inspect.add_argument("--event-key", dest="event_key", help="event_key (with --session)")
     events_inspect.add_argument("--json", action="store_true", help="Output structured JSON")
+    events_inspect.add_argument(
+        "--truncate",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Truncate raw_json / payload_json / vendor line to N chars "
+             "(default: 1024 in human mode, no truncation in --json mode)",
+    )
 
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
@@ -3901,8 +3909,11 @@ def _run_events(args) -> None:
     )
 
 
+_INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024
+
+
 def _run_events_inspect(args) -> None:
-    from .events import CAPABILITY_MATRIX, ensure_view_schema, fetch_vendor_line
+    from .events import CAPABILITY_MATRIX, ensure_view_schema
     from .events.schema import ensure_schema as ensure_events_schema
     from .workbench.index import open_index
 
@@ -3941,11 +3952,41 @@ def _run_events_inspect(args) -> None:
     finally:
         conn.close()
 
+    _apply_inspect_truncation(payload, _effective_truncate(args))
+
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True, default=str))
         return
 
     _print_inspect_human(payload)
+
+
+def _effective_truncate(args) -> int | None:
+    """Return the truncation limit in chars, or None for unlimited.
+
+    - `--truncate 0` means unlimited (explicit opt-out).
+    - `--truncate N` (N>0) always truncates.
+    - No flag: human mode defaults to 1024; --json defaults to unlimited.
+    """
+    if args.truncate is not None:
+        return None if args.truncate <= 0 else args.truncate
+    return None if args.json else _INSPECT_HUMAN_DEFAULT_TRUNCATE
+
+
+def _apply_inspect_truncation(payload: dict, limit: int | None) -> None:
+    if limit is None:
+        return
+    payload["raw_json"] = _truncate_str(payload.get("raw_json"), limit)
+    override = payload.get("override")
+    if override is not None:
+        override["payload_json"] = _truncate_str(override.get("payload_json"), limit)
+    payload["vendor_line"] = _truncate_str(payload.get("vendor_line"), limit)
+
+
+def _truncate_str(value, limit: int):
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f" … [truncated at {limit} of {len(value)} chars]"
 
 
 def _inspect_by_event_id(conn, event_id: int):
@@ -4045,18 +4086,19 @@ def _override_payload(override: dict) -> dict:
 
 
 def _payload_for_base_and_override(base: dict, override):
+    override_applied = override is not None and _override_wins_base(base, override)
     payload = {
         "id": base["id"],
         "session_id": base["session_id"],
         "session_key": base["session_key"],
         "client": base["client"],
-        "type": base["type"],
+        "type": override["type"] if override_applied else base["type"],
         "event_key": base["event_key"],
-        "event_at": base["event_at"],
+        "event_at": override["event_at"] if override_applied else base["event_at"],
         "ingested_at": base["ingested_at"],
-        "source": base["source"],
-        "confidence": base["confidence"],
-        "lossiness": base["lossiness"],
+        "source": override["source"] if override_applied else base["source"],
+        "confidence": override["confidence"] if override_applied else base["confidence"],
+        "lossiness": override["lossiness"] if override_applied else base["lossiness"],
         "raw_json": base["raw_json"],
         "raw_ref": [base["source_path"], base["source_offset"], base["seq"]],
         "override": _override_payload(override) if override is not None else None,
@@ -4065,8 +4107,19 @@ def _payload_for_base_and_override(base: dict, override):
     return payload
 
 
+def _override_wins_base(base: dict, override: dict) -> bool:
+    from .events import CONFIDENCE_RANK
+
+    return (
+        CONFIDENCE_RANK.get(override["confidence"], 0)
+        >= CONFIDENCE_RANK.get(base["confidence"], 0)
+    )
+
+
 def _capability_reason(matrix, client: str, event_type: str) -> str:
-    supported, reason = matrix.get((client, event_type), (False, "missing"))
+    supported, reason = matrix.get(
+        (client, event_type), (False, "not emitted by this client")
+    )
     prefix = "emitted" if supported else "NOT emitted"
     return f"{prefix} by {client} ({reason})"
 
@@ -4074,6 +4127,7 @@ def _capability_reason(matrix, client: str, event_type: str) -> str:
 def _resolve_vendor_line_text(conn, source_path: str, source_offset: int, seq: int):
     # First try a bundle-imported snippet store if it exists; 07 will
     # own the table, so tolerate the table being absent today.
+    import sqlite3 as _sqlite3
     try:
         row = conn.execute(
             """
@@ -4084,7 +4138,8 @@ def _resolve_vendor_line_text(conn, source_path: str, source_offset: int, seq: i
         ).fetchone()
         if row is not None:
             return row[0]
-    except Exception:
+    except _sqlite3.OperationalError:
+        # Table doesn't exist yet (07 owns it); fall through.
         pass
     from .events import fetch_vendor_line
     return fetch_vendor_line(source_path, source_offset)
@@ -4118,6 +4173,17 @@ def _print_inspect_human(payload: dict) -> None:
     print(f"capability {payload['capability']}")
     print()
 
+    raw_json = payload.get("raw_json")
+    if raw_json is not None:
+        print("raw_json:")
+        _print_indented_text(raw_json)
+        print()
+
+    if override is not None:
+        print("override payload:")
+        _print_indented_text(override["payload_json"])
+        print()
+
     if payload.get("hook_only"):
         print("vendor line:")
         print("  (no vendor base — hook-originated)")
@@ -4129,6 +4195,12 @@ def _print_inspect_human(payload: dict) -> None:
         print("  (source file no longer on disk)")
     else:
         print(f"  {vendor_line}")
+
+
+def _print_indented_text(text: str) -> None:
+    lines = str(text).splitlines() or [""]
+    for line in lines:
+        print(f"  {line}")
 
 
 def _generate_pii_findings(file_path: Path, output_path: Path, provider: str, min_confidence: float = 0.0, backend: str = "auto") -> dict[str, Any]:

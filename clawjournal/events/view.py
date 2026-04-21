@@ -33,7 +33,6 @@ from clawjournal.events.capabilities import CAPABILITY_MATRIX
 from clawjournal.events.types import (
     CONFIDENCE_RANK,
     EVENT_TYPES,
-    VALID_CONFIDENCE,
     VALID_LOSSINESS,
     VALID_SOURCES,
 )
@@ -227,7 +226,11 @@ def canonical_events(
     - Overrides whose event_key never appears on a base row emit as
       hook-only CanonicalEvents (raw_json=None, raw_ref=None).
     - `prefer_source` filters base rows before dedup (e.g.
-      "claude-jsonl" drops LA duplicates).
+      "claude-jsonl" drops LA duplicates). Note: if `prefer_source`
+      filters out a base row that had a matching override, the override
+      will emit as hook-only (no base in scope to merge raw_json against).
+      Callers wanting override-promoted rows across all sources should
+      either leave `prefer_source` unset or accept this asymmetry.
     """
     overrides = {row["event_key"]: dict(row) for row in conn.execute(_OVERRIDE_SELECT, (session_id,))}
 
@@ -383,6 +386,7 @@ def capability_join(conn: sqlite3.Connection, session_id: int) -> list[Capabilit
 
 
 _FETCH_CHUNK = 65_536
+_MAX_LINE_BYTES = 16 * 1024 * 1024  # safety cap — real vendor lines are KB-sized
 
 
 def fetch_vendor_line(source_path: str | Path, source_offset: int) -> str | None:
@@ -393,7 +397,9 @@ def fetch_vendor_line(source_path: str | Path, source_offset: int) -> str | None
     - the offset is past EOF;
     - no terminating newline exists between source_offset and EOF
       (partial trailing line — matches 01's "skip incomplete lines"
-      semantics).
+      semantics);
+    - the line would exceed `_MAX_LINE_BYTES` (defends against a
+      corrupted or adversarial file where no newline ever appears).
 
     Does NOT detect rotation / replacement — the file at source_path may
     have been swapped since the event was ingested. Phase 1 accepts this
@@ -408,15 +414,18 @@ def fetch_vendor_line(source_path: str | Path, source_offset: int) -> str | None
                 block = f.read(_FETCH_CHUNK)
                 if not block:
                     return None  # partial line — EOF with no newline
-                chunks.append(block)
                 newline_pos = block.find(b"\n")
                 if newline_pos >= 0:
+                    chunks.append(block)
                     absolute_newline = total + newline_pos
                     complete = b"".join(chunks)[:absolute_newline]
                     if complete.endswith(b"\r"):
                         complete = complete[:-1]
                     return complete.decode("utf-8", errors="replace")
                 total += len(block)
+                if total > _MAX_LINE_BYTES:
+                    return None  # pathological: no newline within safety cap
+                chunks.append(block)
     except (FileNotFoundError, IsADirectoryError):
         return None
     except OSError:
