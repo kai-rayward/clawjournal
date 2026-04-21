@@ -2901,8 +2901,39 @@ def get_share_ready_stats(
     five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
     five_star_recent = [s for s in five_star if _is_recent(s.get("start_time"))]
     five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
-    # Recent first, then older 5-star to top up; never pad below 5 stars.
-    recommended_pool = five_star_recent + five_star_older
+    recommended_pool = list(five_star_recent)
+
+    # Widen the recent slot when the approved pool is thin: any 5-star
+    # session from the last 7 days, even if it's still ``review_status=
+    # 'new'``. Package auto-approves on the way through, so including
+    # unreviewed-but-high-score recent work surfaces what the user
+    # actually just did instead of showing the same stale 5-star
+    # approved sessions week after week.
+    if len(recommended_pool) < 5:
+        seen_ids = {s["session_id"] for s in recommended_pool}
+        for session in sessions:
+            if len(recommended_pool) >= 5:
+                break
+            if session.get("ai_quality_score") != 5:
+                continue
+            if not _is_recent(session.get("start_time")):
+                continue
+            if session["session_id"] in seen_ids:
+                continue
+            recommended_pool.append(session)
+            seen_ids.add(session["session_id"])
+
+    # Older approved 5-star as final backfill if we still aren't at 5.
+    if len(recommended_pool) < 5:
+        seen_ids = {s["session_id"] for s in recommended_pool}
+        for session in five_star_older:
+            if len(recommended_pool) >= 5:
+                break
+            if session["session_id"] in seen_ids:
+                continue
+            recommended_pool.append(session)
+            seen_ids.add(session["session_id"])
+
     recommended_ids = [s["session_id"] for s in recommended_pool[:5]]
 
     return {

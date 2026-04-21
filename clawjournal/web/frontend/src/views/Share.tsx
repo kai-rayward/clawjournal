@@ -555,7 +555,7 @@ export function Share() {
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
-        api.sessions.list({ status: 'new', sort: 'ai_quality_score', order: 'desc', limit: 10 })
+        api.sessions.list({ status: 'new', sort: 'start_time', order: 'desc', limit: 10 })
           .then(setCandidates)
           .catch(() => setCandidates([]));
       }
@@ -609,7 +609,7 @@ export function Share() {
     api.shareReady({ includeUnapproved: true }).then((stats) => {
       setReadyStats(stats);
       if (stats.sessions.length === 0) {
-        api.sessions.list({ status: 'new', sort: 'ai_quality_score', order: 'desc', limit: 10 })
+        api.sessions.list({ status: 'new', sort: 'start_time', order: 'desc', limit: 10 })
           .then(setCandidates)
           .catch(() => { });
       } else {

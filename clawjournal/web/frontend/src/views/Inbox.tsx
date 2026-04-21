@@ -109,7 +109,7 @@ export function Inbox() {
   const [offset, setOffset] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Record<string, Array<{ role: string; content: string; tool_uses?: Array<{ tool: string }> }>>>({});
-  const [sort, setSort] = useState('ai_quality_score:desc');
+  const [sort, setSort] = useState('start_time:desc');
   const [showFilters, setShowFilters] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
@@ -284,8 +284,8 @@ export function Inbox() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
-            <option value="ai_quality_score:desc">Best first</option>
             <option value="start_time:desc">Newest first</option>
+            <option value="ai_quality_score:desc">Best first</option>
             <option value="start_time:asc">Oldest first</option>
           </select>
           <button
