@@ -73,6 +73,14 @@ pipx install clawjournal        # or: pip install clawjournal
 
 Requires Python 3.10+. `pipx` is preferred because it isolates the CLI in its own environment and puts `clawjournal` on your `PATH`. The PyPI wheel already includes the pre-built browser workbench — no frontend build required.
 
+**TruffleHog (required for sharing):**
+
+```bash
+brew install trufflehog      # macOS; Linux/Windows: see upstream installer
+```
+
+Every `bundle-export` and `share` runs an independent secrets scan on the redacted output before the export is considered complete. Exports are blocked if TruffleHog is missing or finds anything. See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
+
 ### 2. Configure
 
 Tell ClawJournal which agents' sessions to scan and what to exclude or redact.

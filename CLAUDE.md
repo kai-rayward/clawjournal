@@ -56,6 +56,7 @@ ClawJournal is a local-first tool that scans coding-agent session logs, indexes 
 - **Redaction runs twice on the share path.** Regex redaction is always applied on export, independently of the scan-time findings pipeline. AI-PII review is an additional layer on top, done at share time — it is not a substitute for the deterministic layers.
 - **Anonymization happens before any AI call.** Home-dir paths and usernames are stripped locally before scoring or AI-PII review sends anything to a backend.
 - **Appending config flags.** `--exclude`, `--redact`, `--redact-usernames` append rather than overwrite; preserve this behavior in any config edits.
+- **Mandatory TruffleHog post-redaction gate.** `clawjournal/redaction/trufflehog.py` is invoked from `export_share_to_disk` (and re-invoked from the daemon upload path after the PII rewrite). Any finding or missing binary blocks the share; manifest gains `blocked=true` + `block_reason` and `shares.status` is not advanced. TruffleHog is AGPL-3.0 — we invoke it as a subprocess only, never link in-process. Tests bypass via the autouse fixture in `tests/conftest.py` which sets `CLAWJOURNAL_SKIP_TRUFFLEHOG=1`.
 
 ### Skills + plugin wrapper
 

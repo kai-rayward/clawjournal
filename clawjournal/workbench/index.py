@@ -2868,6 +2868,38 @@ def export_share_to_disk(
         "by_type": redaction_types,
     }
 
+    # Mandatory post-redaction scan — independent oracle against our
+    # own redactor. Any finding (or missing binary) blocks the share.
+    from ..redaction import trufflehog as trufflehog_scanner
+
+    try:
+        trufflehog_report = trufflehog_scanner.scan_file(sessions_file)
+    except RuntimeError as exc:
+        trufflehog_report = trufflehog_scanner.TruffleHogReport(
+            scanned_path=str(sessions_file),
+            scanned_sha256="",
+            binary_missing=False,
+        )
+        manifest["trufflehog_error"] = str(exc)
+    trufflehog_scanner.write_report(export_dir / "trufflehog.json", trufflehog_report)
+    manifest["redaction_summary"]["trufflehog"] = trufflehog_report.summary()
+
+    if trufflehog_report.blocking:
+        manifest["blocked"] = True
+        manifest["block_reason"] = trufflehog_report.block_reason
+        manifest["block_message"] = trufflehog_scanner.format_block_message(trufflehog_report)
+        with open(export_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        # Record the block on the share row so the UI can surface it,
+        # but do NOT advance status to shared/exported — that would
+        # silently imply the share is clean.
+        conn.execute(
+            "UPDATE shares SET manifest = ? WHERE share_id = ?",
+            (json.dumps(manifest, default=str), share_id),
+        )
+        conn.commit()
+        return export_dir, manifest
+
     with open(export_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, default=str)
 

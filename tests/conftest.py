@@ -5,6 +5,17 @@ import pytest
 from clawjournal.redaction.anonymizer import Anonymizer
 
 
+@pytest.fixture(autouse=True)
+def _bypass_trufflehog_by_default(monkeypatch):
+    """TruffleHog is a mandatory share-time gate in production, but most
+    tests don't have the binary installed and shouldn't depend on it.
+    Default every test to the bypass path; tests that exercise the
+    gate itself do ``monkeypatch.delenv("CLAWJOURNAL_SKIP_TRUFFLEHOG",
+    raising=False)`` and mock the subprocess.
+    """
+    monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")
+
+
 @pytest.fixture
 def sample_user_entry():
     """Realistic JSONL user entry dict."""

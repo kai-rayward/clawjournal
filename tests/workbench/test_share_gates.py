@@ -225,3 +225,108 @@ class TestExportManifestRedactions:
         assert "[REDACTED_EMAIL]" in body
         assert "[REDACTED_JWT]" in body
         assert n >= 2
+
+
+class TestTruffleHogGate:
+    """The post-redaction TruffleHog scan is mandatory on every share
+    export. These tests disable the test-suite-wide bypass and mock
+    the scan to cover the three gate outcomes (clean / findings /
+    missing binary)."""
+
+    def _share(self, conn):
+        sess = _settled_session("sess-1")
+        upsert_sessions(conn, [sess])
+        raw = scan_session_for_findings(sess)
+        write_findings_to_db(conn, "sess-1", raw, revision="v1:t")
+        conn.execute(
+            "UPDATE sessions SET findings_revision='v1:t' WHERE session_id='sess-1'"
+        )
+        conn.commit()
+        share_id = create_share(conn, ["sess-1"], note="t")
+        return share_id, get_share(conn, share_id)
+
+    def test_clean_scan_advances_share_status(self, conn, monkeypatch):
+        from clawjournal.redaction import trufflehog as trufflehog_scanner
+        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+
+        def fake_scan(path):
+            return trufflehog_scanner.TruffleHogReport(
+                scanned_path=str(path), scanned_sha256="sha256:0",
+            )
+
+        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
+        share_id, share = self._share(conn)
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+        status_row = conn.execute(
+            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
+        ).fetchone()
+        assert status_row["status"] in ("shared", "exported")
+        th = manifest["redaction_summary"]["trufflehog"]
+        assert th["findings"] == 0
+        assert (export_dir / "trufflehog.json").exists()
+
+    def test_findings_block_and_do_not_advance_status(self, conn, monkeypatch):
+        from clawjournal.redaction import trufflehog as trufflehog_scanner
+        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+
+        def fake_scan(path):
+            return trufflehog_scanner.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+                findings=[
+                    trufflehog_scanner.TruffleHogFinding(
+                        detector="GitHub", status="verified",
+                        line=3, masked="ghp_a***4567",
+                        raw_sha256="sha256:x",
+                    )
+                ],
+                verified=1,
+                top_detectors=["GitHub"],
+            )
+
+        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
+        share_id, share = self._share(conn)
+        pre_status_row = conn.execute(
+            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
+        ).fetchone()
+        pre_status = pre_status_row["status"]
+
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+        assert export_dir is not None
+        assert manifest["blocked"] is True
+        assert manifest["block_reason"] == "trufflehog-findings"
+        assert "ghp_a***4567" in manifest["block_message"]
+        # Status must not advance — the share is not clean.
+        post_status_row = conn.execute(
+            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
+        ).fetchone()
+        assert post_status_row["status"] == pre_status
+        # Export dir preserved for debugging; report on disk.
+        assert (export_dir / "sessions.jsonl").exists()
+        assert (export_dir / "trufflehog.json").exists()
+        # Manifest-on-disk matches the returned manifest (blocked=true).
+        disk = json.loads((export_dir / "manifest.json").read_text())
+        assert disk["blocked"] is True
+
+    def test_missing_binary_blocks_with_install_hint(self, conn, monkeypatch):
+        from clawjournal.redaction import trufflehog as trufflehog_scanner
+        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog_scanner, "is_available", lambda: False)
+
+        share_id, share = self._share(conn)
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+        assert manifest["blocked"] is True
+        assert manifest["block_reason"] == "trufflehog-not-installed"
+        assert "brew install trufflehog" in manifest["block_message"]
+
+    def test_bypass_env_var_recorded_in_manifest(self, conn):
+        # Autouse fixture sets the bypass var — verify the manifest
+        # records the bypass so reviewers can tell scanned shares from
+        # bypassed ones.
+        share_id, share = self._share(conn)
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+        assert manifest.get("blocked") is not True
+        th = manifest["redaction_summary"]["trufflehog"]
+        assert th["bypassed"] is True

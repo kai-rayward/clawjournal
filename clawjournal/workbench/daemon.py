@@ -631,6 +631,16 @@ def upload_share(
     if not sessions_file.exists():
         return {"error": "Export failed — no sessions file.", "status": 500}
 
+    # Pre-PII TruffleHog scan already ran inside export_share_to_disk —
+    # if that stage blocked, fail closed before we do any additional work.
+    if manifest.get("blocked"):
+        return {
+            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+            "block_reason": manifest.get("block_reason"),
+            "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+            "status": 422,
+        }
+
     # Mandatory PII redaction pass — applied to ALL sessions before upload.
     # This catches names, orgs, usernames, etc. that regex-based secret
     # redaction misses.  No session cap: every session gets reviewed.
@@ -673,6 +683,40 @@ def upload_share(
             "full": coverage_full,
             "rules_only": coverage_rules_only,
         }
+
+    # Post-PII TruffleHog re-scan: the PII pass rewrote sessions.jsonl,
+    # so the scan embedded in the manifest by export_share_to_disk is
+    # stale. Run the gate again on the file that's actually about to
+    # leave this machine.
+    try:
+        from ..redaction import trufflehog as trufflehog_scanner
+
+        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
+    except RuntimeError as exc:
+        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
+        return {
+            "error": "Post-redaction scan failed — upload aborted.",
+            "detail": str(exc),
+            "status": 500,
+        }
+    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
+    if manifest and isinstance(manifest.get("redaction_summary"), dict):
+        manifest["redaction_summary"]["trufflehog_post_pii"] = post_pii_report.summary()
+    if post_pii_report.blocking:
+        if manifest:
+            manifest["blocked"] = True
+            manifest["block_reason"] = post_pii_report.block_reason
+            manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
+            with open(manifest_file, "w") as f:
+                json.dump(manifest, f, indent=2, default=str)
+        return {
+            "error": trufflehog_scanner.format_block_message(post_pii_report),
+            "block_reason": post_pii_report.block_reason,
+            "trufflehog_summary": post_pii_report.summary(),
+            "status": 422,
+        }
+
+    if manifest and isinstance(manifest.get("redaction_summary"), dict):
         with open(manifest_file, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
 
@@ -1761,6 +1805,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "output_path must be under home directory or /tmp"}, 400)
                 return
 
+            if manifest.get("blocked"):
+                _json_response(self, {
+                    "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+                    "block_reason": manifest.get("block_reason"),
+                    "export_path": str(export_dir),
+                    "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+                }, 422)
+                return
+
             _json_response(self, {
                 "ok": True,
                 "export_path": str(export_dir),
@@ -1791,6 +1844,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             )
             if export_dir is None:
                 _json_response(self, {"error": "Failed to prepare download"}, 500)
+                return
+
+            if _manifest.get("blocked"):
+                _json_response(self, {
+                    "error": _manifest.get("block_message") or "Share blocked by TruffleHog",
+                    "block_reason": _manifest.get("block_reason"),
+                    "trufflehog_summary": _manifest.get("redaction_summary", {}).get("trufflehog"),
+                }, 422)
                 return
 
             sessions_content = (export_dir / "sessions.jsonl").read_text()
