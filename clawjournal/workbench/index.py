@@ -1620,7 +1620,20 @@ def query_sessions(
     sql = base
     for clause in where_clauses:
         sql += f" AND {clause}"
-    sql += f" ORDER BY s.{sort} {order.upper()} LIMIT ? OFFSET ?"
+    # "Best first" should really mean "recent 5-star first, then lower
+    # scores, then unscored at the bottom" — a lone ``ORDER BY
+    # ai_quality_score DESC`` puts NULLs at the TOP in SQLite (NULL >
+    # any value when descending) AND shuffles old 5-star sessions over
+    # new ones arbitrarily. The composite tiebreak fixes both:
+    # non-NULL first, then score DESC, then newest within each score.
+    if sort == "ai_quality_score":
+        sql += (
+            " ORDER BY (s.ai_quality_score IS NULL), "
+            f"s.ai_quality_score {order.upper()}, "
+            "s.start_time DESC LIMIT ? OFFSET ?"
+        )
+    else:
+        sql += f" ORDER BY s.{sort} {order.upper()} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     rows = conn.execute(sql, params).fetchall()
