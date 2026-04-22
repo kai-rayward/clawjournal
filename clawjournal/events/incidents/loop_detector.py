@@ -494,29 +494,43 @@ def _serialize_fingerprint(fingerprint: tuple) -> list:
     """Project an in-memory fingerprint tuple into the form stored in
     `incidents.evidence_json`.
 
-    The live fingerprint carries an outcome-availability marker plus
-    the normalized paired-`tool_result` text as its last element so
-    run-grouping can compare both availability and content. That text
-    is derived from `events.raw_json` and has NOT been through the
-    workbench regex/PII redaction pipeline — persisting it verbatim in
-    `evidence_json` would smuggle secrets past any consumer that reads
-    incidents without re-redacting. We replace the outcome with a
-    truncated sha256 so grouping + audit still work without leaking the
-    payload; the full text remains reachable via `first_event_id` /
-    `last_event_id` through the normal redaction paths.
+    The live fingerprint carries raw command / tool args plus the
+    normalized paired-`tool_result` text. None of those slots have been
+    through the workbench redaction pipeline, so persisting them
+    verbatim in `evidence_json` would leak sensitive input or output to
+    any consumer that reads incidents directly. We keep only the
+    structural markers (`event_type`, outcome availability) in cleartext
+    and replace every comparison slot with a truncated sha256 so audit +
+    grouping remain possible without storing raw payloads; the original
+    text stays reachable via `first_event_id` / `last_event_id` through
+    the normal redaction paths.
     """
     if not fingerprint:
         return []
-    out = list(fingerprint)
+    out: list[Any] = [fingerprint[0]]
     availability = _fingerprint_outcome_state(fingerprint)
-    outcome = out[-1]
-    if isinstance(outcome, str):
-        if availability == _OUTCOME_MISSING:
-            out[-1] = ""  # preserve the "no outcome available" signal
-        else:
-            digest = hashlib.sha256(outcome.encode("utf-8")).hexdigest()[:16]
-            out[-1] = f"sha256:{digest}"
+    state_index = len(fingerprint) - 2
+    outcome_index = len(fingerprint) - 1
+    for index, value in enumerate(fingerprint[1:], start=1):
+        if index == state_index:
+            out.append(value)
+            continue
+        if index == outcome_index and availability == _OUTCOME_MISSING:
+            out.append("")  # preserve the "no outcome available" signal
+            continue
+        out.append(_hashed_fingerprint_slot(value))
     return out
+
+
+def _hashed_fingerprint_slot(value: object) -> str:
+    if value == "":
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        text = _canonical_args(value)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
 
 
 def _fingerprint_has_observed_outcome(fingerprint: tuple) -> bool:

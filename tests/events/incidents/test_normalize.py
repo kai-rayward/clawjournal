@@ -37,6 +37,22 @@ def test_strips_user_rooted_path():
     assert "<PATH>" in out
 
 
+def test_strips_user_rooted_path_with_spaces_inside_quotes():
+    out = normalize_outcome_text(
+        "ENOENT: no such file '/Users/kai/My Project/build/output.log'"
+    )
+    assert "/Users/kai/My Project/build/output.log" not in out
+    assert "<PATH>" in out
+
+
+def test_strips_user_rooted_path_with_spaces_in_intermediate_segments():
+    out = normalize_outcome_text(
+        "cannot read /Users/kai/Library/Application Support/Claude/logs.json"
+    )
+    assert "/Users/kai/Library/Application Support/Claude/logs.json" not in out
+    assert "<PATH>" in out
+
+
 def test_strips_linux_home_and_tmp_paths():
     out = normalize_outcome_text(
         "wrote /home/alice/x.log and /tmp/scratch/output"

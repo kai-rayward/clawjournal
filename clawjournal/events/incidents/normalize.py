@@ -35,10 +35,16 @@ _ISO_TIMESTAMP = re.compile(
     r"(?:Z|[+-]\d{2}:?\d{2})?\b"
 )
 
-# 2. Absolute paths under user-rooted prefixes. Matches the leading slash
-# and continues until whitespace, quote, or terminating punctuation.
+# 2. Absolute paths under user-rooted prefixes. Handles the common
+# unquoted case plus quoted paths whose segments contain spaces.
+_PATH_PLAIN_SEGMENT = r"[^/\s\"'<>(){}\[\],;]+"
+_PATH_SPACED_SEGMENT = rf"{_PATH_PLAIN_SEGMENT}(?: {_PATH_PLAIN_SEGMENT})*"
 _HOME_ROOTED_PATH = re.compile(
-    r"/(?:Users|home|var|private|tmp)/[^\s\"'<>(){}\[\],;]+"
+    rf"(?:"
+    rf"(?<=[\"'`])/(?:Users|home|var|private|tmp)/[^\"'`]+(?=[\"'`])"
+    rf"|"
+    rf"/(?:Users|home|var|private|tmp)/(?:{_PATH_SPACED_SEGMENT}/)*{_PATH_PLAIN_SEGMENT}"
+    rf")"
 )
 
 # 3a. `pid 12345`, `PID: 12345`, `process 12345`

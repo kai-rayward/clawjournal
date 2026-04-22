@@ -1478,6 +1478,56 @@ def test_evidence_json_hashes_outcome_text_instead_of_storing_it(conn):
     assert len(outcome_token) == len("sha256:") + 16
 
 
+def test_evidence_json_hashes_command_and_args_slots(conn):
+    sid = _insert_session(conn, session_key="s:secret-command", client="claude")
+    secret = "Bearer sk-live-secret-token"
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command=f"curl -H 'Authorization: {secret}' https://example.test",
+            output="HTTP 401",
+        )
+
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT evidence_json FROM incidents WHERE session_id = ?", (sid,)
+    ).fetchone()
+    evidence_text = row["evidence_json"]
+    assert secret not in evidence_text
+    evidence = json.loads(evidence_text)
+    assert evidence["fingerprint"][1].startswith("sha256:")
+    assert evidence["fingerprint"][2].startswith("sha256:")
+
+
+def test_evidence_json_hashes_tool_call_identity_slots(conn):
+    sid = _insert_session(conn, session_key="s:secret-tool-args", client="claude")
+    secret = "sk-live-write-file"
+    for i in range(DEFAULT_TOOL_CALL_THRESHOLD):
+        _claude_tool_call(
+            conn,
+            session_id=sid,
+            tool_id=f"tc-{i}",
+            name="write_file",
+            args={
+                "path": "/tmp/out.txt",
+                "content": f"token={secret}",
+            },
+            result="ok",
+        )
+
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT evidence_json FROM incidents WHERE session_id = ?", (sid,)
+    ).fetchone()
+    evidence_text = row["evidence_json"]
+    assert secret not in evidence_text
+    evidence = json.loads(evidence_text)
+    assert evidence["fingerprint"][1].startswith("sha256:")
+    assert evidence["fingerprint"][2].startswith("sha256:")
+
+
 def test_claude_bash_description_and_timeout_drift_still_count_as_loop(conn):
     """Claude's Bash `input` carries `description`, `timeout`, and
     `run_in_background` alongside `command`. Those fields drift between
