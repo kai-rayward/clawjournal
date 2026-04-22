@@ -3,11 +3,10 @@
 The driver mirrors the cost ledger pattern (`events/cost/ingest.py`):
 
 - A `loop_ingest_state` cursor tracks the highest `events.id` we've
-  evaluated plus the latest `(event_overrides.created_at, session_id,
-  event_key)` frontier we've seen, so re-running with no new events or
-  overrides is a no-op. The tuple tiebreaker is VACUUM-stable — unlike
-  SQLite's implicit rowid, `session_id` and `event_key` can't be
-  renumbered.
+  evaluated plus the latest accepted `event_overrides.write_seq` we've
+  seen, so re-running with no new events or overrides is a no-op. The
+  cursor also stores the matching `(created_at, session_id, event_key)`
+  snapshot for debugging / inspection.
 - Every session that gained a new event since the last run gets its
   full event list re-evaluated by `detect_session_loops`. Recomputing
   the whole session is necessary because a new repeat can extend a
@@ -68,6 +67,7 @@ class LoopIngestSummary:
 @dataclass(frozen=True)
 class LoopIngestCursor:
     last_event_id: int
+    last_override_write_seq: int = 0
     last_override_created_at: str | None = None
     last_override_session_id: int = 0
     last_override_event_key: str = ""
@@ -80,14 +80,10 @@ SELECT DISTINCT session_id, COUNT(*) AS new_event_count
  GROUP BY session_id
 """
 
-# Row-value tuple comparison: pick up every override strictly greater
-# than the cursor (created_at, session_id, event_key). `session_id` +
-# `event_key` are VACUUM-stable tiebreakers for same-`created_at`
-# writes.
 _SELECT_NEW_OVERRIDE_SESSIONS_SQL = """
 SELECT DISTINCT session_id, COUNT(*) AS new_override_count
   FROM event_overrides
- WHERE (created_at, session_id, event_key) > (?, ?, ?)
+ WHERE write_seq > ?
  GROUP BY session_id
 """
 
@@ -96,14 +92,15 @@ SELECT COALESCE(MAX(id), 0) AS max_id FROM events
 """
 
 _SELECT_MAX_OVERRIDE_CURSOR_SQL = """
-SELECT created_at, session_id, event_key
+SELECT write_seq, created_at, session_id, event_key
   FROM event_overrides
- ORDER BY created_at DESC, session_id DESC, event_key DESC
+ ORDER BY write_seq DESC
  LIMIT 1
 """
 
 _SELECT_LAST_CURSOR_SQL = """
 SELECT last_event_id,
+       last_override_write_seq,
        last_override_created_at,
        last_override_session_id,
        last_override_event_key
@@ -115,13 +112,15 @@ _UPSERT_CURSOR_SQL = """
 INSERT INTO loop_ingest_state (
     consumer_id,
     last_event_id,
+    last_override_write_seq,
     last_override_created_at,
     last_override_session_id,
     last_override_event_key
 )
-VALUES (?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(consumer_id) DO UPDATE SET
     last_event_id            = excluded.last_event_id,
+    last_override_write_seq  = excluded.last_override_write_seq,
     last_override_created_at = excluded.last_override_created_at,
     last_override_session_id = excluded.last_override_session_id,
     last_override_event_key  = excluded.last_override_event_key
@@ -179,11 +178,12 @@ def ingest_loop_incidents(
     conn.execute("BEGIN IMMEDIATE")
     try:
         cursor = (
-            LoopIngestCursor(0, None, 0, "")
+            LoopIngestCursor(0, 0, None, 0, "")
             if rebuild
             else _get_last_processed_cursor(conn)
         )
         last_event_id = cursor.last_event_id
+        last_override_write_seq = cursor.last_override_write_seq
         last_override_created_at = cursor.last_override_created_at
         last_override_session_id = cursor.last_override_session_id
         last_override_event_key = cursor.last_override_event_key
@@ -193,11 +193,7 @@ def ingest_loop_incidents(
         ).fetchall()
         new_override_rows = conn.execute(
             _SELECT_NEW_OVERRIDE_SESSIONS_SQL,
-            (
-                last_override_created_at or "",
-                last_override_session_id,
-                last_override_event_key,
-            ),
+            (last_override_write_seq,),
         ).fetchall()
         sessions_to_evaluate = sorted(
             {
@@ -221,10 +217,12 @@ def ingest_loop_incidents(
         max_override_cursor_row = conn.execute(
             _SELECT_MAX_OVERRIDE_CURSOR_SQL
         ).fetchone()
+        max_override_write_seq = 0
         max_override_created_at = None
         max_override_session_id = 0
         max_override_event_key = ""
         if max_override_cursor_row is not None:
+            max_override_write_seq = int(max_override_cursor_row["write_seq"] or 0)
             max_override_created_at = max_override_cursor_row["created_at"]
             max_override_session_id = int(max_override_cursor_row["session_id"])
             max_override_event_key = max_override_cursor_row["event_key"]
@@ -266,6 +264,7 @@ def ingest_loop_incidents(
 
         if (
             max_event_id > last_event_id
+            or max_override_write_seq != last_override_write_seq
             or max_override_created_at != last_override_created_at
             or max_override_session_id != last_override_session_id
             or max_override_event_key != last_override_event_key
@@ -276,6 +275,7 @@ def ingest_loop_incidents(
                 (
                     LOOP_CONSUMER_ID,
                     max_event_id,
+                    max_override_write_seq,
                     max_override_created_at,
                     max_override_session_id,
                     max_override_event_key,
@@ -302,9 +302,10 @@ def rebuild_loop_incidents(
 def _get_last_processed_cursor(conn: sqlite3.Connection) -> LoopIngestCursor:
     row = conn.execute(_SELECT_LAST_CURSOR_SQL, (LOOP_CONSUMER_ID,)).fetchone()
     if row is None:
-        return LoopIngestCursor(0, None, 0, "")
+        return LoopIngestCursor(0, 0, None, 0, "")
     return LoopIngestCursor(
         last_event_id=int(row["last_event_id"]),
+        last_override_write_seq=int(row["last_override_write_seq"] or 0),
         last_override_created_at=row["last_override_created_at"],
         last_override_session_id=int(row["last_override_session_id"] or 0),
         last_override_event_key=row["last_override_event_key"] or "",

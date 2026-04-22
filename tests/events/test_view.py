@@ -111,6 +111,57 @@ def test_ensure_view_schema_is_idempotent(conn):
         "SELECT name FROM sqlite_master WHERE type='index'"
     )}
     assert "idx_event_overrides_session" in indexes
+    assert "idx_event_overrides_write_seq" in indexes
+
+
+def test_ensure_view_schema_migrates_write_seq_in_place():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_events_schema(conn)
+    conn.executescript(
+        """
+        CREATE TABLE event_overrides (
+            session_id    INTEGER NOT NULL REFERENCES event_sessions(id) ON DELETE CASCADE,
+            event_key     TEXT    NOT NULL,
+            type          TEXT    NOT NULL,
+            source        TEXT    NOT NULL,
+            confidence    TEXT    NOT NULL,
+            lossiness     TEXT    NOT NULL,
+            event_at      TEXT,
+            payload_json  TEXT    NOT NULL,
+            origin        TEXT,
+            created_at    TEXT    NOT NULL,
+            PRIMARY KEY (session_id, event_key)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO event_sessions (session_key, client, status) VALUES (?, ?, ?)",
+        ("s:legacy-view", "claude", "active"),
+    )
+    conn.executemany(
+        """
+        INSERT INTO event_overrides (
+            session_id, event_key, type, source, confidence, lossiness,
+            event_at, payload_json, origin, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (1, "tool_call:a", "tool_call", "hook", "high", "none", TS0, "{}", None, TS0),
+            (1, "tool_call:b", "tool_call", "hook", "high", "none", TS1, "{}", None, TS1),
+        ],
+    )
+    conn.commit()
+
+    ensure_view_schema(conn)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(event_overrides)")}
+    assert "write_seq" in columns
+    rows = conn.execute(
+        "SELECT event_key, write_seq FROM event_overrides ORDER BY write_seq"
+    ).fetchall()
+    assert [row["event_key"] for row in rows] == ["tool_call:a", "tool_call:b"]
+    assert [row["write_seq"] for row in rows] == [1, 2]
 
 
 def test_ensure_view_schema_rejects_invalid_source_via_check(conn):
@@ -240,9 +291,11 @@ def test_write_hook_override_higher_rank_replaces(conn):
     assert write_hook_override(
         conn, confidence="low", payload_json='{"v": 1}', **common
     ) is True
-    first_created_at = conn.execute(
-        "SELECT created_at FROM event_overrides"
-    ).fetchone()[0]
+    first_row = conn.execute(
+        "SELECT created_at, write_seq FROM event_overrides"
+    ).fetchone()
+    first_created_at = first_row["created_at"]
+    first_write_seq = first_row["write_seq"]
     # Ensure the second write's wall-clock `created_at` is strictly
     # greater — microsecond-precision ISO timestamps need a brief
     # pause for the string to sort ahead of the first one.
@@ -251,13 +304,14 @@ def test_write_hook_override_higher_rank_replaces(conn):
         conn, confidence="high", payload_json='{"v": 2}', **common
     ) is True
     row = conn.execute(
-        "SELECT confidence, payload_json, created_at FROM event_overrides"
+        "SELECT confidence, payload_json, created_at, write_seq FROM event_overrides"
     ).fetchone()
     assert row["confidence"] == "high"
     assert row["payload_json"] == '{"v": 2}'
     # `created_at` must bump on a rank-winning overwrite so the loop-
     # detector cursor picks up the upgraded override as "new."
     assert row["created_at"] > first_created_at
+    assert row["write_seq"] > first_write_seq
 
 
 def test_write_hook_override_concurrent_writers_do_not_corrupt_state(tmp_path):

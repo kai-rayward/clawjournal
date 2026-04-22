@@ -9,12 +9,11 @@ Two tables, both alongside 02's `events` / `event_sessions` in
   key — re-running ingest updates the same row's `count` /
   `last_event_id` / `evidence_json` rather than inserting again.
 - `loop_ingest_state` — per-consumer cursor (consumer_id PK,
-  `last_event_id`, plus the `(created_at, session_id, event_key)`
-  frontier of `event_overrides` we've processed) so the loop detector
-  can advance only after the events and override writes it needs to
-  evaluate have actually landed. `session_id` + `event_key` break
-  `created_at` ties without relying on SQLite's implicit rowid (which
-  VACUUM may renumber).
+  `last_event_id`, plus the latest override write frontier we've
+  processed) so the loop detector can advance only after the events
+  and override writes it needs to evaluate have actually landed. The
+  cursor stores both the latest `write_seq` and the matching
+  `(created_at, session_id, event_key)` snapshot for debugging.
 """
 
 from __future__ import annotations
@@ -42,6 +41,7 @@ LOOP_INGEST_STATE_SQL = """
 CREATE TABLE IF NOT EXISTS loop_ingest_state (
     consumer_id                TEXT PRIMARY KEY,
     last_event_id              INTEGER NOT NULL,
+    last_override_write_seq    INTEGER NOT NULL DEFAULT 0,
     last_override_created_at   TEXT,
     last_override_session_id   INTEGER NOT NULL DEFAULT 0,
     last_override_event_key    TEXT    NOT NULL DEFAULT ''
@@ -58,6 +58,11 @@ def ensure_incidents_schema(conn: sqlite3.Connection) -> None:
     existing = {
         row[1] for row in conn.execute("PRAGMA table_info(loop_ingest_state)")
     }
+    if "last_override_write_seq" not in existing:
+        conn.execute(
+            "ALTER TABLE loop_ingest_state "
+            "ADD COLUMN last_override_write_seq INTEGER NOT NULL DEFAULT 0"
+        )
     if "last_override_created_at" not in existing:
         conn.execute(
             "ALTER TABLE loop_ingest_state ADD COLUMN last_override_created_at TEXT"

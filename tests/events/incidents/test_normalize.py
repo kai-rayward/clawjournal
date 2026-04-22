@@ -85,6 +85,10 @@ def test_strips_leading_and_trailing_whitespace():
     assert normalize_outcome_text("  hello  ") == "hello"
 
 
+def test_collapses_newline_only_reflow():
+    assert normalize_outcome_text("foo bar") == normalize_outcome_text("foo\nbar")
+
+
 @pytest.mark.parametrize(
     "first,second",
     [

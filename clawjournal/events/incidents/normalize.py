@@ -46,8 +46,8 @@ _PID_INLINE = re.compile(r"\b(pid|process)\s*[:=]?\s*\d+\b", re.IGNORECASE)
 # 3b. Bare `[12345]` style. Limited digit count to avoid eating GUIDs.
 _PID_BRACKETED = re.compile(r"\[(\d{2,7})\]")
 
-# 4. Runs of whitespace.
-_WHITESPACE_RUN = re.compile(r"[ \t\r\f\v]+")
+# 4. Runs of whitespace, including newline-only terminal reflow.
+_WHITESPACE_RUN = re.compile(r"\s+")
 
 PATH_PLACEHOLDER = "<PATH>"
 PID_PLACEHOLDER = "<PID>"

@@ -361,6 +361,80 @@ def test_compaction_event_breaks_the_run(conn):
     assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
 
 
+def test_hook_only_breaker_override_is_reinserted_chronologically(conn):
+    sid = _insert_session(conn, session_key="s:hook-breaker", client="claude")
+    for idx, event_at in enumerate(
+        (
+            "2026-04-21T10:00:00Z",
+            "2026-04-21T10:00:02Z",
+            "2026-04-21T10:00:04Z",
+        )
+    ):
+        tool_id = f"tu-{idx}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            event_key=f"command_start:{tool_id}",
+            event_at=event_at,
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        }
+                    ]
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="tool_result",
+            event_key=f"tool_result:{tool_id}",
+            event_at=event_at,
+            raw={
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": [{"type": "text", "text": "FAIL same"}],
+                        }
+                    ]
+                },
+            },
+        )
+
+    assert write_hook_override(
+        conn,
+        session_key="s:hook-breaker",
+        event_key="user_message:hook-1",
+        event_type="user_message",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at="2026-04-21T10:00:03Z",
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {"content": "please stop retrying"},
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    assert detect_session_loops(conn, sid) == []
+
+
 def test_distinct_outputs_do_not_count_as_a_loop(conn):
     """Same command with materially different output is NOT a loop —
     progress is being made."""
@@ -775,6 +849,54 @@ def test_codex_shell_command_loop_detected(conn):
     assert rows[0]["count"] == 3
 
 
+def test_codex_plain_text_shell_outputs_ignore_wall_time(conn):
+    sid = _insert_session(conn, session_key="s:codex-plain-shell-output", client="codex")
+    for i in range(3):
+        tool_id = f"call_{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="command_start",
+            event_key=f"command_start:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": tool_id,
+                    "arguments": json.dumps({"command": "npm test", "workdir": "/repo"}),
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="tool_result",
+            event_key=f"tool_result:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": tool_id,
+                    "output": (
+                        "Exit code: 1\n"
+                        f"Wall time: {i} seconds\n"
+                        "Output:\n"
+                        "FAIL identical\n"
+                    ),
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count, confidence FROM incidents").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 3
+    assert rows[0]["confidence"] == "high"
+
+
 def test_codex_exec_command_cmd_loop_detected(conn):
     sid = _insert_session(conn, session_key="s:codex-exec-command", client="codex")
     for i in range(3):
@@ -1010,6 +1132,206 @@ def test_claude_bash_execution_distinct_inline_outputs_do_not_count_as_loop(conn
                     "command": "npm test",
                     "output": f"FAIL iteration {i}",
                     "exitCode": 1,
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
+def test_empty_tool_results_keep_high_confidence(conn):
+    sid = _insert_session(conn, session_key="s:empty-output", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="true",
+            output="",
+        )
+
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT count, confidence FROM incidents WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+    assert row["count"] == 3
+    assert row["confidence"] == "high"
+
+
+def test_missing_tool_result_does_not_merge_with_empty_output(conn):
+    sid = _insert_session(conn, session_key="s:missing-vs-empty", client="claude")
+    for i in range(2):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-empty-{i}",
+            command="true",
+            output="",
+        )
+    _insert_event(
+        conn,
+        session_id=sid,
+        client="claude",
+        event_type="command_start",
+        event_key="command_start:tu-missing",
+        raw={
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu-missing",
+                        "name": "Bash",
+                        "input": {"command": "true"},
+                    }
+                ]
+            },
+        },
+    )
+
+    ingest_loop_incidents(conn)
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
+def test_three_missing_results_emit_medium_confidence_incident(conn):
+    """Three consecutive `command_start`s with NO paired `tool_result`
+    rows must emit a single incident with `confidence="medium"`. The
+    fingerprint's outcome-availability marker is "missing", runs of
+    missing-marker rows DO group (same command + same state), and the
+    confidence is dropped because we can't observe whether the results
+    diverged."""
+    sid = _insert_session(conn, session_key="s:all-missing", client="claude")
+    for i in range(3):
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            event_key=f"command_start:tu-miss-{i}",
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"tu-miss-{i}",
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        }
+                    ]
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT count, confidence FROM incidents WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+    assert row["count"] == 3
+    assert row["confidence"] == "medium"
+
+
+def test_codex_plain_text_metadata_without_output_marker_is_treated_as_missing(conn):
+    """A codex rollout that carries `Exit code:` / `Wall time:` but no
+    `Output:` marker (truncated log, partial capture) must NOT collapse
+    into a high-confidence empty-output loop — the absence of an output
+    section is indistinguishable from "no observable outcome"."""
+    sid = _insert_session(conn, session_key="s:codex-no-output-marker", client="codex")
+    for i in range(3):
+        tool_id = f"call_{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="command_start",
+            event_key=f"command_start:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": tool_id,
+                    "arguments": json.dumps({"command": "npm test", "workdir": "/repo"}),
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="tool_result",
+            event_key=f"tool_result:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": tool_id,
+                    # Metadata present, no `Output:` marker (truncated).
+                    "output": (
+                        "Exit code: 1\n"
+                        f"Wall time: {i} seconds\n"
+                    ),
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT count, confidence FROM incidents WHERE session_id = ?",
+        (sid,),
+    ).fetchone()
+    assert row["count"] == 3
+    assert row["confidence"] == "medium"
+
+
+def test_codex_plain_text_preserves_exit_code_lines_inside_actual_output(conn):
+    """If the real shell output itself contains a line starting with
+    `Exit code: ` or `Wall time: ` (e.g. a shell log echoing a child
+    process's exit), those lines must be preserved verbatim in the
+    fingerprinted outcome — not dropped by the metadata-prefix match.
+    Three commands whose only observable difference lives on such lines
+    must NOT collapse into a loop."""
+    sid = _insert_session(conn, session_key="s:codex-nested-exit", client="codex")
+    for i in range(3):
+        tool_id = f"call_{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="command_start",
+            event_key=f"command_start:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": tool_id,
+                    "arguments": json.dumps({"command": "bash run.sh", "workdir": "/repo"}),
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="tool_result",
+            event_key=f"tool_result:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": tool_id,
+                    "output": (
+                        "Exit code: 0\n"
+                        "Wall time: 0.1 seconds\n"
+                        "Output:\n"
+                        "starting job\n"
+                        # Embedded "Exit code:" line varies per run — must survive.
+                        f"Exit code: {i}\n"
+                    ),
                 },
             },
         )
@@ -1396,6 +1718,104 @@ def test_override_cursor_tiebreaker_handles_same_timestamp_writes(conn):
     assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
 
 
+def test_override_cursor_handles_same_row_rewrite_with_same_timestamp(conn):
+    sid = _insert_session(conn, session_key="s:override-same-row", client="claude")
+    fixed_created_at = "2026-04-21T10:00:00.123456Z"
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    ingest_loop_incidents(conn)
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-same-row",
+        event_key="tool_result:tu-1",
+        event_type="tool_result",
+        source="hook",
+        confidence="medium",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-1",
+                            "content": [{"type": "text", "text": "FAIL identical"}],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+    conn.execute(
+        """
+        UPDATE event_overrides
+           SET created_at = ?
+         WHERE session_id = ? AND event_key = ?
+        """,
+        (fixed_created_at, sid, "tool_result:tu-1"),
+    )
+    conn.commit()
+
+    first = ingest_loop_incidents(conn)
+    assert first.overrides_scanned == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-same-row",
+        event_key="tool_result:tu-1",
+        event_type="tool_result",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-1",
+                            "content": [{"type": "text", "text": "FAIL changed"}],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+    conn.execute(
+        """
+        UPDATE event_overrides
+           SET created_at = ?
+         WHERE session_id = ? AND event_key = ?
+        """,
+        (fixed_created_at, sid, "tool_result:tu-1"),
+    )
+    conn.commit()
+
+    second = ingest_loop_incidents(conn)
+
+    assert second.events_scanned == 0
+    assert second.overrides_scanned == 1
+    assert second.sessions_evaluated == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
 def test_rebuild_preserves_non_loop_incident_kinds(conn):
     """The incidents table is shared across kinds; `--rebuild` must
     only touch `loop_exact_repeat` rows."""
@@ -1456,6 +1876,7 @@ def test_legacy_loop_ingest_state_is_migrated_in_place():
     # dropping the stored cursor value.
     ensure_incidents_schema(conn)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(loop_ingest_state)")}
+    assert "last_override_write_seq" in columns
     assert "last_override_created_at" in columns
     assert "last_override_session_id" in columns
     assert "last_override_event_key" in columns
@@ -1464,6 +1885,7 @@ def test_legacy_loop_ingest_state_is_migrated_in_place():
         "SELECT * FROM loop_ingest_state WHERE consumer_id = 'loop_detector'"
     ).fetchone()
     assert row["last_event_id"] == 0
+    assert row["last_override_write_seq"] == 0
     assert row["last_override_created_at"] is None
     assert row["last_override_session_id"] == 0
     assert row["last_override_event_key"] == ""

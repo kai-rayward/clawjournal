@@ -13,11 +13,11 @@ Per-rule thresholds (spec):
   need **5** repeats.
 
 The "outcome" portion of the fingerprint is the normalized result
-text from the paired `tool_result` row (see `normalize.py`). If a
-tool_call has no paired result (e.g. mid-execution), the outcome is
-the empty string — two such events still match each other but the
-detector treats the run as `confidence='medium'` since we can't see
-whether the result diverged.
+text from the paired `tool_result` row (see `normalize.py`), plus an
+availability bit so a missing result doesn't collapse with a real
+empty-string result. If a tool_call has no paired result (e.g.
+mid-execution), the detector treats the run as `confidence='medium'`
+since we can't see whether the result diverged.
 
 Cross-session matching is not done. Cross-event-key matching is
 strict: a `tool_call` and a `tool_result` are paired only by the
@@ -83,6 +83,8 @@ _RUN_BREAKERS = frozenset({"user_message", "compaction"})
 # model-narrated or ergonomic and would otherwise hide loops whenever
 # those fields drift between identical retries.
 _SHELL_FINGERPRINT_FIELDS = frozenset({"command", "cmd", "workdir", "cwd"})
+_OUTCOME_PRESENT = "present"
+_OUTCOME_MISSING = "missing"
 
 
 @dataclass
@@ -98,6 +100,7 @@ class _SessionEvent:
     event_id: int | None
     event_type: str
     event_key: str | None
+    event_at: str | None
     raw_json: str | None
     payload_json: str | None
 
@@ -176,11 +179,12 @@ def _load_canonical_session_events(
                 event_id=event_id,
                 event_type=event.type,
                 event_key=event.event_key,
+                event_at=event.event_at,
                 raw_json=event.raw_json,
                 payload_json=event.payload_json,
             )
         )
-    return stream
+    return _restore_hook_only_breaker_order(stream)
 
 
 def _has_event_overrides_table(conn: sqlite3.Connection) -> bool:
@@ -200,7 +204,7 @@ def _load_base_session_events(
 ) -> list[_SessionEvent]:
     rows = conn.execute(
         """
-        SELECT id, type, event_key, raw_json
+        SELECT id, type, event_key, event_at, raw_json
           FROM events
          WHERE session_id = ?
          ORDER BY event_at IS NULL, event_at, source_path, source_offset, seq
@@ -220,11 +224,42 @@ def _load_base_session_events(
                 event_id=int(row["id"]),
                 event_type=row["type"],
                 event_key=event_key,
+                event_at=row["event_at"],
                 raw_json=row["raw_json"],
                 payload_json=None,
             )
         )
     return stream
+
+
+def _restore_hook_only_breaker_order(
+    stream: list[_SessionEvent],
+) -> list[_SessionEvent]:
+    ordered: list[_SessionEvent] = []
+    for event in stream:
+        if not _is_hook_only_breaker(event):
+            ordered.append(event)
+            continue
+        insert_at = len(ordered)
+        event_key = _session_event_sort_key(event)
+        for idx, existing in enumerate(ordered):
+            if _session_event_sort_key(existing) > event_key:
+                insert_at = idx
+                break
+        ordered.insert(insert_at, event)
+    return ordered
+
+
+def _is_hook_only_breaker(event: _SessionEvent) -> bool:
+    return (
+        event.event_id is None
+        and event.event_type in _RUN_BREAKERS
+        and event.event_at is not None
+    )
+
+
+def _session_event_sort_key(event: _SessionEvent) -> tuple[bool, str | None]:
+    return (event.event_at is None, event.event_at)
 
 
 def _collect_result_texts(rows, *, client: str) -> dict[str, str]:
@@ -358,10 +393,7 @@ def _emit_runs_for_rule(
         if not run or cur_fingerprint is None or len(run) < rule.threshold:
             run = []
             return None
-        # The fingerprint's last element is the (normalized) outcome
-        # text; an empty string means we couldn't read it, so the
-        # run's confidence drops.
-        confidence = "high" if cur_fingerprint[-1] != "" else "medium"
+        confidence = "high" if _fingerprint_has_observed_outcome(cur_fingerprint) else "medium"
         hit = IncidentHit(
             session_id=session_id,
             kind=rule.kind,
@@ -421,10 +453,15 @@ def _fingerprint_for(
     event does.
     """
     tool_id = _tool_id_from_event_key(event_key)
-    outcome = results.get(tool_id, "") if tool_id is not None else ""
+    outcome_state = _OUTCOME_MISSING
+    outcome = ""
     inline_outcome = _inline_outcome_for_client(client, event_type, parsed)
     if inline_outcome is not None:
+        outcome_state = _OUTCOME_PRESENT
         outcome = normalize_outcome_text(inline_outcome)
+    elif tool_id is not None and tool_id in results:
+        outcome_state = _OUTCOME_PRESENT
+        outcome = results[tool_id]
 
     if event_type == "command_start":
         command, args_key = _command_signature_for_client(
@@ -434,7 +471,7 @@ def _fingerprint_for(
         )
         if not command:
             return None
-        return ("command_start", command, args_key, outcome)
+        return ("command_start", command, args_key, outcome_state, outcome)
     if event_type == "tool_call":
         name, args_key = _tool_call_signature_for_client(
             client,
@@ -449,7 +486,7 @@ def _fingerprint_for(
         # threshold.
         if _is_shell_tool_name(name):
             return None
-        return ("tool_call", name, args_key, outcome)
+        return ("tool_call", name, args_key, outcome_state, outcome)
     return None
 
 
@@ -457,9 +494,10 @@ def _serialize_fingerprint(fingerprint: tuple) -> list:
     """Project an in-memory fingerprint tuple into the form stored in
     `incidents.evidence_json`.
 
-    The live fingerprint carries the normalized paired-`tool_result`
-    text as its last element so run-grouping can compare outcomes. That
-    text is derived from `events.raw_json` and has NOT been through the
+    The live fingerprint carries an outcome-availability marker plus
+    the normalized paired-`tool_result` text as its last element so
+    run-grouping can compare both availability and content. That text
+    is derived from `events.raw_json` and has NOT been through the
     workbench regex/PII redaction pipeline — persisting it verbatim in
     `evidence_json` would smuggle secrets past any consumer that reads
     incidents without re-redacting. We replace the outcome with a
@@ -470,14 +508,25 @@ def _serialize_fingerprint(fingerprint: tuple) -> list:
     if not fingerprint:
         return []
     out = list(fingerprint)
+    availability = _fingerprint_outcome_state(fingerprint)
     outcome = out[-1]
     if isinstance(outcome, str):
-        if outcome == "":
+        if availability == _OUTCOME_MISSING:
             out[-1] = ""  # preserve the "no outcome available" signal
         else:
             digest = hashlib.sha256(outcome.encode("utf-8")).hexdigest()[:16]
             out[-1] = f"sha256:{digest}"
     return out
+
+
+def _fingerprint_has_observed_outcome(fingerprint: tuple) -> bool:
+    return _fingerprint_outcome_state(fingerprint) == _OUTCOME_PRESENT
+
+
+def _fingerprint_outcome_state(fingerprint: tuple) -> str:
+    if len(fingerprint) >= 2 and fingerprint[-2] in {_OUTCOME_PRESENT, _OUTCOME_MISSING}:
+        return fingerprint[-2]
+    return _OUTCOME_MISSING
 
 
 def _tool_id_from_event_key(event_key: str | None) -> str | None:
@@ -683,6 +732,14 @@ def _result_text_for_client(
             try:
                 wrapped = json.loads(out)
             except json.JSONDecodeError:
+                # If the raw text carries a codex `Exit code:` / `Wall
+                # time:` / `Output:` preamble, let the parser own the
+                # answer even when the `Output:` marker is missing —
+                # that case returns None, which propagates out as
+                # "missing outcome" so the run scores confidence=medium
+                # rather than collapsing into a spurious empty match.
+                if _is_codex_metadata_format(out):
+                    return _parse_codex_plain_text_output(out)
                 return out
             if isinstance(wrapped, dict):
                 inner = wrapped.get("output")
@@ -691,7 +748,12 @@ def _result_text_for_client(
                 return json.dumps(wrapped, sort_keys=True)
             return out
         if isinstance(out, list):
-            return _flatten_text(out)
+            text = _flatten_text(out)
+            if text is None:
+                return None
+            if _is_codex_metadata_format(text):
+                return _parse_codex_plain_text_output(text)
+            return text
         return None
     return None
 
@@ -732,6 +794,61 @@ def _flatten_text(value: object) -> str | None:
         if chunks:
             return "\n".join(chunks)
     return None
+
+
+def _is_codex_metadata_format(text: str) -> bool:
+    """True when `text` carries a codex `Exit code:` / `Wall time:` /
+    `Output:` preamble. Scan only the first few lines so unrelated
+    output that happens to embed one of those phrases later doesn't
+    misclassify."""
+    for line in text.splitlines()[:5]:
+        if (
+            line.startswith("Exit code: ")
+            or line.startswith("Wall time: ")
+            or line == "Output:"
+        ):
+            return True
+    return False
+
+
+def _parse_codex_plain_text_output(text: str) -> str | None:
+    """Extract the post-`Output:` payload from a codex plain-text result.
+
+    Returns:
+    - The stripped output text when a well-formed `Exit code` /
+      `Wall time` / `Output:` preamble is present.
+    - `None` when no codex metadata prefix is recognized (fall back to
+      the raw text) OR when metadata is present but the `Output:`
+      marker never arrives (truncated rollout — indistinguishable from
+      "no observable outcome"; the caller treats `None` as missing so
+      the run is scored `confidence="medium"` instead of collapsing
+      into a spurious empty-outcome match).
+
+    Prefix detection is gated on `saw_output_marker` so that `Exit
+    code:` / `Wall time:` lines embedded inside the real output (e.g.
+    a shell log echoing its child's exit status) are preserved
+    verbatim instead of being silently dropped.
+    """
+    saw_metadata = False
+    saw_output_marker = False
+    output_lines: list[str] = []
+    for line in text.splitlines():
+        if not saw_output_marker:
+            if line.startswith("Exit code: "):
+                saw_metadata = True
+                continue
+            if line.startswith("Wall time: "):
+                saw_metadata = True
+                continue
+            if line == "Output:":
+                saw_metadata = True
+                saw_output_marker = True
+                continue
+        else:
+            output_lines.append(line)
+    if not saw_metadata or not saw_output_marker:
+        return None
+    return "\n".join(output_lines).strip()
 
 
 def _matching_tool_call_block(
