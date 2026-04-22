@@ -213,13 +213,71 @@ class TestUpsertSessions:
         """Sessions without provenance fields should have NULL values."""
         upsert_sessions(index_conn, [_make_session()])
         row = index_conn.execute(
-            "SELECT raw_source_path, client_origin, runtime_channel, outer_session_id "
+            "SELECT raw_source_path, session_key, client_origin, runtime_channel, outer_session_id "
             "FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
         assert row["raw_source_path"] is None
+        assert row["session_key"] is None
         assert row["client_origin"] is None
         assert row["runtime_channel"] is None
         assert row["outer_session_id"] is None
+
+    @pytest.mark.parametrize(
+        ("source", "raw_source_path", "expected"),
+        [
+            ("claude", "/tmp/claude/projects/demo-project/sess-1.jsonl", "claude:demo-project:sess-1"),
+            ("claude", "/tmp/claude/projects/demo-project/subagent-only", "claude:demo-project:subagent-only"),
+            # Real production native path: ~/.claude/projects/<proj>/<uuid>.jsonl.
+            # `.claude` is in path.parts but no local-agent wrapper exists at
+            # parents[3].json — must fall through to native stem derivation.
+            ("claude", "/Users/alice/.claude/projects/demo-project/sess-1.jsonl", "claude:demo-project:sess-1"),
+            ("codex", "/tmp/codex/sessions/2025/01/02/run.jsonl", "codex:/tmp/codex/sessions/2025/01/02/run.jsonl"),
+            ("openclaw", "/tmp/openclaw/agents/a/sessions/demo.jsonl", "openclaw:/tmp/openclaw/agents/a/sessions/demo.jsonl"),
+        ],
+    )
+    def test_upsert_derives_session_key_from_provenance(
+        self, index_conn, source, raw_source_path, expected
+    ):
+        session = _make_session(source=source, project=f"{source}:demo")
+        session["raw_source_path"] = raw_source_path
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT session_key FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["session_key"] == expected
+
+    def test_upsert_derives_local_agent_session_key_from_wrapper(self, index_conn, tmp_path):
+        workspace_dir = (
+            tmp_path
+            / "local_agent"
+            / "11111111-2222-3333-4444-555555555555"
+            / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        workspace_dir.mkdir(parents=True)
+        wrapper = workspace_dir / "local_demo.json"
+        wrapper.write_text(
+            json.dumps(
+                {
+                    "cliSessionId": "cli-42",
+                    "sessionId": "sess-42",
+                    "processName": "demo",
+                    "userSelectedFolders": ["/Users/me/ws"],
+                }
+            )
+        )
+        transcript = wrapper.with_suffix("") / ".claude" / "projects" / "-sessions-demo" / "cli-42.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n")
+
+        session = _make_session(project="claude:ws")
+        session["raw_source_path"] = str(transcript)
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT session_key FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["session_key"] == "claude:-Users-me-ws:cli-42"
 
     def test_link_subagent_hierarchy_skips_conflicting_existing_parent(self, index_conn):
         parent_one = _make_session(

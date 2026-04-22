@@ -119,6 +119,7 @@ def ingest_pending(
 ) -> IngestSummary:
     ensure_capture_schema(conn)
     ensure_event_schema(conn)
+    from clawjournal.workbench.index import backfill_session_keys
 
     summary = IngestSummary()
     latest_mtime_by_session_key: dict[str, float] = {}
@@ -138,6 +139,7 @@ def ingest_pending(
         summary._session_keys.add(source.session_key)
         summary.event_rows += _ingest_batch(conn, source, batch, now=now)
     _sweep_idle_sessions(conn, latest_mtime_by_session_key, now=now)
+    backfill_session_keys(conn)
     return summary
 
 

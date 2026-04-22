@@ -293,6 +293,9 @@ def _load_local_agent_wrapper(wrapper_path: Path) -> dict | None:
     Returns None for malformed JSON, non-dict payloads, or missing
     `cliSessionId`. The capture adapter and the parser must skip the
     same wrappers, or step-2 Scanner parity regresses.
+
+    Also consumed by `clawjournal.workbench.index` during session_key
+    backfill (ADR-001). Renames must update that call site too.
     """
     try:
         payload = json.loads(wrapper_path.read_text())
@@ -306,6 +309,8 @@ def _load_local_agent_wrapper(wrapper_path: Path) -> dict | None:
 
 
 def _workspace_key_from_wrapper(wrapper: dict, session_dir: Path) -> str:
+    # Also consumed by `clawjournal.workbench.index` during session_key
+    # backfill (ADR-001). Renames must update that call site too.
     user_folders = wrapper.get("userSelectedFolders") or []
     if (
         isinstance(user_folders, list)

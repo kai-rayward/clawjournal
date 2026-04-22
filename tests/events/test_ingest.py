@@ -262,6 +262,54 @@ def test_native_and_local_agent_converge_on_one_event_session(monkeypatch, tmp_p
         conn.close()
 
 
+def test_ingest_backfills_workbench_session_key_from_subagent_directory(monkeypatch, tmp_path):
+    _patch_db(monkeypatch, tmp_path)
+    _patch_sources(monkeypatch, tmp_path)
+
+    session_dir = tmp_path / "claude" / "projects" / "demo-project" / "child"
+    child_file = session_dir / "subagents" / "agent-1.jsonl"
+    child_file.parent.mkdir(parents=True)
+    child_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-20T10:00:00.000Z",
+                "message": {"content": [{"type": "text", "text": "Child trace"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    conn = open_index()
+    try:
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                session_id, project, source, raw_source_path, indexed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-child",
+                "claude:demo-project",
+                "claude",
+                str(session_dir),
+                "2026-04-20T09:59:00Z",
+            ),
+        )
+        conn.commit()
+
+        now = datetime.fromtimestamp(child_file.stat().st_mtime, tz=timezone.utc)
+        ingest_pending(conn, source_filter="claude", now=now)
+
+        row = conn.execute(
+            "SELECT session_key FROM sessions WHERE session_id = 'legacy-child'"
+        ).fetchone()
+        assert row["session_key"] == "claude:demo-project:child"
+    finally:
+        conn.close()
+
+
 def test_unparseable_line_stored_with_wrapper(monkeypatch, tmp_path):
     _patch_db(monkeypatch, tmp_path)
     _patch_sources(monkeypatch, tmp_path)
