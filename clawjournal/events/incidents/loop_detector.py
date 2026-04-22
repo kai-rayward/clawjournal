@@ -76,6 +76,9 @@ class IncidentHit:
 # bookkeeping are NOT breakers, since otherwise back-to-back
 # auto-retries wouldn't register as a loop.
 _RUN_BREAKERS = frozenset({"user_message", "compaction"})
+_ADJACENCY_SENSITIVE_TYPES = _RUN_BREAKERS.union(
+    rule.event_type for rule in DEFAULT_RULES
+)
 
 # Shell-command fingerprint fields. Only these keys from a Bash/shell
 # tool's args contribute to the run-identity key — other fields (e.g.
@@ -184,7 +187,7 @@ def _load_canonical_session_events(
                 payload_json=event.payload_json,
             )
         )
-    return _restore_hook_only_breaker_order(stream)
+    return _restore_hook_only_adjacency_order(stream)
 
 
 def _has_event_overrides_table(conn: sqlite3.Connection) -> bool:
@@ -232,12 +235,12 @@ def _load_base_session_events(
     return stream
 
 
-def _restore_hook_only_breaker_order(
+def _restore_hook_only_adjacency_order(
     stream: list[_SessionEvent],
 ) -> list[_SessionEvent]:
     ordered: list[_SessionEvent] = []
     for event in stream:
-        if not _is_hook_only_breaker(event):
+        if not _is_hook_only_adjacency_event(event):
             ordered.append(event)
             continue
         insert_at = len(ordered)
@@ -250,10 +253,10 @@ def _restore_hook_only_breaker_order(
     return ordered
 
 
-def _is_hook_only_breaker(event: _SessionEvent) -> bool:
+def _is_hook_only_adjacency_event(event: _SessionEvent) -> bool:
     return (
         event.event_id is None
-        and event.event_type in _RUN_BREAKERS
+        and event.event_type in _ADJACENCY_SENSITIVE_TYPES
         and event.event_at is not None
     )
 
@@ -269,20 +272,16 @@ def _collect_result_texts(rows, *, client: str) -> dict[str, str]:
     duplicates have been removed before pairing."""
     out: dict[str, str] = {}
     for row in rows:
-        payload_json = _effective_payload_json(row)
-        if row.event_type != "tool_result" or payload_json is None:
+        if row.event_type != "tool_result":
+            continue
+        parsed = _effective_parsed_payload(row, client=client)
+        if parsed is None:
             continue
         tool_id = _tool_result_id_from_event_key(row.event_key)
         if tool_id is None:
             continue
         if tool_id in out:
             continue  # first one wins
-        try:
-            parsed = json.loads(payload_json)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
         text = _result_text_for_client(client, parsed, tool_id=tool_id)
         if text is None:
             continue
@@ -308,38 +307,23 @@ def _build_rule_candidates(
     for row in rows:
         event_type = row.event_type
         if event_type == rule.event_type:
-            # Hook-only synthetic events have no `events.id` to cite
-            # in an incident row. Treat them as transparent — the
-            # surrounding real events remain adjacent.
+            # Hook-only synthetic actions have no `events.id` to cite
+            # in an incident row, so they cannot anchor an emitted hit.
+            # They DO still interrupt adjacency: a novel hook-derived
+            # command/tool call between two identical base attempts
+            # means the run was not uninterrupted.
             if row.event_id is None:
-                continue
-            payload_json = _effective_payload_json(row)
-            if payload_json is None:
                 candidates.append(
                     _CandidateRow(
-                        event_id=int(row.event_id),
+                        event_id=0,
                         event_type=event_type,
                         event_key=row.event_key,
                         fingerprint=None,
                     )
                 )
                 continue
-            try:
-                parsed = json.loads(payload_json)
-            except (TypeError, json.JSONDecodeError):
-                # Eligible row whose payload won't parse: include it
-                # with fingerprint=None so it breaks the run rather
-                # than silently extending it.
-                candidates.append(
-                    _CandidateRow(
-                        event_id=int(row.event_id),
-                        event_type=event_type,
-                        event_key=row.event_key,
-                        fingerprint=None,
-                    )
-                )
-                continue
-            if not isinstance(parsed, dict):
+            parsed = _effective_parsed_payload(row, client=client)
+            if parsed is None:
                 candidates.append(
                     _CandidateRow(
                         event_id=int(row.event_id),
@@ -772,8 +756,64 @@ def _result_text_for_client(
     return None
 
 
-def _effective_payload_json(row: _SessionEvent) -> str | None:
-    return row.payload_json if row.payload_json is not None else row.raw_json
+def _effective_parsed_payload(
+    row: _SessionEvent,
+    *,
+    client: str,
+) -> dict | None:
+    fallback: dict | None = None
+    for payload_json in (row.payload_json, row.raw_json):
+        if payload_json is None:
+            continue
+        try:
+            parsed = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if fallback is None:
+            fallback = parsed
+        if _payload_supports_event(
+            client=client,
+            event_type=row.event_type,
+            event_key=row.event_key,
+            parsed=parsed,
+        ):
+            return parsed
+    return fallback
+
+
+def _payload_supports_event(
+    *,
+    client: str,
+    event_type: str,
+    event_key: str | None,
+    parsed: dict,
+) -> bool:
+    if event_type == "command_start":
+        command, _ = _command_signature_for_client(
+            client,
+            parsed,
+            tool_id=_tool_id_from_event_key(event_key),
+        )
+        return command is not None
+    if event_type == "tool_call":
+        name, _ = _tool_call_signature_for_client(
+            client,
+            parsed,
+            tool_id=_tool_id_from_event_key(event_key),
+        )
+        return name is not None
+    if event_type == "tool_result":
+        return (
+            _result_text_for_client(
+                client,
+                parsed,
+                tool_id=_tool_result_id_from_event_key(event_key),
+            )
+            is not None
+        )
+    return True
 
 
 def _inline_outcome_for_client(

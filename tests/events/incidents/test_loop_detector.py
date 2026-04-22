@@ -435,6 +435,88 @@ def test_hook_only_breaker_override_is_reinserted_chronologically(conn):
     assert detect_session_loops(conn, sid) == []
 
 
+def test_hook_only_command_override_breaks_run_chronologically(conn):
+    sid = _insert_session(conn, session_key="s:hook-command-break", client="claude")
+    for idx, event_at in enumerate(
+        (
+            "2026-04-21T10:00:00Z",
+            "2026-04-21T10:00:02Z",
+            "2026-04-21T10:00:04Z",
+        )
+    ):
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            event_key=f"command_start:tu-{idx}",
+            event_at=event_at,
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"tu-{idx}",
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        }
+                    ]
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="tool_result",
+            event_key=f"tool_result:tu-{idx}",
+            event_at=event_at,
+            raw={
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"tu-{idx}",
+                            "content": [{"type": "text", "text": "FAIL same"}],
+                        }
+                    ]
+                },
+            },
+        )
+
+    assert write_hook_override(
+        conn,
+        session_key="s:hook-command-break",
+        event_key="command_start:hook-1",
+        event_type="command_start",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at="2026-04-21T10:00:03Z",
+        payload_json=json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "hook-1",
+                            "name": "Bash",
+                            "input": {"command": "npm run lint"},
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    assert detect_session_loops(conn, sid) == []
+
+
 def test_distinct_outputs_do_not_count_as_a_loop(conn):
     """Same command with materially different output is NOT a loop —
     progress is being made."""
@@ -1415,6 +1497,74 @@ def test_detect_session_loops_uses_command_start_override_payload(conn):
     )
 
     assert detect_session_loops(conn, sid) == []
+
+
+def test_detect_session_loops_falls_back_to_base_raw_json_for_opaque_command_override(
+    conn,
+):
+    sid = _insert_session(conn, session_key="s:opaque-command-override", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    assert write_hook_override(
+        conn,
+        session_key="s:opaque-command-override",
+        event_key="command_start:tu-1",
+        event_type="command_start",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {"tool": "Bash", "args": {"command": "npm test"}},
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    hits = detect_session_loops(conn, sid)
+    assert len(hits) == 1
+    assert hits[0].count == 3
+
+
+def test_detect_session_loops_falls_back_to_base_raw_json_for_opaque_tool_result_override(
+    conn,
+):
+    sid = _insert_session(conn, session_key="s:opaque-tool-result-override", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    assert write_hook_override(
+        conn,
+        session_key="s:opaque-tool-result-override",
+        event_key="tool_result:tu-1",
+        event_type="tool_result",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {"tool": "Bash", "result": "FAIL identical"},
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    hits = detect_session_loops(conn, sid)
+    assert len(hits) == 1
+    assert hits[0].count == 3
 
 
 def test_unparseable_raw_json_breaks_run_safely(conn):
