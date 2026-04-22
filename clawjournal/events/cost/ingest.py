@@ -295,30 +295,65 @@ def _latest_codex_model_before_event(
     a later run than its preceding turn_context. Query the earlier raw events in
     canonical order to recover the model rather than depending on re-scans.
     """
-    rows = conn.execute(
-        """
-        SELECT raw_json
-          FROM events
-         WHERE session_id = ?
-           AND client = 'codex'
-           AND (
-               (? IS NOT NULL AND event_at IS NOT NULL AND
-                   (event_at < ? OR (event_at = ? AND id < ?)))
-               OR
-               (? IS NULL AND (event_at IS NOT NULL OR (event_at IS NULL AND id < ?)))
-           )
-         ORDER BY event_at IS NULL DESC, event_at DESC, id DESC
-        """,
-        (
-            session_id,
-            event_at,
-            event_at,
-            event_at,
-            event_id,
-            event_at,
-            event_id,
-        ),
+    if event_at is not None:
+        model = _latest_codex_model_from_rows(
+            conn.execute(
+                """
+                SELECT raw_json
+                  FROM events
+                 WHERE session_id = ?
+                   AND client = 'codex'
+                   AND event_at IS NOT NULL
+                   AND (event_at < ? OR (event_at = ? AND id < ?))
+                 ORDER BY event_at DESC, id DESC
+                """,
+                (session_id, event_at, event_at, event_id),
+            )
+        )
+        if model:
+            return model
+
+    # Fallback for earlier rows that carried no vendor timestamp. This keeps
+    # replay robust when an older turn_context predates a later token_count by
+    # source order / id but not by event_at presence.
+    model = _latest_codex_model_from_rows(
+        conn.execute(
+            """
+            SELECT raw_json
+              FROM events
+             WHERE session_id = ?
+               AND client = 'codex'
+               AND event_at IS NULL
+               AND id < ?
+             ORDER BY id DESC
+            """,
+            (session_id, event_id),
+        )
     )
+    if model:
+        return model
+
+    if event_at is None:
+        model = _latest_codex_model_from_rows(
+            conn.execute(
+                """
+                SELECT raw_json
+                  FROM events
+                 WHERE session_id = ?
+                   AND client = 'codex'
+                   AND event_at IS NOT NULL
+                   AND id < ?
+                 ORDER BY event_at DESC, id DESC
+                """,
+                (session_id, event_id),
+            )
+        )
+        if model:
+            return model
+    return None
+
+
+def _latest_codex_model_from_rows(rows) -> str | None:
     for row in rows:
         try:
             line = json.loads(row["raw_json"])

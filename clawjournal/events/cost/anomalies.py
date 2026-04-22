@@ -149,7 +149,7 @@ def _detect_input_spike(
         cur = row["input"]
         if cur is None:
             continue
-        if len(baseline) >= 1:
+        if len(baseline) >= INPUT_SPIKE_BASELINE_WINDOW:
             mean = sum(baseline) / len(baseline)
             if mean > 0 and cur > mean * INPUT_SPIKE_MULTIPLIER:
                 hits.append(
