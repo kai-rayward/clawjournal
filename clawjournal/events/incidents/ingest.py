@@ -38,6 +38,7 @@ from clawjournal.events.incidents.loop_detector import (
 from clawjournal.events.incidents.schema import ensure_incidents_schema
 from clawjournal.events.incidents.types import LOOP_INCIDENT_KIND
 from clawjournal.events.schema import ensure_schema as ensure_events_schema
+from clawjournal.events.view import ensure_view_schema
 
 LOOP_CONSUMER_ID = "loop_detector"
 
@@ -100,8 +101,7 @@ ON CONFLICT(session_id, kind, first_event_id) DO UPDATE SET
     last_event_id = excluded.last_event_id,
     evidence_json = excluded.evidence_json,
     count         = excluded.count,
-    confidence    = excluded.confidence,
-    created_at    = excluded.created_at
+    confidence    = excluded.confidence
 """
 
 
@@ -120,30 +120,38 @@ def ingest_loop_incidents(
     """
     ensure_events_schema(conn)
     ensure_incidents_schema(conn)
+    ensure_view_schema(conn)
 
     summary = LoopIngestSummary()
     created_at = _utc_now_iso(now)
-    last_event_id = 0 if rebuild else _get_last_processed_event_id(conn)
 
-    new_session_rows = conn.execute(
-        _SELECT_NEW_EVENT_SESSIONS_SQL, (last_event_id,)
-    ).fetchall()
-    sessions_to_evaluate: list[int] = [int(r["session_id"]) for r in new_session_rows]
-    summary.events_scanned = sum(int(r["new_event_count"]) for r in new_session_rows)
+    # All reads + writes run inside a single BEGIN IMMEDIATE so a
+    # concurrent writer can't land new events between "pick sessions
+    # to evaluate" and "advance the cursor" — otherwise the cursor
+    # could leapfrog events that never got evaluated.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        last_event_id = 0 if rebuild else _get_last_processed_event_id(conn)
 
-    if rebuild:
-        all_sessions = conn.execute(
-            "SELECT id FROM event_sessions"
+        new_session_rows = conn.execute(
+            _SELECT_NEW_EVENT_SESSIONS_SQL, (last_event_id,)
         ).fetchall()
-        sessions_to_evaluate = [int(r["id"]) for r in all_sessions]
+        sessions_to_evaluate: list[int] = [int(r["session_id"]) for r in new_session_rows]
+        summary.events_scanned = sum(int(r["new_event_count"]) for r in new_session_rows)
 
-    max_event_id_row = conn.execute(_SELECT_MAX_EVENT_ID_SQL).fetchone()
-    max_event_id = int(max_event_id_row["max_id"] or 0)
+        if rebuild:
+            all_sessions = conn.execute(
+                "SELECT id FROM event_sessions"
+            ).fetchall()
+            sessions_to_evaluate = [int(r["id"]) for r in all_sessions]
 
-    if not sessions_to_evaluate and not rebuild:
-        return summary
+        max_event_id_row = conn.execute(_SELECT_MAX_EVENT_ID_SQL).fetchone()
+        max_event_id = int(max_event_id_row["max_id"] or 0)
 
-    with conn:
+        if not sessions_to_evaluate and not rebuild:
+            conn.commit()
+            return summary
+
         if rebuild:
             _reset_loop_state(conn)
 
@@ -180,6 +188,11 @@ def ingest_loop_incidents(
                 _UPSERT_LAST_EVENT_ID_SQL,
                 (LOOP_CONSUMER_ID, max_event_id),
             )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
     return summary
 

@@ -31,8 +31,10 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
+from clawjournal.events.classify.common import is_shell_tool
 from clawjournal.events.incidents.normalize import normalize_outcome_text
 from clawjournal.events.incidents.types import LOOP_INCIDENT_KIND
+from clawjournal.events.view import canonical_events
 
 DEFAULT_SHELL_THRESHOLD = 3
 DEFAULT_TOOL_CALL_THRESHOLD = 5
@@ -73,14 +75,28 @@ class IncidentHit:
 # auto-retries wouldn't register as a loop.
 _RUN_BREAKERS = frozenset({"user_message", "compaction"})
 
+# Shell-command fingerprint fields. Only these keys from a Bash/shell
+# tool's args contribute to the run-identity key — other fields (e.g.
+# Claude Bash's `description`, `timeout`, `run_in_background`) are
+# model-narrated or ergonomic and would otherwise hide loops whenever
+# those fields drift between identical retries.
+_SHELL_FINGERPRINT_FIELDS = frozenset({"command", "workdir", "cwd"})
+
 
 @dataclass
 class _CandidateRow:
     event_id: int
     event_type: str
     event_key: str | None
-    raw: dict
     fingerprint: tuple | None  # None = unparseable eligible row
+
+
+@dataclass(frozen=True)
+class _SessionEvent:
+    event_id: int | None
+    event_type: str
+    event_key: str | None
+    raw_json: str | None
 
 
 def detect_session_loops(
@@ -99,23 +115,28 @@ def detect_session_loops(
     or `compaction` event resets adjacency — the next attempt is then
     a response to new context, not a blind retry.
     """
-    rows = conn.execute(
-        """
-        SELECT id, type, event_key, client, raw_json, source_path, source_offset, seq
-          FROM events
-         WHERE session_id = ?
-         ORDER BY event_at IS NULL, event_at, source_path, source_offset, seq
-        """,
+    row = conn.execute(
+        "SELECT client FROM event_sessions WHERE id = ?",
         (session_id,),
-    ).fetchall()
+    ).fetchone()
+    if row is None:
+        return []
+    client = row["client"]
+
+    rows = _load_canonical_session_events(conn, session_id)
     if not rows:
         return []
 
-    result_text_by_tool_id = _collect_result_texts(rows)
+    result_text_by_tool_id = _collect_result_texts(rows, client=client)
 
     hits: list[IncidentHit] = []
     for rule in rules:
-        candidates = _build_rule_candidates(rows, rule, result_text_by_tool_id)
+        candidates = _build_rule_candidates(
+            rows,
+            rule,
+            result_text_by_tool_id,
+            client=client,
+        )
         hits.extend(_emit_runs_for_rule(session_id, candidates, rule))
     return hits
 
@@ -123,30 +144,106 @@ def detect_session_loops(
 # --- candidate construction ----------------------------------------------- #
 
 
-def _collect_result_texts(rows) -> dict[str, str]:
+def _load_canonical_session_events(
+    conn: sqlite3.Connection,
+    session_id: int,
+) -> list[_SessionEvent]:
+    if not _has_event_overrides_table(conn):
+        return _load_base_session_events(conn, session_id)
+
+    event_id_by_raw_ref = {
+        (row["source_path"], int(row["source_offset"]), int(row["seq"])): int(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id, source_path, source_offset, seq
+              FROM events
+             WHERE session_id = ?
+            """,
+            (session_id,),
+        )
+    }
+
+    stream: list[_SessionEvent] = []
+    for event in canonical_events(conn, session_id):
+        event_id = None
+        if event.raw_ref is not None:
+            event_id = event_id_by_raw_ref.get(event.raw_ref)
+        stream.append(
+            _SessionEvent(
+                event_id=event_id,
+                event_type=event.type,
+                event_key=event.event_key,
+                raw_json=event.raw_json,
+            )
+        )
+    return stream
+
+
+def _has_event_overrides_table(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM sqlite_master
+         WHERE type = 'table' AND name = 'event_overrides'
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _load_base_session_events(
+    conn: sqlite3.Connection,
+    session_id: int,
+) -> list[_SessionEvent]:
+    rows = conn.execute(
+        """
+        SELECT id, type, event_key, raw_json
+          FROM events
+         WHERE session_id = ?
+         ORDER BY event_at IS NULL, event_at, source_path, source_offset, seq
+        """,
+        (session_id,),
+    ).fetchall()
+    emitted_keys: set[str] = set()
+    stream: list[_SessionEvent] = []
+    for row in rows:
+        event_key = row["event_key"]
+        if event_key is not None:
+            if event_key in emitted_keys:
+                continue
+            emitted_keys.add(event_key)
+        stream.append(
+            _SessionEvent(
+                event_id=int(row["id"]),
+                event_type=row["type"],
+                event_key=event_key,
+                raw_json=row["raw_json"],
+            )
+        )
+    return stream
+
+
+def _collect_result_texts(rows, *, client: str) -> dict[str, str]:
     """Map `tool_id -> normalized result text` for paired lookup.
 
-    Only the *latest* tool_result wins if there are duplicates across
-    sources (native + LA emit the same logical event); cross-source
-    dedup happens at the read layer via 03's canonical_events for
-    consumers that need it, but for fingerprint comparison we just
-    pick whichever lands first — they should produce identical
-    normalized text by construction."""
+    Rows already come from `canonical_events`, so cross-source
+    duplicates have been removed before pairing."""
     out: dict[str, str] = {}
     for row in rows:
-        if row["type"] != "tool_result":
+        if row.event_type != "tool_result" or row.raw_json is None:
             continue
-        event_key = row["event_key"]
+        event_key = row.event_key
         if not event_key or not event_key.startswith("tool_result:"):
             continue
         tool_id = event_key[len("tool_result:") :]
         if tool_id in out:
             continue  # first one wins
         try:
-            parsed = json.loads(row["raw_json"])
+            parsed = json.loads(row.raw_json)
         except (TypeError, json.JSONDecodeError):
             continue
-        text = _result_text_for_client(row["client"], parsed)
+        if not isinstance(parsed, dict):
+            continue
+        text = _result_text_for_client(client, parsed)
         if text is None:
             continue
         out[tool_id] = normalize_outcome_text(text)
@@ -154,7 +251,11 @@ def _collect_result_texts(rows) -> dict[str, str]:
 
 
 def _build_rule_candidates(
-    rows, rule: LoopRule, results: dict[str, str]
+    rows,
+    rule: LoopRule,
+    results: dict[str, str],
+    *,
+    client: str,
 ) -> list[_CandidateRow]:
     """For a single rule, project the canonical stream down to (a)
     eligible-type rows and (b) breaker rows that reset adjacency.
@@ -165,47 +266,72 @@ def _build_rule_candidates(
     """
     candidates: list[_CandidateRow] = []
     for row in rows:
-        event_type = row["type"]
+        event_type = row.event_type
         if event_type == rule.event_type:
+            # Hook-only synthetic events have no `events.id` to cite
+            # in an incident row. Treat them as transparent — the
+            # surrounding real events remain adjacent.
+            if row.event_id is None:
+                continue
+            if row.raw_json is None:
+                candidates.append(
+                    _CandidateRow(
+                        event_id=int(row.event_id),
+                        event_type=event_type,
+                        event_key=row.event_key,
+                        fingerprint=None,
+                    )
+                )
+                continue
             try:
-                parsed = json.loads(row["raw_json"])
+                parsed = json.loads(row.raw_json)
             except (TypeError, json.JSONDecodeError):
                 # Eligible row whose payload won't parse: include it
                 # with fingerprint=None so it breaks the run rather
                 # than silently extending it.
                 candidates.append(
                     _CandidateRow(
-                        event_id=int(row["id"]),
+                        event_id=int(row.event_id),
                         event_type=event_type,
-                        event_key=row["event_key"],
-                        raw={},
+                        event_key=row.event_key,
+                        fingerprint=None,
+                    )
+                )
+                continue
+            if not isinstance(parsed, dict):
+                candidates.append(
+                    _CandidateRow(
+                        event_id=int(row.event_id),
+                        event_type=event_type,
+                        event_key=row.event_key,
                         fingerprint=None,
                     )
                 )
                 continue
             fingerprint = _fingerprint_for(
-                client=row["client"],
+                client=client,
                 event_type=event_type,
-                event_key=row["event_key"],
+                event_key=row.event_key,
                 parsed=parsed,
                 results=results,
             )
             candidates.append(
                 _CandidateRow(
-                    event_id=int(row["id"]),
+                    event_id=int(row.event_id),
                     event_type=event_type,
-                    event_key=row["event_key"],
-                    raw=parsed,
+                    event_key=row.event_key,
                     fingerprint=fingerprint,
                 )
             )
         elif event_type in _RUN_BREAKERS:
+            # Breakers never cite an event_id in the incident row, but
+            # hook-only overrides may have raw_ref=None → no id. Use 0
+            # as a harmless sentinel; it's never read back.
             candidates.append(
                 _CandidateRow(
-                    event_id=int(row["id"]),
+                    event_id=int(row.event_id) if row.event_id is not None else 0,
                     event_type=event_type,
-                    event_key=row["event_key"],
-                    raw={},
+                    event_key=row.event_key,
                     fingerprint=None,
                 )
             )
@@ -292,10 +418,10 @@ def _fingerprint_for(
     outcome = results.get(tool_id, "") if tool_id is not None else ""
 
     if event_type == "command_start":
-        command = _command_string_for_client(client, parsed)
+        command, args_key = _command_signature_for_client(client, parsed)
         if not command:
             return None
-        return ("command_start", command, outcome)
+        return ("command_start", command, args_key, outcome)
     if event_type == "tool_call":
         name, args_key = _tool_call_signature_for_client(client, parsed)
         if not name:
@@ -319,7 +445,9 @@ def _tool_id_from_event_key(event_key: str | None) -> str | None:
     return None
 
 
-def _command_string_for_client(client: str, parsed: dict) -> str | None:
+def _command_signature_for_client(
+    client: str, parsed: dict
+) -> tuple[str | None, str]:
     if client in ("claude", "openclaw"):
         # Either a Bash tool_use carrying input.command, or a
         # bashExecution role carrying a top-level command string.
@@ -328,7 +456,7 @@ def _command_string_for_client(client: str, parsed: dict) -> str | None:
             if message.get("role") == "bashExecution":
                 command = message.get("command")
                 if isinstance(command, str) and command.strip():
-                    return command
+                    return command, _canonical_args({"command": command})
             content = message.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -339,38 +467,58 @@ def _command_string_for_client(client: str, parsed: dict) -> str | None:
                     name = block.get("name")
                     if not _is_shell_tool_name(name):
                         continue
-                    inp = block.get("input")
-                    if isinstance(inp, dict):
-                        cmd = inp.get("command")
-                        if isinstance(cmd, str) and cmd.strip():
-                            return cmd
-                    return None
-        return None
+                    args = block.get("input") if "input" in block else block.get("arguments")
+                    return _command_signature_from_args(args)
+        return None, ""
     if client == "codex":
         payload = parsed.get("payload")
         if not isinstance(payload, dict):
-            return None
+            return None, ""
         if payload.get("type") not in ("function_call", "custom_tool_call"):
-            return None
+            return None, ""
         if not _is_shell_tool_name(payload.get("name")):
-            return None
+            return None, ""
         args = payload.get("arguments")
         if isinstance(args, str):
             try:
                 args_obj = json.loads(args)
             except json.JSONDecodeError:
-                return args.strip() or None
+                stripped = args.strip()
+                return (stripped or None), stripped
         elif isinstance(args, dict):
             args_obj = args
         else:
-            return None
-        cmd = args_obj.get("command") if isinstance(args_obj, dict) else None
-        if isinstance(cmd, list):
-            return " ".join(str(p) for p in cmd)
-        if isinstance(cmd, str) and cmd.strip():
-            return cmd
-        return None
-    return None
+            return None, ""
+        return _command_signature_from_args(args_obj)
+    return None, ""
+
+
+def _command_signature_from_args(args: object) -> tuple[str | None, str]:
+    args_key = _shell_fingerprint_key(args)
+    if not isinstance(args, dict):
+        return None, args_key
+    cmd = args.get("command")
+    if isinstance(cmd, list):
+        joined = " ".join(str(part) for part in cmd).strip()
+        return (joined or None), args_key
+    if isinstance(cmd, str):
+        stripped = cmd.strip()
+        return (stripped or None), args_key
+    return None, args_key
+
+
+def _shell_fingerprint_key(args: object) -> str:
+    """Canonicalize *only* the shell-identity fields of `args`.
+
+    Prevents Claude Bash's `description`/`timeout`/`run_in_background`
+    drift from hiding otherwise-identical retries.
+    """
+    if not isinstance(args, dict):
+        return _canonical_args(args)
+    filtered = {
+        k: args[k] for k in _SHELL_FINGERPRINT_FIELDS if k in args
+    }
+    return _canonical_args(filtered)
 
 
 def _tool_call_signature_for_client(
@@ -423,10 +571,9 @@ def _canonical_args(args: object) -> str:
 
 
 def _is_shell_tool_name(name: object) -> bool:
-    if not isinstance(name, str):
-        return False
-    lowered = name.lower()
-    return lowered in {"bash", "shell", "sh", "zsh"}
+    return is_shell_tool(name) or (
+        isinstance(name, str) and name.strip().lower() in {"sh", "zsh"}
+    )
 
 
 def _result_text_for_client(client: str, parsed: dict) -> str | None:
@@ -438,6 +585,10 @@ def _result_text_for_client(client: str, parsed: dict) -> str | None:
     if client in ("claude", "openclaw"):
         message = parsed.get("message")
         if isinstance(message, dict):
+            if client == "openclaw" and message.get("role") == "toolResult":
+                text = _flatten_text(message.get("content"))
+                if text is not None:
+                    return text
             content = message.get("content")
             if isinstance(content, list):
                 for block in content:
