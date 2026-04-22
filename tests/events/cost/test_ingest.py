@@ -290,24 +290,78 @@ def test_ingest_threads_codex_model_from_prior_run_turn_context(conn):
     assert row["cost_estimate"] is not None and row["cost_estimate"] > 0
 
 
-def test_ingest_threads_codex_model_from_null_timestamp_turn_context(conn):
+def test_ingest_threads_codex_model_from_prior_null_timestamp_turn_context(conn):
     sid = _insert_session(conn, session_key="s:codex-null-ts", client="codex")
     _insert_event(
         conn, session_id=sid, client="codex", event_type="schema_unknown",
         raw={"type": "turn_context", "payload": {"model": "gpt-5-codex"}},
         event_at=None,
     )
+    first = ingest_cost_pending(conn)
+    assert first.events_scanned == 1
+    assert first.token_rows_written == 0
+
     eid = _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw=_codex_token_count(input_tokens=3655, cached=2048, reasoning=64),
+        event_at=None,
+    )
+
+    second = ingest_cost_pending(conn)
+    row = conn.execute("SELECT * FROM token_usage WHERE event_id = ?", (eid,)).fetchone()
+    assert second.events_scanned == 1
+    assert second.token_rows_written == 1
+    assert row is not None
+    assert row["model"] == "gpt-5-codex"
+    assert row["cost_estimate"] is not None and row["cost_estimate"] > 0
+
+
+def test_ingest_does_not_emit_false_model_shift_from_null_timestamp_backfill(conn):
+    sid = _insert_session(conn, session_key="s:codex-null-false-shift", client="codex")
+    _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw={"type": "turn_context", "payload": {"model": "gpt-5-codex"}},
+        event_at=None,
+    )
+    first_eid = _insert_event(
         conn, session_id=sid, client="codex", event_type="schema_unknown",
         raw=_codex_token_count(input_tokens=3655, cached=2048, reasoning=64),
         event_at="2026-04-20T10:00:01Z",
     )
+    _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw={"type": "turn_context", "payload": {"model": "gpt-5.3-codex"}},
+        event_at="2026-04-20T10:00:02Z",
+    )
+    second_eid = _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw=_codex_token_count(input_tokens=4000, cached=1024, reasoning=32),
+        event_at="2026-04-20T10:00:03Z",
+    )
 
     ingest_cost_pending(conn)
-    row = conn.execute("SELECT * FROM token_usage WHERE event_id = ?", (eid,)).fetchone()
-    assert row is not None
-    assert row["model"] == "gpt-5-codex"
-    assert row["cost_estimate"] is not None and row["cost_estimate"] > 0
+
+    first_row = conn.execute(
+        "SELECT model FROM token_usage WHERE event_id = ?",
+        (first_eid,),
+    ).fetchone()
+    second_row = conn.execute(
+        "SELECT model FROM token_usage WHERE event_id = ?",
+        (second_eid,),
+    ).fetchone()
+    kinds = [
+        row["kind"]
+        for row in conn.execute(
+            "SELECT kind FROM cost_anomalies WHERE session_id = ?",
+            (sid,),
+        )
+    ]
+
+    assert first_row is not None
+    assert first_row["model"] is None
+    assert second_row is not None
+    assert second_row["model"] == "gpt-5.3-codex"
+    assert "model_shift" not in kinds
 
 
 # --------------------------------------------------------------------------- #
