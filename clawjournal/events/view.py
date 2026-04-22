@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS event_overrides (
     payload_json  TEXT    NOT NULL,
     origin        TEXT,
     created_at    TEXT    NOT NULL,
+    write_seq     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, event_key)
 );
 CREATE INDEX IF NOT EXISTS idx_event_overrides_session ON event_overrides(session_id);
@@ -69,6 +70,19 @@ CREATE INDEX IF NOT EXISTS idx_event_overrides_session ON event_overrides(sessio
 def ensure_view_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA_SQL)
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(event_overrides)")
+    }
+    if "write_seq" not in existing:
+        conn.execute(
+            "ALTER TABLE event_overrides "
+            "ADD COLUMN write_seq INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_event_overrides_write_seq "
+        "ON event_overrides(write_seq)"
+    )
+    _backfill_override_write_seq(conn)
 
 
 # --- types ---------------------------------------------------------------- #
@@ -99,11 +113,12 @@ class CapabilityState(NamedTuple):
 # --- hook override writer -------------------------------------------------- #
 
 
-_UPSERT_SQL = """
+_UPSERT_OVERRIDE_SQL = """
 INSERT INTO event_overrides (
     session_id, event_key, type, source, confidence, lossiness,
-    event_at, payload_json, origin, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    event_at, payload_json, origin, created_at, write_seq
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          (SELECT COALESCE(MAX(write_seq), 0) + 1 FROM event_overrides))
 ON CONFLICT(session_id, event_key) DO UPDATE SET
     type         = excluded.type,
     source       = excluded.source,
@@ -112,7 +127,8 @@ ON CONFLICT(session_id, event_key) DO UPDATE SET
     event_at     = excluded.event_at,
     payload_json = excluded.payload_json,
     origin       = excluded.origin,
-    created_at   = excluded.created_at
+    created_at   = excluded.created_at,
+    write_seq    = excluded.write_seq
   WHERE
     CASE excluded.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END
     >
@@ -166,9 +182,13 @@ def write_hook_override(
         raise KeyError(f"session_key not found in event_sessions: {session_key}")
 
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    # Single-statement UPSERT is atomic under SQLite's default
+    # isolation — the rank-guard and the `created_at` bump both live
+    # inside the ON CONFLICT clause, so two concurrent writers can't
+    # race between a pre-check and the write.
     with conn:
         cursor = conn.execute(
-            _UPSERT_SQL,
+            _UPSERT_OVERRIDE_SQL,
             (
                 session_id,
                 event_key,
@@ -191,6 +211,33 @@ def _resolve_session_id(conn: sqlite3.Connection, session_key: str) -> int | Non
         (session_key,),
     ).fetchone()
     return None if row is None else int(row[0])
+
+
+def _backfill_override_write_seq(conn: sqlite3.Connection) -> None:
+    """Assign stable non-zero write order to pre-migration rows."""
+    conn.execute(
+        """
+        WITH max_seq AS (
+            SELECT COALESCE(MAX(write_seq), 0) AS base
+              FROM event_overrides
+        ),
+        ordered AS (
+            SELECT rowid AS rid,
+                   (SELECT base FROM max_seq)
+                   + ROW_NUMBER() OVER (
+                         ORDER BY created_at IS NULL, created_at, session_id, event_key
+                     ) AS seq
+              FROM event_overrides
+             WHERE write_seq = 0
+        )
+        UPDATE event_overrides
+           SET write_seq = (
+               SELECT seq FROM ordered WHERE ordered.rid = event_overrides.rowid
+           )
+         WHERE rowid IN (SELECT rid FROM ordered)
+           AND write_seq = 0
+        """
+    )
 
 
 # --- canonical reader ----------------------------------------------------- #
