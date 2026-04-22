@@ -296,7 +296,7 @@ def _latest_codex_model_before_event(
     canonical order to recover the model rather than depending on re-scans.
     """
     if event_at is not None:
-        model = _latest_codex_model_from_rows(
+        return _latest_codex_model_from_rows(
             conn.execute(
                 """
                 SELECT raw_json
@@ -310,12 +310,9 @@ def _latest_codex_model_before_event(
                 (session_id, event_at, event_at, event_id),
             )
         )
-        if model:
-            return model
 
-    # Fallback for earlier rows that carried no vendor timestamp. This keeps
-    # replay robust when an older turn_context predates a later token_count by
-    # source order / id but not by event_at presence.
+    # Null-timestamp rows sort after all timestamped rows in canonical order,
+    # so only a null-timestamp candidate can inherit from earlier null rows.
     model = _latest_codex_model_from_rows(
         conn.execute(
             """
@@ -333,24 +330,20 @@ def _latest_codex_model_before_event(
     if model:
         return model
 
-    if event_at is None:
-        model = _latest_codex_model_from_rows(
-            conn.execute(
-                """
-                SELECT raw_json
-                  FROM events
-                 WHERE session_id = ?
-                   AND client = 'codex'
-                   AND event_at IS NOT NULL
-                   AND id < ?
-                 ORDER BY event_at DESC, id DESC
-                """,
-                (session_id, event_id),
-            )
+    return _latest_codex_model_from_rows(
+        conn.execute(
+            """
+            SELECT raw_json
+              FROM events
+             WHERE session_id = ?
+               AND client = 'codex'
+               AND event_at IS NOT NULL
+               AND id < ?
+             ORDER BY event_at DESC, id DESC
+            """,
+            (session_id, event_id),
         )
-        if model:
-            return model
-    return None
+    )
 
 
 def _latest_codex_model_from_rows(rows) -> str | None:
