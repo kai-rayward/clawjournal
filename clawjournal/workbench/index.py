@@ -782,7 +782,7 @@ def backfill_session_keys(conn: sqlite3.Connection) -> int:
         return 0
 
     with conn:
-        conn.executemany(
+        cursor = conn.executemany(
             """
             UPDATE sessions
                SET session_key = ?
@@ -791,7 +791,11 @@ def backfill_session_keys(conn: sqlite3.Connection) -> int:
             """,
             updates,
         )
-    return len(updates)
+    # `cursor.rowcount` reflects rows actually affected by the guarded UPDATE
+    # (concurrent backfills can see the same NULL candidates and race; the
+    # `session_key IS NULL` guard keeps the data correct but `len(updates)`
+    # would over-report in that case).
+    return max(cursor.rowcount, 0)
 
 
 def session_matches_excluded_projects(
