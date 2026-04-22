@@ -315,6 +315,52 @@ def test_unrelated_event_between_repeats_breaks_the_run(conn):
     assert n == 0
 
 
+def test_transparent_event_between_repeats_does_not_break_the_run(conn):
+    """Only `user_message` / `compaction` reset adjacency. An
+    `assistant_message` between two `command_start`s is bookkeeping,
+    not new external input, and must NOT break the run."""
+    sid = _insert_session(conn, session_key="s:transparent", client="claude")
+    for i in range(2):
+        _claude_bash_pair(
+            conn, session_id=sid, tool_id=f"a-{i}",
+            command="npm test", output="FAIL same",
+        )
+    _insert_event(
+        conn, session_id=sid, client="claude", event_type="assistant_message",
+        raw={"type": "assistant", "message": {"content": "let me try again"}},
+    )
+    _claude_bash_pair(
+        conn, session_id=sid, tool_id="a-2",
+        command="npm test", output="FAIL same",
+    )
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count FROM incidents").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 3
+
+
+def test_compaction_event_breaks_the_run(conn):
+    """A `compaction` event means the conversation was summarized and
+    the next attempt is against refreshed context — it must break
+    adjacency just like a `user_message` does."""
+    sid = _insert_session(conn, session_key="s:compaction", client="claude")
+    for i in range(2):
+        _claude_bash_pair(
+            conn, session_id=sid, tool_id=f"a-{i}",
+            command="npm test", output="FAIL same",
+        )
+    _insert_event(
+        conn, session_id=sid, client="claude", event_type="compaction",
+        raw={"type": "system", "subtype": "compact_boundary"},
+    )
+    _claude_bash_pair(
+        conn, session_id=sid, tool_id="a-2",
+        command="npm test", output="FAIL same",
+    )
+    ingest_loop_incidents(conn)
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
 def test_distinct_outputs_do_not_count_as_a_loop(conn):
     """Same command with materially different output is NOT a loop —
     progress is being made."""
@@ -413,6 +459,51 @@ def test_tool_call_below_threshold_does_not_emit(conn):
         )
     ingest_loop_incidents(conn)
     assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
+def test_shell_tool_call_events_do_not_double_emit(conn):
+    """A shell `tool_call` event (e.g. name=`Bash`) has a paired
+    `command_start` event carrying the more meaningful (command,
+    outcome) fingerprint. If the `tool_call` rule also matched, 5
+    identical Bash calls would produce TWO incidents — one under the
+    command-threshold=3 rule, one under the tool-call-threshold=5 rule.
+    `_fingerprint_for` drops shell-named tool_calls for exactly this
+    reason."""
+    sid = _insert_session(conn, session_key="s:shell-tc", client="claude")
+    for i in range(DEFAULT_TOOL_CALL_THRESHOLD):
+        tool_id = f"tc-{i}"
+        # Emit BOTH a command_start (what the shell rule sees) and a
+        # tool_call with name=Bash (what the tool-call rule would see
+        # if the dedup guard regressed).
+        _claude_bash_pair(
+            conn, session_id=sid, tool_id=tool_id,
+            command="npm test", output="FAIL",
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="tool_call",
+            event_key=f"tool_call:{tool_id}-tc",
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"{tool_id}-tc",
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        }
+                    ]
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count, evidence_json FROM incidents").fetchall()
+    assert len(rows) == 1  # ONE incident, not two
+    assert json.loads(rows[0]["evidence_json"])["event_type"] == "command_start"
 
 
 # --------------------------------------------------------------------------- #
@@ -751,6 +842,35 @@ def test_unparseable_raw_json_breaks_run_safely(conn):
     summary = ingest_loop_incidents(conn)
     # The bad row breaks the run; we only have 2 and then 2 → no loop.
     assert summary.incidents_written == 0
+
+
+def test_evidence_json_hashes_outcome_text_instead_of_storing_it(conn):
+    """`incidents.evidence_json` must NOT carry the paired tool_result
+    text verbatim — otherwise secrets that survived the normalizer
+    (anything outside the five fingerprint-normalization rules) would
+    be written into the DB and surface through any consumer that
+    doesn't re-run redaction. The fingerprint's outcome slot is stored
+    as a `sha256:<prefix>` token; the real text stays reachable via
+    `first_event_id` / `last_event_id` through the normal paths."""
+    sid = _insert_session(conn, session_key="s:secret-outcome", client="claude")
+    # Construct an output whose "secret" portion survives the
+    # normalizer (no timestamps / home paths / PIDs / whitespace).
+    secret_output = "ERROR: invalid token AKIA1234567890ABCDEF please check config"
+    for i in range(3):
+        _claude_bash_pair(
+            conn, session_id=sid, tool_id=f"tu-{i}",
+            command="deploy", output=secret_output,
+        )
+    ingest_loop_incidents(conn)
+    row = conn.execute(
+        "SELECT evidence_json FROM incidents WHERE session_id = ?", (sid,)
+    ).fetchone()
+    evidence_text = row["evidence_json"]
+    assert "AKIA1234567890ABCDEF" not in evidence_text
+    evidence = json.loads(evidence_text)
+    outcome_token = evidence["fingerprint"][-1]
+    assert outcome_token.startswith("sha256:")
+    assert len(outcome_token) == len("sha256:") + 16
 
 
 def test_claude_bash_description_and_timeout_drift_still_count_as_loop(conn):

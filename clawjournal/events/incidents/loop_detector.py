@@ -26,6 +26,7 @@ which 02 already populates.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
@@ -365,7 +366,7 @@ def _emit_runs_for_rule(
             confidence=confidence,
             evidence={
                 "event_type": rule.event_type,
-                "fingerprint": list(cur_fingerprint),
+                "fingerprint": _serialize_fingerprint(cur_fingerprint),
                 "threshold": rule.threshold,
                 "first_event_id": run[0].event_id,
                 "last_event_id": run[-1].event_id,
@@ -434,6 +435,33 @@ def _fingerprint_for(
             return None
         return ("tool_call", name, args_key, outcome)
     return None
+
+
+def _serialize_fingerprint(fingerprint: tuple) -> list:
+    """Project an in-memory fingerprint tuple into the form stored in
+    `incidents.evidence_json`.
+
+    The live fingerprint carries the normalized paired-`tool_result`
+    text as its last element so run-grouping can compare outcomes. That
+    text is derived from `events.raw_json` and has NOT been through the
+    workbench regex/PII redaction pipeline — persisting it verbatim in
+    `evidence_json` would smuggle secrets past any consumer that reads
+    incidents without re-redacting. We replace the outcome with a
+    truncated sha256 so grouping + audit still work without leaking the
+    payload; the full text remains reachable via `first_event_id` /
+    `last_event_id` through the normal redaction paths.
+    """
+    if not fingerprint:
+        return []
+    out = list(fingerprint)
+    outcome = out[-1]
+    if isinstance(outcome, str):
+        if outcome == "":
+            out[-1] = ""  # preserve the "no outcome available" signal
+        else:
+            digest = hashlib.sha256(outcome.encode("utf-8")).hexdigest()[:16]
+            out[-1] = f"sha256:{digest}"
+    return out
 
 
 def _tool_id_from_event_key(event_key: str | None) -> str | None:
