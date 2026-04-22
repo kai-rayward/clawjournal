@@ -8,6 +8,7 @@ import pytest
 from clawjournal.workbench.index import (
     _migrate_bundles_to_shares,
     add_policy,
+    backfill_session_keys,
     create_share,
     get_effective_share_settings,
     get_dashboard_analytics,
@@ -246,6 +247,26 @@ class TestUpsertSessions:
             "SELECT session_key FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
         assert row["session_key"] == expected
+
+    def test_backfill_session_keys_on_fresh_db_without_events_ingest(self, index_conn):
+        """Calling backfill before any events ingest must not crash on missing
+        `event_sessions` / `events` tables — it should ensure them and fall
+        through to path derivation.
+        """
+        index_conn.execute(
+            "INSERT INTO sessions (session_id, project, source, raw_source_path, indexed_at) "
+            "VALUES ('legacy', 'p', 'claude', "
+            "'/home/u/.claude/projects/p/uuid1.jsonl', '2026-01-01T00:00:00Z')"
+        )
+        index_conn.commit()
+
+        updated = backfill_session_keys(index_conn)
+        assert updated == 1
+
+        row = index_conn.execute(
+            "SELECT session_key FROM sessions WHERE session_id = 'legacy'"
+        ).fetchone()
+        assert row["session_key"] == "claude:p:uuid1"
 
     def test_upsert_derives_local_agent_session_key_from_wrapper(self, index_conn, tmp_path):
         workspace_dir = (

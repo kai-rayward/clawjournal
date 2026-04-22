@@ -748,7 +748,15 @@ def _lookup_event_session_key(
 
 
 def backfill_session_keys(conn: sqlite3.Connection) -> int:
-    """Populate missing `sessions.session_key` values from events or path derivation."""
+    """Populate missing `sessions.session_key` values from events or path derivation.
+
+    Safe to call on a fresh workbench DB where no ``events ingest`` has run yet —
+    ``event_sessions`` / ``events`` are ensured here, so ``_lookup_event_session_key``
+    degrades to an empty query and the backfill falls through to path derivation.
+    """
+    from clawjournal.events.schema import ensure_schema as ensure_event_schema
+
+    ensure_event_schema(conn)
     rows = conn.execute(
         """
         SELECT session_id, source, raw_source_path
