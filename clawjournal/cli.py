@@ -3240,6 +3240,26 @@ def main() -> None:
         "--json", action="store_true", help="Output JSON summary"
     )
 
+    events_incidents = events_sub.add_parser(
+        "incidents",
+        help="Incidents pipeline (loop detector lite, future: more kinds)",
+    )
+    events_incidents_sub = events_incidents.add_subparsers(
+        dest="incidents_command", required=True
+    )
+    events_incidents_detect = events_incidents_sub.add_parser(
+        "detect",
+        help="Detect exact-repeat command/tool-call loops in recorded events",
+    )
+    events_incidents_detect.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Clear loop incidents + cursor, re-evaluate every session",
+    )
+    events_incidents_detect.add_argument(
+        "--json", action="store_true", help="Output JSON summary"
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -3916,6 +3936,10 @@ def _run_events(args) -> None:
         _run_events_cost(args)
         return
 
+    if args.events_command == "incidents":
+        _run_events_incidents(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -3955,6 +3979,32 @@ def _run_events_cost(args) -> None:
         f"Cost ledger: scanned {payload['events_scanned']} events, "
         f"wrote {payload['token_rows_written']} token_usage rows + "
         f"{payload['anomalies_written']} anomalies "
+        f"across {payload['sessions_touched']} sessions."
+    )
+
+
+def _run_events_incidents(args) -> None:
+    from .events.incidents import ingest_loop_incidents
+    from .workbench.index import open_index
+
+    if args.incidents_command != "detect":
+        print(f"Unknown incidents command: {args.incidents_command}", file=sys.stderr)
+        sys.exit(2)
+
+    conn = open_index()
+    try:
+        summary = ingest_loop_incidents(conn, rebuild=args.rebuild)
+    finally:
+        conn.close()
+
+    payload = summary.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        f"Loop detector: scanned {payload['events_scanned']} new events, "
+        f"evaluated {payload['sessions_evaluated']} sessions, "
+        f"wrote {payload['incidents_written']} loop incidents "
         f"across {payload['sessions_touched']} sessions."
     )
 
