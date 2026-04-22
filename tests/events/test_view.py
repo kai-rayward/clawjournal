@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -239,14 +240,93 @@ def test_write_hook_override_higher_rank_replaces(conn):
     assert write_hook_override(
         conn, confidence="low", payload_json='{"v": 1}', **common
     ) is True
+    first_created_at = conn.execute(
+        "SELECT created_at FROM event_overrides"
+    ).fetchone()[0]
+    # Ensure the second write's wall-clock `created_at` is strictly
+    # greater — microsecond-precision ISO timestamps need a brief
+    # pause for the string to sort ahead of the first one.
+    time.sleep(0.01)
     assert write_hook_override(
         conn, confidence="high", payload_json='{"v": 2}', **common
     ) is True
     row = conn.execute(
-        "SELECT confidence, payload_json FROM event_overrides"
+        "SELECT confidence, payload_json, created_at FROM event_overrides"
     ).fetchone()
     assert row["confidence"] == "high"
     assert row["payload_json"] == '{"v": 2}'
+    # `created_at` must bump on a rank-winning overwrite so the loop-
+    # detector cursor picks up the upgraded override as "new."
+    assert row["created_at"] > first_created_at
+
+
+def test_write_hook_override_concurrent_writers_do_not_corrupt_state(tmp_path):
+    """Two processes racing to upgrade the same override must not
+    produce a duplicate-PK IntegrityError, a stale rank-guard bypass,
+    or a partial row. The single-statement UPSERT is atomic under
+    SQLite's default isolation — this test pins that guarantee."""
+    import threading
+
+    db_path = tmp_path / "race.db"
+
+    def _open() -> sqlite3.Connection:
+        c = sqlite3.connect(str(db_path), timeout=5.0)
+        c.row_factory = sqlite3.Row
+        return c
+
+    setup = _open()
+    ensure_events_schema(setup)
+    ensure_view_schema(setup)
+    _insert_event_session(setup, session_key="s:race", client="claude")
+    setup.close()
+
+    common = dict(
+        session_key="s:race",
+        event_key="tool_call:tu-race",
+        event_type="tool_call",
+        source="hook",
+        lossiness="none",
+        event_at=TS0,
+        origin=None,
+    )
+    errors: list[Exception] = []
+
+    def worker(confidence: str, payload: str):
+        conn = _open()
+        try:
+            for _ in range(20):
+                try:
+                    write_hook_override(
+                        conn,
+                        confidence=confidence,
+                        payload_json=payload,
+                        **common,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=worker, args=("high", '{"who": "A"}')),
+        threading.Thread(target=worker, args=("high", '{"who": "B"}')),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+
+    verify = _open()
+    rows = verify.execute(
+        "SELECT confidence, payload_json FROM event_overrides"
+    ).fetchall()
+    verify.close()
+    assert len(rows) == 1  # exactly one winner, no duplicates
+    assert rows[0]["confidence"] == "high"
+    assert rows[0]["payload_json"] in ('{"who": "A"}', '{"who": "B"}')
 
 
 def test_write_hook_override_raises_on_unknown_session(conn):

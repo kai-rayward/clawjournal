@@ -1,7 +1,8 @@
 """Loop detector (lite) — flag exact-repeat command and tool-call runs.
 
 The detector walks a session's events in canonical order and computes
-a per-event "fingerprint" from `events.raw_json` plus the matching
+a per-event "fingerprint" from the canonical payload (override
+`payload_json` when present, else base `raw_json`) plus the matching
 `tool_result` row. Consecutive events sharing a fingerprint are
 grouped into a run; runs meeting the per-rule threshold become
 `incidents` rows of kind `loop_exact_repeat`.
@@ -81,7 +82,7 @@ _RUN_BREAKERS = frozenset({"user_message", "compaction"})
 # Claude Bash's `description`, `timeout`, `run_in_background`) are
 # model-narrated or ergonomic and would otherwise hide loops whenever
 # those fields drift between identical retries.
-_SHELL_FINGERPRINT_FIELDS = frozenset({"command", "workdir", "cwd"})
+_SHELL_FINGERPRINT_FIELDS = frozenset({"command", "cmd", "workdir", "cwd"})
 
 
 @dataclass
@@ -98,6 +99,7 @@ class _SessionEvent:
     event_type: str
     event_key: str | None
     raw_json: str | None
+    payload_json: str | None
 
 
 def detect_session_loops(
@@ -175,6 +177,7 @@ def _load_canonical_session_events(
                 event_type=event.type,
                 event_key=event.event_key,
                 raw_json=event.raw_json,
+                payload_json=event.payload_json,
             )
         )
     return stream
@@ -218,6 +221,7 @@ def _load_base_session_events(
                 event_type=row["type"],
                 event_key=event_key,
                 raw_json=row["raw_json"],
+                payload_json=None,
             )
         )
     return stream
@@ -230,21 +234,21 @@ def _collect_result_texts(rows, *, client: str) -> dict[str, str]:
     duplicates have been removed before pairing."""
     out: dict[str, str] = {}
     for row in rows:
-        if row.event_type != "tool_result" or row.raw_json is None:
+        payload_json = _effective_payload_json(row)
+        if row.event_type != "tool_result" or payload_json is None:
             continue
-        event_key = row.event_key
-        if not event_key or not event_key.startswith("tool_result:"):
+        tool_id = _tool_result_id_from_event_key(row.event_key)
+        if tool_id is None:
             continue
-        tool_id = event_key[len("tool_result:") :]
         if tool_id in out:
             continue  # first one wins
         try:
-            parsed = json.loads(row.raw_json)
+            parsed = json.loads(payload_json)
         except (TypeError, json.JSONDecodeError):
             continue
         if not isinstance(parsed, dict):
             continue
-        text = _result_text_for_client(client, parsed)
+        text = _result_text_for_client(client, parsed, tool_id=tool_id)
         if text is None:
             continue
         out[tool_id] = normalize_outcome_text(text)
@@ -274,7 +278,8 @@ def _build_rule_candidates(
             # surrounding real events remain adjacent.
             if row.event_id is None:
                 continue
-            if row.raw_json is None:
+            payload_json = _effective_payload_json(row)
+            if payload_json is None:
                 candidates.append(
                     _CandidateRow(
                         event_id=int(row.event_id),
@@ -285,7 +290,7 @@ def _build_rule_candidates(
                 )
                 continue
             try:
-                parsed = json.loads(row.raw_json)
+                parsed = json.loads(payload_json)
             except (TypeError, json.JSONDecodeError):
                 # Eligible row whose payload won't parse: include it
                 # with fingerprint=None so it breaks the run rather
@@ -417,14 +422,25 @@ def _fingerprint_for(
     """
     tool_id = _tool_id_from_event_key(event_key)
     outcome = results.get(tool_id, "") if tool_id is not None else ""
+    inline_outcome = _inline_outcome_for_client(client, event_type, parsed)
+    if inline_outcome is not None:
+        outcome = normalize_outcome_text(inline_outcome)
 
     if event_type == "command_start":
-        command, args_key = _command_signature_for_client(client, parsed)
+        command, args_key = _command_signature_for_client(
+            client,
+            parsed,
+            tool_id=tool_id,
+        )
         if not command:
             return None
         return ("command_start", command, args_key, outcome)
     if event_type == "tool_call":
-        name, args_key = _tool_call_signature_for_client(client, parsed)
+        name, args_key = _tool_call_signature_for_client(
+            client,
+            parsed,
+            tool_id=tool_id,
+        )
         if not name:
             return None
         # Shell tool calls already get a `command_start` companion
@@ -465,16 +481,27 @@ def _serialize_fingerprint(fingerprint: tuple) -> list:
 
 
 def _tool_id_from_event_key(event_key: str | None) -> str | None:
+    return _event_key_suffix(event_key, "command_start:", "tool_call:")
+
+
+def _tool_result_id_from_event_key(event_key: str | None) -> str | None:
+    return _event_key_suffix(event_key, "tool_result:")
+
+
+def _event_key_suffix(event_key: str | None, *prefixes: str) -> str | None:
     if not event_key:
         return None
-    for prefix in ("command_start:", "tool_call:"):
+    for prefix in prefixes:
         if event_key.startswith(prefix):
             return event_key[len(prefix) :]
     return None
 
 
 def _command_signature_for_client(
-    client: str, parsed: dict
+    client: str,
+    parsed: dict,
+    *,
+    tool_id: str | None,
 ) -> tuple[str | None, str]:
     if client in ("claude", "openclaw"):
         # Either a Bash tool_use carrying input.command, or a
@@ -485,18 +512,14 @@ def _command_signature_for_client(
                 command = message.get("command")
                 if isinstance(command, str) and command.strip():
                     return command, _canonical_args({"command": command})
-            content = message.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") not in ("tool_use", "toolCall"):
-                        continue
-                    name = block.get("name")
-                    if not _is_shell_tool_name(name):
-                        continue
-                    args = block.get("input") if "input" in block else block.get("arguments")
-                    return _command_signature_from_args(args)
+            block = _matching_tool_call_block(message, expected_tool_id=tool_id)
+            if block is None:
+                return None, ""
+            name = block.get("name")
+            if not _is_shell_tool_name(name):
+                return None, ""
+            args = block.get("input") if "input" in block else block.get("arguments")
+            return _command_signature_from_args(args)
         return None, ""
     if client == "codex":
         payload = parsed.get("payload")
@@ -523,16 +546,7 @@ def _command_signature_for_client(
 
 def _command_signature_from_args(args: object) -> tuple[str | None, str]:
     args_key = _shell_fingerprint_key(args)
-    if not isinstance(args, dict):
-        return None, args_key
-    cmd = args.get("command")
-    if isinstance(cmd, list):
-        joined = " ".join(str(part) for part in cmd).strip()
-        return (joined or None), args_key
-    if isinstance(cmd, str):
-        stripped = cmd.strip()
-        return (stripped or None), args_key
-    return None, args_key
+    return _shell_command_from_args(args), args_key
 
 
 def _shell_fingerprint_key(args: object) -> str:
@@ -549,27 +563,44 @@ def _shell_fingerprint_key(args: object) -> str:
     return _canonical_args(filtered)
 
 
+def _shell_command_from_args(args: object) -> str | None:
+    if not isinstance(args, dict):
+        return None
+    for key in ("command", "cmd"):
+        command = _command_value_to_string(args.get(key))
+        if command is not None:
+            return command
+    return None
+
+
+def _command_value_to_string(value: object) -> str | None:
+    if isinstance(value, list):
+        joined = " ".join(str(part) for part in value).strip()
+        return joined or None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
 def _tool_call_signature_for_client(
-    client: str, parsed: dict
+    client: str,
+    parsed: dict,
+    *,
+    tool_id: str | None,
 ) -> tuple[str | None, str]:
     if client in ("claude", "openclaw"):
         message = parsed.get("message")
         if not isinstance(message, dict):
             return None, ""
-        content = message.get("content")
-        if not isinstance(content, list):
+        block = _matching_tool_call_block(message, expected_tool_id=tool_id)
+        if block is None:
             return None, ""
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") not in ("tool_use", "toolCall"):
-                continue
-            name = block.get("name")
-            if not isinstance(name, str):
-                continue
-            args = block.get("input") if "input" in block else block.get("arguments")
-            return name, _canonical_args(args)
-        return None, ""
+        name = block.get("name")
+        if not isinstance(name, str):
+            return None, ""
+        args = block.get("input") if "input" in block else block.get("arguments")
+        return name, _canonical_args(args)
     if client == "codex":
         payload = parsed.get("payload")
         if not isinstance(payload, dict):
@@ -604,7 +635,12 @@ def _is_shell_tool_name(name: object) -> bool:
     )
 
 
-def _result_text_for_client(client: str, parsed: dict) -> str | None:
+def _result_text_for_client(
+    client: str,
+    parsed: dict,
+    *,
+    tool_id: str | None,
+) -> str | None:
     """Pull the human-readable result text from a tool_result row.
 
     Falls back to a stable JSON dump if the wire format puts the
@@ -614,20 +650,24 @@ def _result_text_for_client(client: str, parsed: dict) -> str | None:
         message = parsed.get("message")
         if isinstance(message, dict):
             if client == "openclaw" and message.get("role") == "toolResult":
+                message_tool_id = _tool_result_message_id(message)
+                if (
+                    tool_id is not None
+                    and message_tool_id is not None
+                    and message_tool_id != tool_id
+                ):
+                    return None
                 text = _flatten_text(message.get("content"))
                 if text is not None:
                     return text
-            content = message.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") != "tool_result":
-                        continue
-                    inner = block.get("content")
-                    text = _flatten_text(inner)
-                    if text is not None:
-                        return text
+            block = _matching_tool_result_block(
+                message,
+                expected_tool_id=tool_id,
+            )
+            if block is not None:
+                text = _flatten_text(block.get("content"))
+                if text is not None:
+                    return text
         return None
     if client == "codex":
         payload = parsed.get("payload")
@@ -656,6 +696,27 @@ def _result_text_for_client(client: str, parsed: dict) -> str | None:
     return None
 
 
+def _effective_payload_json(row: _SessionEvent) -> str | None:
+    return row.payload_json if row.payload_json is not None else row.raw_json
+
+
+def _inline_outcome_for_client(
+    client: str,
+    event_type: str,
+    parsed: dict,
+) -> str | None:
+    if event_type != "command_start":
+        return None
+    if client not in ("claude", "openclaw"):
+        return None
+    message = parsed.get("message")
+    if not isinstance(message, dict):
+        return None
+    if message.get("role") != "bashExecution":
+        return None
+    return _flatten_text(message.get("output"))
+
+
 def _flatten_text(value: object) -> str | None:
     if isinstance(value, str):
         return value
@@ -670,4 +731,68 @@ def _flatten_text(value: object) -> str | None:
                     chunks.append(text)
         if chunks:
             return "\n".join(chunks)
+    return None
+
+
+def _matching_tool_call_block(
+    message: dict,
+    *,
+    expected_tool_id: str | None,
+) -> dict | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in ("tool_use", "toolCall"):
+            continue
+        if expected_tool_id is None:
+            return block
+        if _tool_call_block_id(block) == expected_tool_id:
+            return block
+    return None
+
+
+def _tool_call_block_id(block: dict) -> str | None:
+    for key in ("id", "toolUseId", "toolCallId"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _matching_tool_result_block(
+    message: dict,
+    *,
+    expected_tool_id: str | None,
+) -> dict | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_result":
+            continue
+        if expected_tool_id is None:
+            return block
+        if _tool_result_block_id(block) == expected_tool_id:
+            return block
+    return None
+
+
+def _tool_result_block_id(block: dict) -> str | None:
+    for key in ("tool_use_id", "toolUseId", "tool_call_id", "toolCallId", "id"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _tool_result_message_id(message: dict) -> str | None:
+    for key in ("toolCallId", "toolUseId", "tool_call_id", "tool_use_id"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
     return None

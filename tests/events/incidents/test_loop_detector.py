@@ -29,7 +29,7 @@ from clawjournal.events.incidents import (
     rebuild_loop_incidents,
 )
 from clawjournal.events.schema import ensure_schema as ensure_events_schema
-from clawjournal.events.view import ensure_view_schema
+from clawjournal.events.view import ensure_view_schema, write_hook_override
 
 
 TS = "2026-04-21T10:00:00Z"
@@ -375,6 +375,128 @@ def test_distinct_outputs_do_not_count_as_a_loop(conn):
     assert n == 0
 
 
+def test_claude_batched_shell_blocks_match_current_event_key(conn):
+    sid = _insert_session(conn, session_key="s:claude-batched-shell", client="claude")
+    for i in range(3):
+        target_id = f"target-{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            event_key=f"command_start:{target_id}",
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"other-{i}",
+                            "name": "Bash",
+                            "input": {"command": f"echo {i}"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": target_id,
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        },
+                    ]
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="tool_result",
+            event_key=f"tool_result:{target_id}",
+            raw={
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"other-{i}",
+                            "content": [{"type": "text", "text": f"other {i}"}],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": target_id,
+                            "content": [{"type": "text", "text": "FAIL identical"}],
+                        },
+                    ]
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count FROM incidents").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 3
+
+
+def test_claude_batched_tool_results_do_not_use_first_block_output(conn):
+    sid = _insert_session(conn, session_key="s:claude-batched-results", client="claude")
+    for i in range(3):
+        target_id = f"target-{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            event_key=f"command_start:{target_id}",
+            raw={
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"other-{i}",
+                            "name": "Bash",
+                            "input": {"command": "echo shared"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": target_id,
+                            "name": "Bash",
+                            "input": {"command": "npm test"},
+                        },
+                    ]
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="tool_result",
+            event_key=f"tool_result:{target_id}",
+            raw={
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"other-{i}",
+                            "content": [{"type": "text", "text": "shared"}],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": target_id,
+                            "content": [
+                                {"type": "text", "text": f"FAIL iteration {i}"}
+                            ],
+                        },
+                    ]
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
 def test_cross_source_duplicates_do_not_false_positive_a_shell_loop(conn):
     sid = _insert_session(conn, session_key="s:xsrc-loop", client="claude")
     for tool_id, path in (("tu-0", "/a.jsonl"), ("tu-1", "/c.jsonl")):
@@ -653,6 +775,48 @@ def test_codex_shell_command_loop_detected(conn):
     assert rows[0]["count"] == 3
 
 
+def test_codex_exec_command_cmd_loop_detected(conn):
+    sid = _insert_session(conn, session_key="s:codex-exec-command", client="codex")
+    for i in range(3):
+        tool_id = f"call_{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="command_start",
+            event_key=f"command_start:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": tool_id,
+                    "arguments": json.dumps({"cmd": "npm test", "cwd": "/repo"}),
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="codex",
+            event_type="tool_result",
+            event_key=f"tool_result:{tool_id}",
+            raw={
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": tool_id,
+                    "output": json.dumps({"output": "FAIL identical"}),
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count FROM incidents").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["count"] == 3
+
+
 def test_codex_shell_args_are_part_of_the_fingerprint(conn):
     sid = _insert_session(conn, session_key="s:codex-shell-args", client="codex")
     for i in range(3):
@@ -777,6 +941,83 @@ def test_openclaw_distinct_results_do_not_count_as_a_loop(conn):
     assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
 
 
+def test_openclaw_batched_tool_calls_match_current_event_key(conn):
+    sid = _insert_session(conn, session_key="s:openclaw-batched-tools", client="openclaw")
+    for i in range(DEFAULT_TOOL_CALL_THRESHOLD):
+        target_id = f"target-{i}"
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="openclaw",
+            event_type="tool_call",
+            event_key=f"tool_call:{target_id}",
+            raw={
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "toolCall",
+                            "id": f"other-{i}",
+                            "name": "read_file",
+                            "input": {"path": f"/tmp/{i}"},
+                        },
+                        {
+                            "type": "toolCall",
+                            "id": target_id,
+                            "name": "read_file",
+                            "input": {"path": "/etc/hosts"},
+                        },
+                    ],
+                },
+            },
+        )
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="openclaw",
+            event_type="tool_result",
+            event_key=f"tool_result:{target_id}",
+            raw={
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": target_id,
+                    "content": [{"type": "text", "text": "127.0.0.1 localhost"}],
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    rows = conn.execute("SELECT count, evidence_json FROM incidents").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["count"] == DEFAULT_TOOL_CALL_THRESHOLD
+    assert json.loads(rows[0]["evidence_json"])["event_type"] == "tool_call"
+
+
+def test_claude_bash_execution_distinct_inline_outputs_do_not_count_as_loop(conn):
+    sid = _insert_session(conn, session_key="s:claude-bashexec", client="claude")
+    for i in range(3):
+        _insert_event(
+            conn,
+            session_id=sid,
+            client="claude",
+            event_type="command_start",
+            raw={
+                "type": "message",
+                "message": {
+                    "role": "bashExecution",
+                    "command": "npm test",
+                    "output": f"FAIL iteration {i}",
+                    "exitCode": 1,
+                },
+            },
+        )
+
+    ingest_loop_incidents(conn)
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
 def test_pure_read_helper_does_not_write(conn):
     sid = _insert_session(conn, session_key="s:pure", client="claude")
     for i in range(3):
@@ -810,6 +1051,48 @@ def test_pure_read_helper_works_without_view_schema():
 
     assert len(hits) == 1
     assert hits[0].count == 3
+
+
+def test_detect_session_loops_uses_command_start_override_payload(conn):
+    sid = _insert_session(conn, session_key="s:override-command", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-command",
+        event_key="command_start:tu-1",
+        event_type="command_start",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-1",
+                            "name": "Bash",
+                            "input": {"command": "npm run lint"},
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    assert detect_session_loops(conn, sid) == []
 
 
 def test_unparseable_raw_json_breaks_run_safely(conn):
@@ -965,6 +1248,154 @@ def test_cursor_advances_correctly_across_mid_run_boundary(conn):
     assert second.sessions_evaluated == 1
 
 
+def test_override_only_tool_result_change_reingests_session(conn):
+    sid = _insert_session(conn, session_key="s:override-ingest", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    first = ingest_loop_incidents(conn)
+    assert first.incidents_written == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-ingest",
+        event_key="tool_result:tu-1",
+        event_type="tool_result",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-1",
+                            "content": [{"type": "text", "text": "FAIL changed"}],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+
+    second = ingest_loop_incidents(conn)
+
+    assert second.events_scanned == 0
+    assert second.overrides_scanned == 1
+    assert second.sessions_evaluated == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
+def test_override_cursor_tiebreaker_handles_same_timestamp_writes(conn):
+    sid = _insert_session(conn, session_key="s:override-cursor-tie", client="claude")
+    fixed_created_at = "2026-04-21T10:00:00.123456Z"
+    for i in range(3):
+        _claude_bash_pair(
+            conn,
+            session_id=sid,
+            tool_id=f"tu-{i}",
+            command="npm test",
+            output="FAIL identical",
+        )
+
+    ingest_loop_incidents(conn)
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-cursor-tie",
+        event_key="tool_result:tu-0",
+        event_type="tool_result",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-0",
+                            "content": [{"type": "text", "text": "FAIL identical"}],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+    conn.execute(
+        """
+        UPDATE event_overrides
+           SET created_at = ?
+         WHERE session_id = ? AND event_key = ?
+        """,
+        (fixed_created_at, sid, "tool_result:tu-0"),
+    )
+    conn.commit()
+
+    first = ingest_loop_incidents(conn)
+    assert first.overrides_scanned == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
+
+    assert write_hook_override(
+        conn,
+        session_key="s:override-cursor-tie",
+        event_key="tool_result:tu-1",
+        event_type="tool_result",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=TS,
+        payload_json=json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-1",
+                            "content": [{"type": "text", "text": "FAIL changed"}],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        origin="test",
+    )
+    conn.execute(
+        """
+        UPDATE event_overrides
+           SET created_at = ?
+         WHERE session_id = ? AND event_key = ?
+        """,
+        (fixed_created_at, sid, "tool_result:tu-1"),
+    )
+    conn.commit()
+
+    second = ingest_loop_incidents(conn)
+
+    assert second.events_scanned == 0
+    assert second.overrides_scanned == 1
+    assert second.sessions_evaluated == 1
+    assert conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 0
+
+
 def test_rebuild_preserves_non_loop_incident_kinds(conn):
     """The incidents table is shared across kinds; `--rebuild` must
     only touch `loop_exact_repeat` rows."""
@@ -995,3 +1426,55 @@ def test_rebuild_preserves_non_loop_incident_kinds(conn):
     }
     assert "other_kind" in kinds
     assert LOOP_INCIDENT_KIND in kinds
+
+
+def test_legacy_loop_ingest_state_is_migrated_in_place():
+    """A DB whose `loop_ingest_state` predates the override-cursor
+    columns must migrate cleanly: `ensure_incidents_schema` ALTERs the
+    missing columns in place, old cursor values survive, and
+    `ingest_loop_incidents` runs without touching the legacy row's
+    `last_event_id`."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_events_schema(conn)
+    ensure_view_schema(conn)
+
+    # Forge the legacy schema (pre-override-cursor) with a cursor of 0.
+    conn.executescript(
+        """
+        CREATE TABLE loop_ingest_state (
+            consumer_id   TEXT PRIMARY KEY,
+            last_event_id INTEGER NOT NULL
+        );
+        INSERT INTO loop_ingest_state (consumer_id, last_event_id)
+          VALUES ('loop_detector', 0);
+        """
+    )
+    conn.commit()
+
+    # ensure_incidents_schema must ADD the missing columns without
+    # dropping the stored cursor value.
+    ensure_incidents_schema(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(loop_ingest_state)")}
+    assert "last_override_created_at" in columns
+    assert "last_override_session_id" in columns
+    assert "last_override_event_key" in columns
+
+    row = conn.execute(
+        "SELECT * FROM loop_ingest_state WHERE consumer_id = 'loop_detector'"
+    ).fetchone()
+    assert row["last_event_id"] == 0
+    assert row["last_override_created_at"] is None
+    assert row["last_override_session_id"] == 0
+    assert row["last_override_event_key"] == ""
+
+    # Driving an ingest afterwards must not crash on the migrated row
+    # and must correctly pick up the new events.
+    sid = _insert_session(conn, session_key="s:migrated", client="claude")
+    for i in range(3):
+        _claude_bash_pair(
+            conn, session_id=sid, tool_id=f"tu-{i}",
+            command="npm test", output="FAIL same",
+        )
+    summary = ingest_loop_incidents(conn)
+    assert summary.incidents_written == 1

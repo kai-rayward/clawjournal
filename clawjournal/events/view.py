@@ -99,7 +99,7 @@ class CapabilityState(NamedTuple):
 # --- hook override writer -------------------------------------------------- #
 
 
-_UPSERT_SQL = """
+_UPSERT_OVERRIDE_SQL = """
 INSERT INTO event_overrides (
     session_id, event_key, type, source, confidence, lossiness,
     event_at, payload_json, origin, created_at
@@ -166,9 +166,13 @@ def write_hook_override(
         raise KeyError(f"session_key not found in event_sessions: {session_key}")
 
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    # Single-statement UPSERT is atomic under SQLite's default
+    # isolation — the rank-guard and the `created_at` bump both live
+    # inside the ON CONFLICT clause, so two concurrent writers can't
+    # race between a pre-check and the write.
     with conn:
         cursor = conn.execute(
-            _UPSERT_SQL,
+            _UPSERT_OVERRIDE_SQL,
             (
                 session_id,
                 event_key,
