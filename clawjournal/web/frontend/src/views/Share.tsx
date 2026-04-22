@@ -171,7 +171,8 @@ interface RemovedEntry {
   id: string;
   title: string;
   removedAt: number;
-  originalIndex: number;
+  beforeId: string | null;
+  afterId: string | null;
 }
 
 interface ShareReadyStats {
@@ -654,17 +655,50 @@ export function Share() {
   // Queue actions
   // =================================================
 
+  const insertRestored = (queue: string[], entry: RemovedEntry): string[] => {
+    if (queue.includes(entry.id)) return queue;
+    const next = [...queue];
+    // Prefer afterId: an item's successor at removal time is more reliable than
+    // its predecessor when multiple adjacent items were removed and are being
+    // restored in reverse order.
+    if (entry.afterId) {
+      const aIdx = next.indexOf(entry.afterId);
+      if (aIdx >= 0) {
+        next.splice(aIdx, 0, entry.id);
+        return next;
+      }
+    }
+    if (entry.beforeId) {
+      const bIdx = next.indexOf(entry.beforeId);
+      if (bIdx >= 0) {
+        next.splice(bIdx + 1, 0, entry.id);
+        return next;
+      }
+    }
+    if (!entry.beforeId && !entry.afterId) {
+      next.unshift(entry.id);
+      return next;
+    }
+    if (!entry.beforeId) {
+      next.unshift(entry.id);
+      return next;
+    }
+    next.push(entry.id);
+    return next;
+  };
+
   const removeFromQueue = (id: string) => {
-    const originalIndex = queueOrder.indexOf(id);
+    const idx = queueOrder.indexOf(id);
+    if (idx < 0) return;
+    const beforeId = idx > 0 ? queueOrder[idx - 1] : null;
+    const afterId = idx < queueOrder.length - 1 ? queueOrder[idx + 1] : null;
     const session = sessionById[id];
     const title = session?.display_title || id;
     setQueueOrder((prev) => prev.filter((x) => x !== id));
-    if (originalIndex >= 0) {
-      setRemovedSessions((prev) => [
-        ...prev,
-        { id, title, removedAt: Date.now(), originalIndex },
-      ]);
-    }
+    setRemovedSessions((prev) => [
+      ...prev,
+      { id, title, removedAt: Date.now(), beforeId, afterId },
+    ]);
     toast(`Removed "${truncateTitle(title)}"`, {
       type: 'info',
       duration: 8000,
@@ -676,29 +710,21 @@ export function Share() {
     setRemovedSessions((prev) => {
       const entry = prev.find((e) => e.id === id);
       if (!entry) return prev;
-      setQueueOrder((q) => {
-        if (q.includes(id)) return q;
-        const clamped = Math.min(entry.originalIndex, q.length);
-        const next = [...q];
-        next.splice(clamped, 0, id);
-        return next;
-      });
+      setQueueOrder((q) => insertRestored(q, entry));
       return prev.filter((e) => e.id !== id);
     });
   };
 
   const restoreAll = () => {
     if (removedSessions.length === 0) return;
-    // Sort by originalIndex asc so earlier-indexed items go first; later ones
-    // get clamped correctly as the queue grows.
-    const sorted = [...removedSessions].sort((a, b) => a.originalIndex - b.originalIndex);
+    // Process newest removals first. The most recent removal captured the
+    // freshest neighbor snapshot; restoring it first unwinds the state closest
+    // to just-before-last-removal, and earlier removals anchor onto items that
+    // are progressively restored around them.
+    const entries = [...removedSessions].sort((a, b) => b.removedAt - a.removedAt);
     setQueueOrder((q) => {
-      const next = [...q];
-      for (const entry of sorted) {
-        if (next.includes(entry.id)) continue;
-        const clamped = Math.min(entry.originalIndex, next.length);
-        next.splice(clamped, 0, entry.id);
-      }
+      let next = q;
+      for (const entry of entries) next = insertRestored(next, entry);
       return next;
     });
     setRemovedSessions([]);
@@ -924,7 +950,7 @@ export function Share() {
     const candidates = queuedSessions
       .filter((s) =>
         !approvedIds.has(s.session_id) &&
-        classify(redactedSessions[s.session_id]) !== 'clear'
+        classify(redactedSessions[s.session_id]) === 'review'
       )
       .map((s) => s.session_id);
     if (candidates.length === 0) return;
