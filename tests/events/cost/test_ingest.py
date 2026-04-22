@@ -290,6 +290,26 @@ def test_ingest_threads_codex_model_from_prior_run_turn_context(conn):
     assert row["cost_estimate"] is not None and row["cost_estimate"] > 0
 
 
+def test_ingest_threads_codex_model_from_null_timestamp_turn_context(conn):
+    sid = _insert_session(conn, session_key="s:codex-null-ts", client="codex")
+    _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw={"type": "turn_context", "payload": {"model": "gpt-5-codex"}},
+        event_at=None,
+    )
+    eid = _insert_event(
+        conn, session_id=sid, client="codex", event_type="schema_unknown",
+        raw=_codex_token_count(input_tokens=3655, cached=2048, reasoning=64),
+        event_at="2026-04-20T10:00:01Z",
+    )
+
+    ingest_cost_pending(conn)
+    row = conn.execute("SELECT * FROM token_usage WHERE event_id = ?", (eid,)).fetchone()
+    assert row is not None
+    assert row["model"] == "gpt-5-codex"
+    assert row["cost_estimate"] is not None and row["cost_estimate"] > 0
+
+
 # --------------------------------------------------------------------------- #
 # anomaly detectors — acceptance criteria from 04-cost-ledger.md
 # --------------------------------------------------------------------------- #
@@ -384,6 +404,26 @@ def test_input_spike_flagged_against_rolling_baseline(conn):
     assert evidence["current_input"] == 1000
     assert evidence["baseline_mean"] == pytest.approx(100)
     assert evidence["ratio"] >= 3.0
+
+
+def test_input_spike_requires_full_baseline_window(conn):
+    sid = _insert_session(conn, session_key="s:spike-short", client="claude")
+    for i, input_tokens in enumerate((100, 400)):
+        _insert_event(
+            conn, session_id=sid, client="claude", event_type="assistant_message",
+            raw=_claude_assistant(input_tokens=input_tokens, output_tokens=10),
+            event_at=f"2026-04-20T10:00:0{i}Z",
+        )
+
+    ingest_cost_pending(conn)
+    kinds = [
+        a["kind"]
+        for a in conn.execute(
+            "SELECT kind FROM cost_anomalies WHERE session_id = ?",
+            (sid,),
+        )
+    ]
+    assert "input_spike" not in kinds
 
 
 def test_model_shift_detected_within_session(conn):
