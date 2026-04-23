@@ -572,7 +572,11 @@ def _load_session_tree(
                     anchor_id=(
                         f"event-{event.event_id}"
                         if event.event_id is not None
-                        else f"event-key-{_anchor_slug(event.event_key or event.type)}"
+                        else (
+                            "event-key-"
+                            f"{_anchor_slug(session_key)}-"
+                            f"{_anchor_slug(event.event_key or event.type)}"
+                        )
                     ),
                     turn_number=event.turn_number,
                     type=event.type,
@@ -649,7 +653,11 @@ def _load_session_tree(
 def _load_events(conn: sqlite3.Connection, session_id: int) -> list[TimelineEvent]:
     events: list[TimelineEvent] = []
     turn_number = 0
-    for event in canonical_events(conn, session_id):
+    canonical = sorted(
+        canonical_events(conn, session_id),
+        key=_timeline_event_sort_key,
+    )
+    for event in canonical:
         if event.type == "user_message":
             turn_number += 1
         events.append(
@@ -675,6 +683,33 @@ def _load_events(conn: sqlite3.Connection, session_id: int) -> list[TimelineEven
             )
         )
     return events
+
+
+def _timeline_event_sort_key(event) -> tuple[Any, ...]:
+    """Restore chronological order before assigning timeline turns.
+
+    `canonical_events()` yields base rows in canonical vendor order and then
+    appends hook-only overrides whose event_key never appeared on a base row.
+    The timeline renderer needs a single chronological stream so early
+    hook-only events (for example a prompt captured only by hooks) do not get
+    shoved after later vendor rows and distort turn numbering.
+    """
+    source_path = ""
+    source_offset = -1
+    seq = -1
+    if event.raw_ref is not None:
+        source_path, source_offset, seq = event.raw_ref
+    return (
+        event.event_at is None,
+        event.event_at or "",
+        event.event_id is None,
+        event.event_id if event.event_id is not None else 2**63 - 1,
+        source_path,
+        source_offset,
+        seq,
+        event.event_key or "",
+        event.type,
+    )
 
 
 def _load_coverage(conn: sqlite3.Connection, session_id: int) -> list[CoverageBucket]:

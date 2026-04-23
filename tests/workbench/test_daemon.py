@@ -818,7 +818,7 @@ class TestTimelineRoute:
         assert "clawjournal_token=" in set_cookie
         assert "HttpOnly" in set_cookie
         assert "SameSite=Strict" in set_cookie
-        assert "Path=/" in set_cookie
+        assert "Path=/timeline" in set_cookie
 
     def test_timeline_route_accepts_cookie_auth(self, server, index_setup):
         seeded = _seed_timeline(index_setup)
@@ -857,6 +857,90 @@ class TestTimelineRoute:
 
         assert resp.status == 401
         assert body == b""
+
+    def test_hook_only_events_are_reordered_before_turn_assignment(
+        self, server, index_setup
+    ):
+        seeded = _seed_timeline(index_setup)
+
+        from clawjournal.events.view import write_hook_override
+
+        conn = open_index()
+        try:
+            write_hook_override(
+                conn,
+                session_key=seeded["root_key"],
+                event_key="user_message:hook-early",
+                event_type="user_message",
+                source="hook",
+                confidence="high",
+                lossiness="none",
+                event_at="2026-04-22T09:59:59Z",
+                payload_json='{"message":{"content":"hook only first turn"}}',
+                origin="hook:test",
+            )
+        finally:
+            conn.close()
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", seeded["root_url"], headers=_api_auth_headers())
+        resp = conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert body.index("hook only first turn") < body.index("pytest tests/test_auth.py")
+        assert "Turn 2" in body
+
+    def test_hook_only_anchor_ids_are_namespaced_by_session(
+        self, server, index_setup
+    ):
+        seeded = _seed_timeline(index_setup)
+
+        from clawjournal.events.view import write_hook_override
+
+        conn = open_index()
+        try:
+            write_hook_override(
+                conn,
+                session_key=seeded["root_key"],
+                event_key="tool_call:shared-hook",
+                event_type="tool_call",
+                source="hook",
+                confidence="high",
+                lossiness="none",
+                event_at="2026-04-22T10:01:30Z",
+                payload_json='{"tool_name":"Read","path":"root.txt"}',
+                origin="hook:test",
+            )
+            write_hook_override(
+                conn,
+                session_key=seeded["child_key"],
+                event_key="tool_call:shared-hook",
+                event_type="tool_call",
+                source="hook",
+                confidence="high",
+                lossiness="none",
+                event_at="2026-04-22T10:04:30Z",
+                payload_json='{"tool_name":"Read","path":"child.txt"}',
+                origin="hook:test",
+            )
+        finally:
+            conn.close()
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", seeded["root_url"], headers=_api_auth_headers())
+        resp = conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert (
+            'id="event-key-claude-demo-proj-parent-root-tool-call-shared-hook"'
+            in body
+        )
+        assert (
+            'id="event-key-claude-demo-proj-child-agent-tool-call-shared-hook"'
+            in body
+        )
 
 
 class TestRunServerPortFallback:
