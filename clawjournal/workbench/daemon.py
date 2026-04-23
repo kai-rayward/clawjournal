@@ -20,7 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
 from ..redaction.anonymizer import Anonymizer
@@ -52,6 +52,12 @@ from .index import (
     search_fts,
     update_session,
     upsert_sessions,
+)
+from .timeline import (
+    canonical_session_path,
+    load_timeline_page,
+    render_not_found_html,
+    render_timeline_html,
 )
 from ..parsing.parser import (
     AIDER_SOURCE,
@@ -297,12 +303,52 @@ class Scanner:
 _LOCALHOST_ORIGINS = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 
 
+_API_TOKEN_COOKIE_NAME = "clawjournal_token"
+
+
 def _cors_origin(handler: BaseHTTPRequestHandler) -> str | None:
     """Return the request Origin if it's a localhost address, else None."""
     origin = handler.headers.get("Origin", "")
     if _LOCALHOST_ORIGINS.match(origin):
         return origin
     return None
+
+
+def _parse_cookie_token(cookie_header: str | None) -> str | None:
+    """Extract the per-install api_token from the `Cookie` request header.
+
+    Returns None when the header is absent, unparseable, or does not
+    include the expected cookie. Never raises — malformed cookies just
+    fall through to the 401 path.
+    """
+    if not cookie_header:
+        return None
+    try:
+        from http.cookies import SimpleCookie
+
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+    except Exception:
+        return None
+    morsel = jar.get(_API_TOKEN_COOKIE_NAME)
+    if morsel is None:
+        return None
+    return morsel.value or None
+
+
+def _api_token_cookie_header(token: str) -> str:
+    """Build the `Set-Cookie` value that carries the api_token.
+
+    HttpOnly prevents XSS from reading the token (stricter than the
+    existing `window.__CLAWJOURNAL_API_TOKEN__` injection, which we keep
+    for the SPA's fetch-based API access). SameSite=Strict prevents
+    cross-site navigation from leaking the cookie. The cookie is scoped
+    to `/timeline` so it cannot authorize the broader `/api/*` surface.
+    No Secure flag — the daemon is loopback HTTP only.
+    """
+    return (
+        f"{_API_TOKEN_COOKIE_NAME}={token}; Path=/timeline; HttpOnly; SameSite=Strict"
+    )
 
 
 def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200) -> None:
@@ -832,10 +878,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the workbench API + static files.
 
     Auth: every `/api/*` request requires an `Authorization: Bearer <token>`
-    header where `<token>` matches `~/.clawjournal/api_token`. Missing or
-    wrong tokens get a 401 with an empty body — no hint about what was
-    wrong. Non-`/api/*` paths (static files, health checks) bypass auth.
-    See docs/security-refactor.md §Daemon API surface.
+    header where `<token>` matches `~/.clawjournal/api_token`. `/timeline/*`
+    accepts the same bearer token and, for browser navigations only, a
+    `clawjournal_token` cookie scoped to `/timeline`. Missing or wrong
+    credentials get a 401 with an empty body — no hint about what was wrong.
+    Static/SPA shell paths bypass auth. See docs/security-refactor.md §Daemon
+    API surface.
 
     Access logs go to `logger.debug` and receive only the format string
     plus the request line; bodies, query strings, and the `Authorization`
@@ -849,18 +897,27 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         logger.debug(format, *args)
 
     def _check_api_auth(self) -> bool:
-        """Return True if the request is authorized for the API.
+        """Return True if the request is authorized for protected routes.
 
-        Non-`/api/*` routes bypass the check entirely (static files,
-        SPA fallback). Otherwise compare the bearer token against the
-        per-install `api_token`. Uses `secrets.compare_digest` to keep
-        the comparison constant-time.
+        Static assets and the SPA shell bypass auth. Transcript-bearing
+        routes under `/api/*` and `/timeline/*` require the per-install
+        `api_token`. `/api/*` accepts only the `Authorization: Bearer`
+        header; `/timeline/*` accepts that header plus a
+        `clawjournal_token` cookie for browser navigations. The cookie is
+        set by `_serve_static` on SPA HTML responses so a user who has
+        opened the workbench can follow `/timeline/*` links with no extra
+        handling. Uses `secrets.compare_digest` for constant-time
+        comparison.
         """
         from pathlib import Path as _Path
         import secrets as _secrets
 
         parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/"):
+        is_api_path = parsed.path.startswith("/api/")
+        is_timeline_path = (
+            parsed.path == "/timeline" or parsed.path.startswith("/timeline/")
+        )
+        if not (is_api_path or is_timeline_path):
             return True
 
         try:
@@ -872,10 +929,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return False
 
         header = self.headers.get("Authorization") or ""
-        if not header.startswith("Bearer "):
-            return False
-        supplied = header[len("Bearer "):].strip()
-        return _secrets.compare_digest(supplied, expected)
+        if header.startswith("Bearer "):
+            supplied = header[len("Bearer "):].strip()
+            if _secrets.compare_digest(supplied, expected):
+                return True
+
+        if is_timeline_path:
+            cookie_token = _parse_cookie_token(self.headers.get("Cookie"))
+            if cookie_token is not None and _secrets.compare_digest(
+                cookie_token, expected
+            ):
+                return True
+
+        return False
 
     def _reject_unauthenticated(self) -> None:
         """Send a 401 with no body — never reveal what the auth state is."""
@@ -966,6 +1032,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_list_findings_allowlist()
+        elif path.startswith("/timeline/"):
+            if self._handle_session_timeline(path):
+                return
+            self._serve_static(parsed.path)
+            return
         else:
             self._serve_static(parsed.path)
 
@@ -2063,10 +2134,94 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            if content_type == "text/html":
+                self._maybe_set_api_token_cookie()
             self.end_headers()
             self.wfile.write(data)
         except OSError:
             self.send_error(404)
+
+    def _maybe_set_api_token_cookie(self) -> None:
+        """Set the `clawjournal_token` cookie on SPA HTML responses.
+
+        The cookie is what lets a browser that has opened the workbench
+        follow `/timeline/<key>` links without manually attaching an
+        `Authorization` header. The cookie is intentionally scoped to
+        `/timeline` so it cannot unlock the wider `/api/*` surface.
+        Silent fall-through on any failure — worst case, the browser
+        falls back to the existing 401 flow.
+        """
+        try:
+            from pathlib import Path as _Path
+            from ..paths import ensure_api_token
+            from .index import INDEX_DB as _INDEX_DB
+
+            token = ensure_api_token(_Path(str(_INDEX_DB)).parent)
+        except Exception:
+            logger.exception("Could not resolve api_token for cookie set")
+            return
+        self.send_header("Set-Cookie", _api_token_cookie_header(token))
+
+    def _handle_session_timeline(self, path: str) -> bool:
+        requested = unquote(path[len("/timeline/"):])
+        if not requested:
+            return False
+
+        conn = open_index()
+        try:
+            legacy_row = conn.execute(
+                "SELECT session_key FROM sessions WHERE session_id = ? LIMIT 1",
+                (requested,),
+            ).fetchone()
+            if legacy_row is not None:
+                session_key = legacy_row["session_key"]
+                if session_key:
+                    self._redirect(canonical_session_path(str(session_key)))
+                    return True
+                # Legacy workbench row exists but has no `session_key`
+                # yet — most likely a pre-ADR-001 session that hasn't been
+                # re-scanned through `events ingest`. Surface the
+                # pending-ingest page with a 404 rather than falling
+                # through to the SPA shell (the SPA has no /timeline/
+                # route).
+                body = render_not_found_html(requested).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+
+            page = load_timeline_page(conn, requested)
+        finally:
+            conn.close()
+
+        if page.root is None and page.workbench_row is None:
+            body = render_not_found_html(requested).encode("utf-8")
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
+        if page.redirect_session_key:
+            self._redirect(canonical_session_path(page.redirect_session_key))
+            return True
+
+        body = render_timeline_html(page).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _inject_api_token(self, data: bytes) -> bytes:
         # Inject the per-install API token so same-origin frontend fetches
@@ -2124,6 +2279,7 @@ npm run build</pre>
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(data)))
+        self._maybe_set_api_token_cookie()
         self.end_headers()
         self.wfile.write(data)
 
