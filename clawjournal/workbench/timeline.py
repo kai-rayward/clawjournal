@@ -531,9 +531,18 @@ def _resolve_root_session_key(conn: sqlite3.Connection, session_key: str) -> str
     while current_key not in seen:
         seen.add(current_key)
         row = _load_event_session(conn, current_key)
-        if row is None or row["parent_session_key"] is None:
+        if row is None:
+            return session_key
+        parent_key = row["parent_session_key"]
+        if parent_key is None:
             return current_key
-        current_key = str(row["parent_session_key"])
+        parent_row = _load_event_session(conn, str(parent_key))
+        if parent_row is None:
+            # Child rows can arrive before their parent transcript has been
+            # ingested. Keep rendering the concrete child session we do have
+            # instead of walking to a missing root and crashing.
+            return current_key
+        current_key = str(parent_row["session_key"])
     return session_key
 
 

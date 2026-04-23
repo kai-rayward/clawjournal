@@ -121,6 +121,13 @@ class TestAuth:
         assert resp.status == 401
         assert resp.read() == b""
 
+    def test_timeline_route_missing_header_returns_401_empty_body(self, server):
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/timeline/claude:demo:unknown")
+        resp = conn.getresponse()
+        assert resp.status == 401
+        assert resp.read() == b""
+
     def test_wrong_token_returns_401(self, server):
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
         conn.request("GET", "/api/sessions/sess-1/findings",

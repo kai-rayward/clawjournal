@@ -641,14 +641,14 @@ class TestStaticServing:
         # the legacy id is resolved to its canonical session_key and the
         # client is redirected to the canonical timeline URL.
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", seeded["legacy_url"])
+        conn.request("GET", seeded["legacy_url"], headers=_api_auth_headers())
         resp = conn.getresponse()
         resp.read()
         assert resp.status == 302
         assert resp.getheader("Location") == seeded["root_url"]
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", seeded["root_url"])
+        conn.request("GET", seeded["root_url"], headers=_api_auth_headers())
         resp = conn.getresponse()
         body = resp.read().decode()
         assert resp.status == 200
@@ -661,7 +661,7 @@ class TestTimelineRoute:
         seeded = _seed_timeline(index_setup)
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", seeded["root_url"])
+        conn.request("GET", seeded["root_url"], headers=_api_auth_headers())
         resp = conn.getresponse()
         body = resp.read().decode()
 
@@ -679,7 +679,7 @@ class TestTimelineRoute:
         seeded = _seed_timeline(index_setup)
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", seeded["child_url"])
+        conn.request("GET", seeded["child_url"], headers=_api_auth_headers())
         resp = conn.getresponse()
         resp.read()
 
@@ -690,7 +690,11 @@ class TestTimelineRoute:
         _seed_timeline(index_setup)
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", "/timeline/claude:nobody:unknown")
+        conn.request(
+            "GET",
+            "/timeline/claude:nobody:unknown",
+            headers=_api_auth_headers(),
+        )
         resp = conn.getresponse()
         body = resp.read().decode()
 
@@ -712,7 +716,7 @@ class TestTimelineRoute:
             conn.close()
 
         http_conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        http_conn.request("GET", "/timeline/sess-1")
+        http_conn.request("GET", "/timeline/sess-1", headers=_api_auth_headers())
         resp = http_conn.getresponse()
         body = resp.read().decode()
 
@@ -748,13 +752,111 @@ class TestTimelineRoute:
             conn.close()
 
         http_conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        http_conn.request("GET", seeded["root_url"])
+        http_conn.request("GET", seeded["root_url"], headers=_api_auth_headers())
         resp = http_conn.getresponse()
         body = resp.read().decode()
 
         assert resp.status == 200
         assert "<script>alert(1)</script>" not in body
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+
+    def test_partially_ingested_child_session_renders_in_place(self, server, index_setup):
+        from urllib.parse import quote
+
+        conn = open_index()
+        try:
+            from clawjournal.events.schema import ensure_schema as ensure_events_schema
+            from clawjournal.events.view import ensure_view_schema
+
+            ensure_events_schema(conn)
+            ensure_view_schema(conn)
+            child_key = "claude:demo-proj:orphan-child"
+            missing_parent_key = "claude:demo-proj:missing-parent"
+            child_id = conn.execute(
+                """
+                INSERT INTO event_sessions (
+                    session_key, parent_session_key, client, started_at, status
+                ) VALUES (?, ?, 'claude', '2026-04-22T11:00:00Z', 'active')
+                """,
+                (child_key, missing_parent_key),
+            ).lastrowid
+            conn.execute(
+                """
+                INSERT INTO events (
+                    session_id, type, event_key, event_at, ingested_at, source,
+                    source_path, source_offset, seq, client, confidence, lossiness, raw_json
+                ) VALUES (?, 'tool_call', 'tool_call:orphan', '2026-04-22T11:00:01Z',
+                          '2026-04-22T11:00:02Z', 'hook', 'orphan.jsonl', 0, 0,
+                          'claude', 'high', 'none', '{"tool_name":"Read","path":"README.md"}')
+                """,
+                (child_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        http_conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        http_conn.request(
+            "GET",
+            f"/timeline/{quote(child_key, safe='')}",
+            headers=_api_auth_headers(),
+        )
+        resp = http_conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert child_key in body
+        assert missing_parent_key not in body
+
+    def test_spa_html_sets_httponly_session_cookie(self, server):
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        resp.read()
+
+        set_cookie = resp.getheader("Set-Cookie") or ""
+        assert "clawjournal_token=" in set_cookie
+        assert "HttpOnly" in set_cookie
+        assert "SameSite=Strict" in set_cookie
+        assert "Path=/" in set_cookie
+
+    def test_timeline_route_accepts_cookie_auth(self, server, index_setup):
+        seeded = _seed_timeline(index_setup)
+
+        from clawjournal.paths import API_TOKEN_FILENAME
+        from clawjournal.workbench.index import INDEX_DB
+        from pathlib import Path
+
+        token = (
+            Path(str(INDEX_DB)).parent / API_TOKEN_FILENAME
+        ).read_text().strip()
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request(
+            "GET",
+            seeded["root_url"],
+            headers={"Cookie": f"clawjournal_token={token}"},
+        )
+        resp = conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert "Session Timeline" in body
+
+    def test_timeline_route_rejects_wrong_cookie_value(self, server, index_setup):
+        seeded = _seed_timeline(index_setup)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request(
+            "GET",
+            seeded["root_url"],
+            headers={"Cookie": "clawjournal_token=not-the-real-token"},
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+
+        assert resp.status == 401
+        assert body == b""
 
 
 class TestRunServerPortFallback:
