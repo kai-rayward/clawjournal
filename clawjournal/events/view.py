@@ -100,6 +100,9 @@ class CanonicalEvent:
     payload_json: str | None
     raw_ref: tuple[str, int, int] | None
     origin: str | None
+    event_id: int | None = None
+    session_id: int | None = None
+    ingested_at: str | None = None
 
 
 class CapabilityState(NamedTuple):
@@ -244,8 +247,8 @@ def _backfill_override_write_seq(conn: sqlite3.Connection) -> None:
 
 
 _BASE_SELECT = """
-SELECT type, event_key, event_at, source, confidence, lossiness,
-       raw_json, source_path, source_offset, seq
+SELECT id, session_id, type, event_key, event_at, ingested_at,
+       source, confidence, lossiness, raw_json, source_path, source_offset, seq
   FROM events
  WHERE session_id = ?
 """
@@ -254,7 +257,7 @@ _BASE_ORDER = " ORDER BY event_at IS NULL, event_at, source_path, source_offset,
 
 
 _OVERRIDE_SELECT = """
-SELECT event_key, type, source, confidence, lossiness,
+SELECT session_id, event_key, type, source, confidence, lossiness,
        event_at, payload_json, origin
   FROM event_overrides
  WHERE session_id = ?
@@ -339,6 +342,9 @@ def _canonical_from_base(base: dict) -> CanonicalEvent:
         payload_json=None,
         raw_ref=(base["source_path"], base["source_offset"], base["seq"]),
         origin=None,
+        event_id=base["id"],
+        session_id=base["session_id"],
+        ingested_at=base["ingested_at"],
     )
 
 
@@ -354,6 +360,9 @@ def _canonical_override_wins(override: dict, base: dict) -> CanonicalEvent:
         payload_json=override["payload_json"],
         raw_ref=(base["source_path"], base["source_offset"], base["seq"]),
         origin=override["origin"],
+        event_id=base["id"],
+        session_id=base["session_id"],
+        ingested_at=base["ingested_at"],
     )
 
 
@@ -369,6 +378,9 @@ def _canonical_hook_only(override: dict) -> CanonicalEvent:
         payload_json=override["payload_json"],
         raw_ref=None,
         origin=override["origin"],
+        event_id=None,
+        session_id=override["session_id"],
+        ingested_at=None,
     )
 
 

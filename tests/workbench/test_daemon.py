@@ -130,6 +130,213 @@ def _delete(port, path, *, skip_auth=False):
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
 
 
+def _seed_timeline(index_setup):
+    from urllib.parse import quote
+
+    from clawjournal.events.cost.schema import ensure_cost_schema
+    from clawjournal.events.incidents.schema import ensure_incidents_schema
+    from clawjournal.events.schema import ensure_schema as ensure_events_schema
+    from clawjournal.events.view import ensure_view_schema
+
+    conn = open_index()
+    try:
+        ensure_events_schema(conn)
+        ensure_view_schema(conn)
+        ensure_cost_schema(conn)
+        ensure_incidents_schema(conn)
+
+        vendor_file = index_setup / "timeline_vendor.jsonl"
+        vendor_file.write_text(
+            '{"type":"user_message","message":{"content":"debug the failing cache auth flow"}}\n'
+            '{"type":"tool_call","tool_name":"Bash","command":"pytest tests/test_auth.py"}\n'
+            '{"type":"tool_result","output":"401 unauthorized"}\n',
+            encoding="utf-8",
+        )
+        root_key = "claude:demo-proj:parent-root"
+        child_key = "claude:demo-proj:child-agent"
+        conn.execute(
+            "UPDATE sessions SET session_key = ?, display_title = ? WHERE session_id = ?",
+            (root_key, "Demo timeline session", "sess-0"),
+        )
+        root_id = conn.execute(
+            """
+            INSERT INTO event_sessions (
+                session_key, parent_session_key, client, started_at, ended_at, status
+            ) VALUES (?, NULL, 'claude', '2026-04-22T10:00:00Z', '2026-04-22T10:08:00Z', 'closed')
+            """,
+            (root_key,),
+        ).lastrowid
+        child_id = conn.execute(
+            """
+            INSERT INTO event_sessions (
+                session_key, parent_session_key, parent_session_id, client,
+                started_at, ended_at, status
+            ) VALUES (?, ?, ?, 'claude', '2026-04-22T10:04:00Z', '2026-04-22T10:05:00Z', 'closed')
+            """,
+            (child_key, root_key, root_id),
+        ).lastrowid
+        first_id = conn.execute(
+            """
+            INSERT INTO events (
+                session_id, type, event_key, event_at, ingested_at, source,
+                source_path, source_offset, seq, client, confidence, lossiness, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                "user_message",
+                "user_message:1",
+                "2026-04-22T10:00:00Z",
+                "2026-04-22T10:00:01Z",
+                "claude-jsonl",
+                str(vendor_file),
+                0,
+                0,
+                "claude",
+                "high",
+                "none",
+                '{"message":{"content":"debug the failing cache auth flow"}}',
+            ),
+        ).lastrowid
+        second_id = conn.execute(
+            """
+            INSERT INTO events (
+                session_id, type, event_key, event_at, ingested_at, source,
+                source_path, source_offset, seq, client, confidence, lossiness, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                "tool_call",
+                "tool_call:1",
+                "2026-04-22T10:00:03Z",
+                "2026-04-22T10:00:04Z",
+                "claude-jsonl",
+                str(vendor_file),
+                82,
+                0,
+                "claude",
+                "high",
+                "partial",
+                '{"tool_name":"Bash","command":"pytest tests/test_auth.py"}',
+            ),
+        ).lastrowid
+        conn.execute(
+            """
+            INSERT INTO events (
+                session_id, type, event_key, event_at, ingested_at, source,
+                source_path, source_offset, seq, client, confidence, lossiness, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                "tool_result",
+                "tool_result:1",
+                "2026-04-22T10:00:05Z",
+                "2026-04-22T10:00:06Z",
+                "claude-jsonl",
+                str(vendor_file),
+                153,
+                0,
+                "claude",
+                "medium",
+                "none",
+                '{"output":"401 unauthorized"}',
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO events (
+                session_id, type, event_key, event_at, ingested_at, source,
+                source_path, source_offset, seq, client, confidence, lossiness, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                child_id,
+                "tool_call",
+                "tool_call:child",
+                "2026-04-22T10:04:01Z",
+                "2026-04-22T10:04:02Z",
+                "hook",
+                str(vendor_file),
+                200,
+                0,
+                "claude",
+                "high",
+                "none",
+                '{"tool_name":"Read","path":"README.md"}',
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO token_usage (
+                event_id, session_id, model, service_tier, data_source, input, output,
+                cache_read, cache_write, reasoning, cost_estimate, event_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                second_id,
+                root_id,
+                "claude-sonnet-4",
+                "standard",
+                "api",
+                120,
+                42,
+                10,
+                0,
+                8,
+                0.0137,
+                "2026-04-22T10:00:03Z",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO cost_anomalies (
+                session_id, turn_event_id, kind, confidence, evidence_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                second_id,
+                "cache_read_collapse",
+                "medium",
+                '{"before": 200, "after": 10}',
+                "2026-04-22T10:00:08Z",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO incidents (
+                session_id, kind, first_event_id, last_event_id,
+                evidence_json, count, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                "loop_exact_repeat",
+                second_id,
+                second_id,
+                '{"fingerprint":"pytest tests/test_auth.py"}',
+                3,
+                "medium",
+                "2026-04-22T10:00:09Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "root_key": root_key,
+        "child_key": child_key,
+        "root_url": f"/timeline/{quote(root_key, safe='')}",
+        "child_url": f"/timeline/{quote(child_key, safe='')}",
+        "legacy_url": "/timeline/sess-0",
+        "spa_session_url": "/session/sess-0",
+        "first_event_id": int(first_id),
+        "second_event_id": int(second_id),
+    }
+
+
 class TestSessionsAPI:
     def test_list_sessions(self, server):
         status, data = _get(server, "/api/sessions")
@@ -412,6 +619,7 @@ class TestStaticServing:
         (dist / "index.html").write_text("<!DOCTYPE html><title>Built UI</title>", encoding="utf-8")
         (dist / "app.js").write_text("console.log('ok');", encoding="utf-8")
         monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+        seeded = _seed_timeline(index_setup)
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
         conn.request("GET", "/")
@@ -420,19 +628,133 @@ class TestStaticServing:
         assert resp.status == 200
         assert "Built UI" in body
 
+        # `/session/<id>` is owned by the SPA's client-side router — the
+        # daemon must keep serving the SPA shell there, not the timeline.
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", "/session/sess-0")
+        conn.request("GET", seeded["spa_session_url"])
         resp = conn.getresponse()
         body = resp.read().decode()
         assert resp.status == 200
         assert "Built UI" in body
 
+        # `/timeline/<legacy_workbench_id>` is the timeline's own surface;
+        # the legacy id is resolved to its canonical session_key and the
+        # client is redirected to the canonical timeline URL.
         conn = HTTPConnection("127.0.0.1", server, timeout=5)
-        conn.request("GET", "/traces/session/sess-0")
+        conn.request("GET", seeded["legacy_url"])
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 302
+        assert resp.getheader("Location") == seeded["root_url"]
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", seeded["root_url"])
         resp = conn.getresponse()
         body = resp.read().decode()
         assert resp.status == 200
-        assert "Built UI" in body
+        assert "Session Timeline" in body
+        assert "Built UI" not in body
+
+
+class TestTimelineRoute:
+    def test_session_timeline_renders_cost_incidents_and_subagents(self, server, index_setup):
+        seeded = _seed_timeline(index_setup)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", seeded["root_url"])
+        resp = conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert "Session Timeline" in body
+        assert f'id="event-{seeded["second_event_id"]}"' in body
+        assert "cache_read_collapse" in body
+        assert "loop_exact_repeat" in body
+        assert "Subagent session" in body
+        assert "Not captured by this client" in body
+        assert "Captured but lossy" in body
+        assert "Captured directly" in body
+
+    def test_child_session_route_redirects_to_parent_timeline(self, server, index_setup):
+        seeded = _seed_timeline(index_setup)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", seeded["child_url"])
+        resp = conn.getresponse()
+        resp.read()
+
+        assert resp.status == 302
+        assert resp.getheader("Location") == seeded["root_url"]
+
+    def test_unknown_session_key_returns_404_with_not_found_page(self, server, index_setup):
+        _seed_timeline(index_setup)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/timeline/claude:nobody:unknown")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 404
+        assert "claude:nobody:unknown" in body
+
+    def test_legacy_workbench_id_without_session_key_returns_404(
+        self, server, index_setup
+    ):
+        _seed_timeline(index_setup)
+
+        conn = open_index()
+        try:
+            conn.execute(
+                "UPDATE sessions SET session_key = NULL WHERE session_id = 'sess-1'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        http_conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        http_conn.request("GET", "/timeline/sess-1")
+        resp = http_conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 404
+        assert "sess-1" in body
+
+    def test_html_escapes_event_content_to_block_xss(self, server, index_setup):
+        seeded = _seed_timeline(index_setup)
+
+        conn = open_index()
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (
+                    session_id, type, event_key, event_at, ingested_at, source,
+                    source_path, source_offset, seq, client, confidence,
+                    lossiness, raw_json
+                ) VALUES (
+                    (SELECT id FROM event_sessions WHERE session_key = ?),
+                    'tool_call', 'tool_call:xss', '2026-04-22T10:01:00Z',
+                    '2026-04-22T10:01:01Z', 'claude-jsonl', 'vendor.jsonl',
+                    900, 0, 'claude', 'high', 'none',
+                    ?
+                )
+                """,
+                (
+                    seeded["root_key"],
+                    '{"text":"<script>alert(1)</script>"}',
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        http_conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        http_conn.request("GET", seeded["root_url"])
+        resp = http_conn.getresponse()
+        body = resp.read().decode()
+
+        assert resp.status == 200
+        assert "<script>alert(1)</script>" not in body
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
 
 
 class TestRunServerPortFallback:

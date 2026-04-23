@@ -20,7 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
 from ..redaction.anonymizer import Anonymizer
@@ -52,6 +52,12 @@ from .index import (
     search_fts,
     update_session,
     upsert_sessions,
+)
+from .timeline import (
+    canonical_session_path,
+    load_timeline_page,
+    render_not_found_html,
+    render_timeline_html,
 )
 from ..parsing.parser import (
     AIDER_SOURCE,
@@ -966,6 +972,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_list_findings_allowlist()
+        elif path.startswith("/timeline/"):
+            if self._handle_session_timeline(path):
+                return
+            self._serve_static(parsed.path)
+            return
         else:
             self._serve_static(parsed.path)
 
@@ -2067,6 +2078,67 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except OSError:
             self.send_error(404)
+
+    def _handle_session_timeline(self, path: str) -> bool:
+        requested = unquote(path[len("/timeline/"):])
+        if not requested:
+            return False
+
+        conn = open_index()
+        try:
+            legacy_row = conn.execute(
+                "SELECT session_key FROM sessions WHERE session_id = ? LIMIT 1",
+                (requested,),
+            ).fetchone()
+            if legacy_row is not None:
+                session_key = legacy_row["session_key"]
+                if session_key:
+                    self._redirect(canonical_session_path(str(session_key)))
+                    return True
+                # Legacy workbench row exists but has no `session_key`
+                # yet — most likely a pre-ADR-001 session that hasn't been
+                # re-scanned through `events ingest`. Surface the
+                # pending-ingest page with a 404 rather than falling
+                # through to the SPA shell (the SPA has no /timeline/
+                # route).
+                body = render_not_found_html(requested).encode("utf-8")
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+
+            page = load_timeline_page(conn, requested)
+        finally:
+            conn.close()
+
+        if page.root is None and page.workbench_row is None:
+            body = render_not_found_html(requested).encode("utf-8")
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
+        if page.redirect_session_key:
+            self._redirect(canonical_session_path(page.redirect_session_key))
+            return True
+
+        body = render_timeline_html(page).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _inject_api_token(self, data: bytes) -> bytes:
         # Inject the per-install API token so same-origin frontend fetches
