@@ -768,6 +768,7 @@ class TestDiscoverProjects:
         assert sessions[0]["messages"][0]["role"] == "user"
         assert sessions[0]["messages"][1]["role"] == "assistant"
         assert sessions[0]["messages"][1]["tool_uses"][0]["tool"] == "exec_command"
+        assert sessions[0]["raw_source_path"] == str(session_file)
 
     def test_codex_thinking_not_duplicated(self, tmp_path, monkeypatch, mock_anonymizer):
         """Reasoning from response_item and agent_reasoning event_msg should not duplicate."""
@@ -1834,6 +1835,7 @@ class TestDiscoverOpenclawProjects:
         assert sessions[0]["source"] == "openclaw"
         assert sessions[0]["project"] == "openclaw:myapp"
         assert sessions[0]["messages"][0]["content"] == "Hello"
+        assert sessions[0]["raw_source_path"] == str(sessions_dir / "sess-1.jsonl")
 
     def test_multiple_agents_same_cwd(self, tmp_path, monkeypatch, mock_anonymizer):
         """Sessions from different agents but same cwd should be grouped."""

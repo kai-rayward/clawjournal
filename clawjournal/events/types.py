@@ -1,4 +1,60 @@
-"""Shared types and validation for the execution recorder."""
+"""Shared types and validation for the execution recorder.
+
+``session_key`` grammar (per ADR-001, 2026-04-22)
+-------------------------------------------------
+
+``session_key`` is the canonical public session identifier for every phase-1
+feature from 06 onward: timeline-viewer URLs, replay-export bundles, encrypted
+HTML-share metadata, aggregation bucket keys, cross-session FTS results, and
+any external tool (MCP responses, etc.) that needs to reference a session.
+Workbench's legacy ``sessions.session_id`` remains for internal plumbing only.
+
+Current grammar, by ``client``:
+
+- ``claude:<project_dir_name>:<session_uuid>``
+  Native Claude Code (``~/.claude/projects/<project_dir_name>/<uuid>.jsonl``)
+  and the Claude-Desktop local-agent convergence case where the CLI session id
+  matches the native uuid.
+- ``claude:<workspace_key>:<cliSessionId>``
+  Claude-Desktop local-agent path when the CLI session id differs from the
+  native uuid. ``workspace_key`` is derived from the wrapper's
+  ``userSelectedFolders[0]`` (path separators replaced with ``-``) or
+  ``_cowork_<sessionId>`` when no user-selected folder is present.
+- ``codex:<absolute_source_path>``
+- ``openclaw:<absolute_source_path>``
+
+Stability guarantees
+--------------------
+
+The grammar above is the public contract. Any change to the grammar itself
+requires an ADR amendment or a superseding ADR. Do not edit the grammar in
+isolation; the export, URL, and FTS consumers all assume the shapes above.
+
+For a fixed grammar, ``session_key`` values are stable with respect to a
+fixed set of inputs (``project_dir_name``, session UUID, wrapper metadata).
+They are **not** guaranteed stable across input changes — renaming
+``~/Projects/myapp`` → ``~/Projects/my-app`` today produces a new
+``session_key`` because ``project_dir_name`` is part of the claude grammar.
+This is ADR-001's Open Question #1 and is deferred to a follow-up ADR; a
+future grammar may decouple ``project_dir_name`` from the key specifically to
+survive renames.
+
+Consumers that care about durability across renames (bundle export, URL
+bookmarks, encrypted share metadata) should either (a) snapshot the
+``session_key`` at share time and treat it as an opaque handle, or (b) carry
+a bundle ``schema_version`` that can be converted when the grammar changes.
+
+Within a single grammar version:
+
+- Bundles exported on one ``schema_version`` remain resolvable by any later
+  clawjournal version that honors the same ``schema_version``.
+- URLs of the form ``clawjournal://session/<session_key>#event-<id>`` remain
+  resolvable as long as the underlying inputs (path + wrapper) are unchanged.
+- Workbench ``sessions.session_key`` re-derives on upsert — a rescan after an
+  input change will overwrite the stored value with the new derivation. This
+  is the intentional escape hatch for fixing derivation bugs; it is also why
+  renames surface as an Open Question rather than a silent breakage.
+"""
 
 from __future__ import annotations
 

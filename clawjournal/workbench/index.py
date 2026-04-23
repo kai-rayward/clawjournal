@@ -21,11 +21,12 @@ from ..pricing import estimate_cost
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
 
-# Schema version sentinel. Bumped once for the security refactor (findings,
-# allowlist, hold-state history, per-session security columns). The prior
-# bundles→shares migration uses version 1; the security migration advances
-# PRAGMA user_version to 2 and is gated atomically on that comparison.
+# Schema version sentinels. Version 1 is the bundles→shares migration,
+# version 2 is the security refactor, and version 3 adds the
+# `sessions.session_key` bridge to `event_sessions.session_key`.
 SECURITY_SCHEMA_VERSION = 2
+SESSION_IDENTITY_SCHEMA_VERSION = 3
+WORKBENCH_SCHEMA_VERSION = SESSION_IDENTITY_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     reviewed_at        TEXT,
     blob_path          TEXT,
     raw_source_path    TEXT,
+    session_key        TEXT,
     indexed_at         TEXT NOT NULL,
     updated_at         TEXT,
     share_id           TEXT REFERENCES shares(share_id),
@@ -299,6 +301,7 @@ def open_index() -> sqlite3.Connection:
                 raise
 
     _migrate_security_refactor(conn)
+    _migrate_session_identity_bridge(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -386,6 +389,31 @@ def _migrate_security_refactor(conn: sqlite3.Connection) -> None:
         )
 
         conn.execute(f"PRAGMA user_version = {SECURITY_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_session_identity_bridge(conn: sqlite3.Connection) -> None:
+    """Add `sessions.session_key` + partial index and advance version 2 → 3."""
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= SESSION_IDENTITY_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN session_key TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+            "ON sessions(session_key) WHERE session_key IS NOT NULL"
+        )
+        conn.execute(f"PRAGMA user_version = {SESSION_IDENTITY_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -633,6 +661,141 @@ def _dedupe_strings(values: list[str]) -> list[str]:
         seen.add(cleaned)
         result.append(cleaned)
     return result
+
+
+def _derive_session_key_from_source(
+    source: Any, raw_source_path: Any
+) -> str | None:
+    """Best-effort `event_sessions.session_key` derivation from workbench provenance."""
+    if not isinstance(source, str) or not isinstance(raw_source_path, str):
+        return None
+    if not raw_source_path.strip():
+        return None
+
+    path = Path(raw_source_path)
+    if source == "codex":
+        return f"codex:{path}"
+    if source == "openclaw":
+        return f"openclaw:{path}"
+    if source != "claude":
+        return None
+
+    if ".claude" in path.parts and path.suffix == ".jsonl":
+        la_key = _derive_local_agent_claude_session_key(path)
+        if la_key is not None:
+            return la_key
+        # Real native paths (~/.claude/projects/<proj>/<uuid>.jsonl) also
+        # contain `.claude`; when the local-agent wrapper probe fails, fall
+        # through to the stem-based native derivation below.
+
+    if path.suffix == ".jsonl":
+        project_dir_name = path.parent.name
+        session_id = path.stem
+    else:
+        project_dir_name = path.parent.name
+        session_id = path.name
+
+    if not project_dir_name or not session_id:
+        return None
+    return f"claude:{project_dir_name}:{session_id}"
+
+
+def _derive_local_agent_claude_session_key(path: Path) -> str | None:
+    """Recover the Claude local-agent session key from a nested transcript path."""
+    try:
+        session_dir = path.parents[3]
+    except IndexError:
+        return None
+
+    wrapper_path = session_dir.with_suffix(".json")
+    if not wrapper_path.is_file():
+        return None
+
+    # Deferred import to avoid a workbench↔capture cycle. We reach into two
+    # private helpers in `clawjournal.capture.discovery` so the workbench
+    # backfill derives exactly the same `session_key` the events-layer
+    # capture adapter writes. If those helpers are renamed, update this
+    # call site in lockstep or the derivation silently diverges.
+    from clawjournal.capture import discovery
+
+    wrapper = discovery._load_local_agent_wrapper(wrapper_path)
+    if wrapper is None:
+        return None
+    cli_session_id = wrapper.get("cliSessionId")
+    if not isinstance(cli_session_id, str) or cli_session_id != path.stem:
+        return None
+    workspace_key = discovery._workspace_key_from_wrapper(wrapper, session_dir)
+    return f"claude:{workspace_key}:{cli_session_id}"
+
+
+def _lookup_event_session_key(
+    conn: sqlite3.Connection, raw_source_path: Any
+) -> str | None:
+    if not isinstance(raw_source_path, str) or not raw_source_path.strip():
+        return None
+    row = conn.execute(
+        """
+        SELECT event_sessions.session_key
+          FROM event_sessions
+          JOIN events ON events.session_id = event_sessions.id
+         WHERE events.source_path = ?
+         ORDER BY events.id
+         LIMIT 1
+        """,
+        (raw_source_path,),
+    ).fetchone()
+    return None if row is None else str(row["session_key"])
+
+
+def backfill_session_keys(conn: sqlite3.Connection) -> int:
+    """Populate missing `sessions.session_key` values from events or path derivation.
+
+    Safe to call on a fresh workbench DB where no ``events ingest`` has run yet —
+    ``event_sessions`` / ``events`` are ensured here, so ``_lookup_event_session_key``
+    degrades to an empty query and the backfill falls through to path derivation.
+    """
+    from clawjournal.events.schema import ensure_schema as ensure_event_schema
+
+    ensure_event_schema(conn)
+    rows = conn.execute(
+        """
+        SELECT session_id, source, raw_source_path
+          FROM sessions
+         WHERE session_key IS NULL
+           AND source IN ('claude', 'codex', 'openclaw')
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        session_key = _lookup_event_session_key(
+            conn, row["raw_source_path"]
+        ) or _derive_session_key_from_source(
+            row["source"], row["raw_source_path"]
+        )
+        if session_key is not None:
+            updates.append((session_key, row["session_id"]))
+
+    if not updates:
+        return 0
+
+    with conn:
+        cursor = conn.executemany(
+            """
+            UPDATE sessions
+               SET session_key = ?
+             WHERE session_id = ?
+               AND session_key IS NULL
+            """,
+            updates,
+        )
+    # `cursor.rowcount` reflects rows actually affected by the guarded UPDATE
+    # (concurrent backfills can see the same NULL candidates and race; the
+    # `session_key IS NULL` guard keeps the data correct but `len(updates)`
+    # would over-report in that case).
+    return max(cursor.rowcount, 0)
 
 
 def session_matches_excluded_projects(
@@ -1254,6 +1417,9 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         if not project or not source:
             continue
 
+        session_key = _derive_session_key_from_source(
+            source, session.get("raw_source_path")
+        )
         stats = session.get("stats", {})
         duration = _compute_duration(session)
 
@@ -1281,7 +1447,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
             "ai_display_title, ai_task_type, ai_outcome_badge, "
             "ai_value_badges, ai_risk_badges, "
             "ai_effort_estimate, ai_summary, "
-            "share_id, parent_session_id, subagent_session_ids, "
+            "share_id, session_key, parent_session_id, subagent_session_ids, "
             "estimated_cost_usd, end_time "
             "FROM sessions WHERE session_id = ?",
             (session_id,),
@@ -1318,6 +1484,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         preserved_ai_effort = existing["ai_effort_estimate"] if not is_new else None
         preserved_ai_summary = existing["ai_summary"] if not is_new else None
         preserved_share_id = existing["share_id"] if not is_new else None
+        preserved_session_key = existing["session_key"] if not is_new else None
         preserved_parent_session_id = existing["parent_session_id"] if not is_new else None
         preserved_subagent_session_ids = existing["subagent_session_ids"] if not is_new else None
 
@@ -1357,6 +1524,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 sensitivity_score, task_type,
                 files_touched, commands_run,
                 blob_path, raw_source_path,
+                session_key,
                 indexed_at, updated_at,
                 review_status,
                 selection_reason, reviewer_notes, reviewed_at,
@@ -1386,7 +1554,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 ?, ?,
                 ?, ?,
                 ?,
-                ?, ?, ?,
+                ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
                 ?, ?,
@@ -1426,6 +1594,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 commands_run = excluded.commands_run,
                 blob_path = excluded.blob_path,
                 raw_source_path = excluded.raw_source_path,
+                session_key = COALESCE(excluded.session_key, session_key),
                 updated_at = excluded.updated_at,
                 parent_session_id = COALESCE(excluded.parent_session_id, parent_session_id),
                 segment_index = excluded.segment_index,
@@ -1460,6 +1629,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 json.dumps(commands),
                 str(blob_path),
                 session.get("raw_source_path"),
+                session_key or preserved_session_key,
                 preserved_indexed_at,
                 now,
                 preserved_status,

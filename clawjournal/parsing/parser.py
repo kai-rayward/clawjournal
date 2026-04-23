@@ -717,6 +717,7 @@ def parse_project_sessions(
             if parsed and parsed["messages"]:
                 parsed["project"] = _build_openclaw_project_name(project_dir_name)
                 parsed["source"] = OPENCLAW_SOURCE
+                parsed["raw_source_path"] = str(session_file)
                 sessions.append(parsed)
         return sessions
 
@@ -764,6 +765,7 @@ def parse_project_sessions(
             if parsed and parsed["messages"]:
                 parsed["project"] = _build_codex_project_name(project_dir_name)
                 parsed["source"] = CODEX_SOURCE
+                parsed["raw_source_path"] = str(session_file)
                 # Derive client_origin from originator field
                 originator = parsed.pop("originator", None) or ""
                 parsed.pop("codex_source", None)

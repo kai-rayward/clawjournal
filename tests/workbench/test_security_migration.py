@@ -16,7 +16,7 @@ from clawjournal.paths import (
 )
 from clawjournal.workbench.index import (
     BACKFILL_WINDOW,
-    SECURITY_SCHEMA_VERSION,
+    WORKBENCH_SCHEMA_VERSION,
     open_index,
     upsert_sessions,
 )
@@ -76,11 +76,21 @@ class TestFreshInstall:
         finally:
             conn.close()
 
+    def test_adds_session_key_bridge_column_and_index(self, fresh_db):
+        conn = open_index()
+        try:
+            cols = _columns(conn, "sessions")
+            assert "session_key" in cols
+            indexes = _indexes(conn, "sessions")
+            assert "idx_sessions_session_key" in indexes
+        finally:
+            conn.close()
+
     def test_advances_schema_version(self, fresh_db):
         conn = open_index()
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == SECURITY_SCHEMA_VERSION
+            assert version == WORKBENCH_SCHEMA_VERSION
         finally:
             conn.close()
 
@@ -183,7 +193,7 @@ class TestUpsertHoldState:
 
 
 class TestLegacyMigration:
-    """Exercise the v1 → v2 migration path on a pre-security-refactor DB."""
+    """Exercise the v1 → v3 migration path on a pre-security-refactor DB."""
 
     def _build_v1_db(self, db_path, session_rows):
         """Create a minimal pre-security-refactor DB at PRAGMA user_version=1.
@@ -282,7 +292,80 @@ class TestLegacyMigration:
             ).fetchone()[0]
             assert history_count == 1
             version = conn2.execute("PRAGMA user_version").fetchone()[0]
-            assert version == SECURITY_SCHEMA_VERSION
+            assert version == WORKBENCH_SCHEMA_VERSION
+        finally:
+            conn2.close()
+
+
+class TestSessionIdentityBridgeMigration:
+    def _build_v2_db(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id         TEXT PRIMARY KEY,
+                project            TEXT NOT NULL,
+                source             TEXT NOT NULL,
+                start_time         TEXT,
+                end_time           TEXT,
+                review_status      TEXT DEFAULT 'new',
+                indexed_at         TEXT NOT NULL,
+                hold_state         TEXT DEFAULT 'auto_redacted',
+                embargo_until      TEXT,
+                findings_revision  TEXT,
+                findings_backfill_needed INTEGER
+            );
+            CREATE TABLE session_hold_history (
+                history_id     TEXT PRIMARY KEY,
+                session_id     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                from_state     TEXT,
+                to_state       TEXT NOT NULL,
+                embargo_until  TEXT,
+                changed_by     TEXT NOT NULL,
+                changed_at     TEXT NOT NULL,
+                reason         TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (session_id, project, source, indexed_at) "
+            "VALUES ('s1', 'p', 'claude', '2025-01-01T00:00:00+00:00')"
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+
+    def test_v2_db_gains_session_key_bridge(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "index.db"
+        self._build_v2_db(db_path)
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", db_path)
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+
+        conn = open_index()
+        try:
+            cols = _columns(conn, "sessions")
+            assert "session_key" in cols
+            indexes = _indexes(conn, "sessions")
+            assert "idx_sessions_session_key" in indexes
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == WORKBENCH_SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_v2_bridge_migration_is_idempotent(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "index.db"
+        self._build_v2_db(db_path)
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", db_path)
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+
+        conn1 = open_index()
+        conn1.close()
+        conn2 = open_index()
+        try:
+            indexes = _indexes(conn2, "sessions")
+            assert "idx_sessions_session_key" in indexes
+            version = conn2.execute("PRAGMA user_version").fetchone()[0]
+            assert version == WORKBENCH_SCHEMA_VERSION
         finally:
             conn2.close()
 
