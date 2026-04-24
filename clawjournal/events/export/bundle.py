@@ -50,6 +50,15 @@ _DEFAULT_EXPORT_DIRNAME = "exports"
 _BUNDLE_FILENAME_PREFIX = "clawjournal-bundle-"
 _SNIPPET_UNAVAILABLE_SENTINEL = "source-unavailable-at-export"
 _REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
+# TruffleHog's subprocess-path hard-caps input at 200 MB (see
+# ``_MAX_SCAN_BYTES`` in ``redaction/trufflehog.py``) and drops findings
+# silently when the input exceeds it. The batched redactor merges every
+# piece in a workbench session into a single synthetic blob for the TH
+# call, so a large session could overflow the cap where the old
+# per-piece path would not. Bound the per-batch text to 64 MB so the
+# merged blob + JSON framing comfortably stays under TH's limit; larger
+# groups get split into sub-batches, each with its own TH scan.
+_MAX_GROUP_BATCH_BYTES = 64 * 1024 * 1024
 
 
 class ExportError(Exception):
@@ -441,10 +450,6 @@ class _BundleRedactor:
        subprocess scan covers the batch, and the redacted pieces are
        extracted back.
     3. ``get(piece_id)`` returns the final redacted text.
-
-    ``text(...)`` is a sugar wrapper for one-shot use; it calls
-    ``prepare`` / ``finalize`` / ``get`` for a fresh piece_id. Prefer the
-    batch API when redacting many pieces.
     """
 
     conn: sqlite3.Connection
@@ -457,10 +462,8 @@ class _BundleRedactor:
     _reviewed_replacements_cache: dict[str, list[tuple[Any, str, str]]] = field(
         default_factory=dict
     )
-    _decisions_cache: dict[str, dict[str, str]] = field(default_factory=dict)
     _pending: dict[Any, tuple[str, str | None]] = field(default_factory=dict)
     _finalized: dict[Any, str] = field(default_factory=dict)
-    _finalize_seq: int = 0
 
     def __post_init__(self) -> None:
         from clawjournal.workbench.index import _compile_blocked_domain_pattern
@@ -489,6 +492,11 @@ class _BundleRedactor:
         Applies the cheap per-piece layers now; the result is retrievable
         via ``get(piece_id)`` after ``finalize()`` runs.
         """
+        if piece_id in self._pending or piece_id in self._finalized:
+            raise RuntimeError(
+                f"duplicate piece_id {piece_id!r} — callers must use "
+                "unique ids per redaction batch"
+            )
         if text is None:
             self._pending[piece_id] = (None, None)
             return
@@ -530,22 +538,6 @@ class _BundleRedactor:
         if piece_id not in self._finalized:
             raise RuntimeError(f"piece_id not finalized: {piece_id!r}")
         return self._finalized[piece_id]
-
-    def text(
-        self,
-        text: str | None,
-        *,
-        session_key: str | None,
-        field: str,
-    ) -> str | None:
-        """One-shot redaction sugar. Prefer ``prepare``+``finalize``+``get``
-        in loops — this method calls finalize once per invocation and
-        does not batch."""
-        piece_id = ("__text__", self._finalize_seq)
-        self._finalize_seq += 1
-        self.prepare(piece_id, text, session_key=session_key, field=field)
-        self.finalize()
-        return self.get(piece_id)
 
     # --- light layers (cheap, per-piece) ---------------------------------- #
 
@@ -704,10 +696,46 @@ class _BundleRedactor:
         self, workbench_session_id: str, piece_ids: list[Any]
     ) -> None:
         """Batched findings-backed redaction: one synthetic session blob
-        per workbench_session_id. ``apply_findings_to_blob`` and
-        ``_build_deterministic_redaction_log`` each spawn TruffleHog
-        subprocesses internally, so batching turns O(pieces) TH calls
-        into O(sessions) TH calls.
+        per workbench_session_id.
+
+        ``apply_findings_to_blob`` and ``_build_deterministic_redaction_log``
+        each spawn TruffleHog subprocesses internally, so batching turns
+        O(pieces) TH calls into O(sessions) TH calls. Large sessions
+        whose merged text would exceed TH's scan cap are split into
+        sub-batches bounded by ``_MAX_GROUP_BATCH_BYTES``; each sub-batch
+        gets its own TH scan but the decisions query still amortizes.
+        """
+        # Split by cumulative text size so each sub-batch stays well
+        # under TruffleHog's 200 MB input ceiling.
+        sub_batches: list[list[Any]] = []
+        current: list[Any] = []
+        current_bytes = 0
+        for pid in piece_ids:
+            lightly_redacted = self._pending[pid][0]
+            piece_bytes = len(lightly_redacted.encode("utf-8", errors="replace"))
+            if current and current_bytes + piece_bytes > _MAX_GROUP_BATCH_BYTES:
+                sub_batches.append(current)
+                current = []
+                current_bytes = 0
+            current.append(pid)
+            current_bytes += piece_bytes
+        if current:
+            sub_batches.append(current)
+
+        for batch in sub_batches:
+            self._run_findings_pass(workbench_session_id, batch)
+
+    def _run_findings_pass(
+        self, workbench_session_id: str, piece_ids: list[Any]
+    ) -> None:
+        """Single findings-backed pass on one sub-batch.
+
+        Falls back to the pure ``redact_text`` path if the findings DB
+        is unavailable. On the fallback path the deterministic-engine
+        log entries from this batch are lost (we never called
+        ``self.counts.record(log)`` because ``apply_findings_to_blob``
+        raised); the regex-only redact_text still runs so correctness
+        is preserved, only the per-type metadata differs.
         """
         try:
             from clawjournal.redaction.secrets import apply_findings_to_blob
@@ -748,22 +776,22 @@ class _BundleRedactor:
         if extra > 0:
             self.counts.add("deterministic_extra", extra)
 
+        # apply_findings_to_blob mutates the synthetic blob in place,
+        # keeping one message per queued piece. Defensive fallback to the
+        # lightly-redacted text if the shared helper's output shape ever
+        # changes (e.g. filters out empty messages), so a future refactor
+        # there can't leave a piece unfinalized.
         redacted_messages = redacted.get("messages") or []
-        for pid, msg in zip(piece_ids, redacted_messages):
-            redacted_content = msg.get("content") if isinstance(msg, dict) else None
-            if isinstance(redacted_content, str):
-                self._finalized[pid] = redacted_content
-            else:
-                # Fall back to the lightly-redacted text if the
-                # findings-backed pass returned something unexpected.
-                self._finalized[pid] = self._pending[pid][0]
-
-        # If _iter_text_locations returned fewer messages than we queued
-        # (shouldn't happen with the blob shape we construct, but defend
-        # against schema drift), fill in the missing ones from light.
-        for pid in piece_ids:
-            if pid not in self._finalized:
-                self._finalized[pid] = self._pending[pid][0]
+        for idx, pid in enumerate(piece_ids):
+            msg = redacted_messages[idx] if idx < len(redacted_messages) else None
+            redacted_content = (
+                msg.get("content") if isinstance(msg, dict) else None
+            )
+            self._finalized[pid] = (
+                redacted_content
+                if isinstance(redacted_content, str)
+                else self._pending[pid][0]
+            )
 
 
 def _redact_path_with(anonymizer: Anonymizer, path: str | None) -> str | None:

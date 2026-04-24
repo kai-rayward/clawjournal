@@ -615,6 +615,84 @@ def test_redactor_runs_findings_pass_once_per_workbench_session(
     )
 
 
+def test_redactor_prepare_rejects_duplicate_piece_id():
+    """Calling ``prepare`` twice with the same piece_id would silently
+    overwrite the first queued piece. Raise so the bug surfaces at the
+    duplicate call site instead of producing wrong export output later.
+    """
+    import clawjournal.events.export.bundle as bundle_mod
+    from clawjournal.redaction.anonymizer import Anonymizer
+
+    conn = make_conn()
+    redactor = bundle_mod._BundleRedactor(
+        conn=conn,
+        anonymizer=Anonymizer(),
+        custom_strings=[],
+        user_allowlist=None,
+        blocked_domains=[],
+        counts=bundle_mod._RedactionCounts(),
+    )
+    redactor.prepare(("event", 0), "hello", session_key=None, field="raw_json")
+    with pytest.raises(RuntimeError, match="duplicate piece_id"):
+        redactor.prepare(("event", 0), "goodbye", session_key=None, field="raw_json")
+
+
+def test_redactor_splits_oversized_batch_into_sub_batches(tmp_path, monkeypatch):
+    """A session whose merged text would exceed TruffleHog's scan cap
+    gets split into sub-batches rather than sending one payload that
+    TH would silently drop.
+    """
+    import clawjournal.events.export.bundle as bundle_mod
+
+    # Shrink the threshold so the test doesn't need megabytes of text.
+    monkeypatch.setattr(bundle_mod, "_MAX_GROUP_BATCH_BYTES", 50)
+
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:big:s")
+    insert_workbench_session(
+        src,
+        session_id="wb-big",
+        session_key="claude:big:s",
+    )
+    # Five events, each ~30 bytes of raw_json; at threshold=50 bytes
+    # they must split into at least 3 sub-batches.
+    for i in range(5):
+        insert_event(
+            src,
+            session_id=sid,
+            event_type="user_message",
+            event_key=f"msg:{i}",
+            source_path="/tmp/big.jsonl",
+            source_offset=i * 100,
+            seq=0,
+            raw_json={"text": f"padding-padding-{i}"},
+        )
+
+    call_counts = {"n": 0}
+    real_pass = bundle_mod._BundleRedactor._run_findings_pass
+
+    def _counting_pass(self, wb_id, piece_ids):
+        call_counts["n"] += 1
+        return real_pass(self, wb_id, piece_ids)
+
+    monkeypatch.setattr(
+        bundle_mod._BundleRedactor, "_run_findings_pass", _counting_pass
+    )
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+
+    export_session_bundle(
+        src,
+        "claude:big:s",
+        config=PERMISSIVE_CONFIG,
+        skip_global_gates=True,
+    )
+
+    assert call_counts["n"] >= 2, (
+        f"expected the oversized batch to split, got {call_counts['n']} "
+        "findings-pass calls (no split)"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # edge cases
 # --------------------------------------------------------------------------- #
