@@ -43,6 +43,7 @@ from ._helpers import (
     PERMISSIVE_CONFIG,
     insert_event,
     insert_event_session,
+    insert_workbench_session,
     insert_token_usage,
     make_conn,
 )
@@ -404,6 +405,43 @@ def test_recorder_schema_major_mismatch_rejected(tmp_path, monkeypatch):
         import_session_bundle(dst, summary.bundle_path)
 
 
+def test_malformed_bundle_minor_version_rejected(tmp_path, monkeypatch):
+    """A bundle whose minor version doesn't parse as an integer must be
+    rejected outright — pre-fix this silently coerced to -1 and accepted
+    the bundle."""
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:minor:s")
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        source_path="/tmp/x.jsonl",
+        raw_json={"x": 1},
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:minor:s",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+    bundle["bundle_schema_version"] = "1.0abc"
+    digest_input = {k: v for k, v in bundle.items() if k != "manifest"}
+    canonical = json.dumps(
+        digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    bundle["manifest"]["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    summary.bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="malformed bundle_schema_version minor"):
+        import_session_bundle(dst, summary.bundle_path)
+
+
 # --------------------------------------------------------------------------- #
 # edge cases
 # --------------------------------------------------------------------------- #
@@ -506,6 +544,74 @@ def test_malformed_raw_ref_three_tuple_rejected(tmp_path, monkeypatch):
     dst = make_conn()
     with pytest.raises(ImportError_, match="malformed raw_ref"):
         import_session_bundle(dst, summary.bundle_path)
+
+
+def test_no_snippets_import_restores_local_source_path_for_inspect(
+    tmp_path, monkeypatch
+):
+    """When a no-snippets bundle is imported on the original machine, use
+    the local workbench raw_source_path so events inspect can still read
+    the vendor JSONL line. The bundle itself continues to carry the
+    anonymized raw_ref path."""
+    home = tmp_path / "home"
+    source_file = home / ".claude" / "projects" / "-repo" / "sess.jsonl"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text('{"text": "inspect me"}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        "clawjournal.redaction.anonymizer._detect_home_dir",
+        lambda: (str(home), home.name),
+    )
+
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:-repo:sess")
+    insert_workbench_session(
+        src,
+        session_id="wb-inspect",
+        session_key="claude:-repo:sess",
+        raw_source_path=str(source_file),
+    )
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        event_key="msg:1",
+        source_path=str(source_file),
+        source_offset=0,
+        seq=0,
+        raw_json={"text": "inspect me"},
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:-repo:sess",
+        config=PERMISSIVE_CONFIG,
+        include_snippets=False,
+        skip_global_gates=True,
+    )
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+    assert "source_snippets" not in bundle
+    assert bundle["events"][0]["raw_ref"][1].startswith("[REDACTED_PATH_")
+
+    dst = make_conn()
+    insert_workbench_session(
+        dst,
+        session_id="wb-inspect",
+        session_key="claude:-repo:sess",
+        raw_source_path=str(source_file),
+    )
+    import_session_bundle(dst, summary.bundle_path)
+
+    row = dst.execute(
+        "SELECT source_path, source_offset FROM events WHERE event_key = 'msg:1'"
+    ).fetchone()
+    assert row["source_path"] == str(source_file)
+
+    from clawjournal.events.view import fetch_vendor_line
+
+    assert fetch_vendor_line(row["source_path"], row["source_offset"]) == (
+        '{"text": "inspect me"}'
+    )
 
 
 @pytest.fixture

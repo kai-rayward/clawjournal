@@ -3290,11 +3290,6 @@ def main() -> None:
         action="store_true",
         help="Opt past the hold-state gate for events-only sessions (no workbench review)",
     )
-    events_export.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the interactive pre-publish summary",
-    )
     pretty_group = events_export.add_mutually_exclusive_group()
     pretty_group.add_argument(
         "--pretty",
@@ -3323,11 +3318,6 @@ def main() -> None:
         action="store_true",
         help="Re-run cost ledger + loop detector against imported events instead of "
              "importing the bundle's cost_anomalies / incidents rows",
-    )
-    events_import.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip any interactive prompts (currently unused; reserved)",
     )
     events_import.add_argument(
         "--json", action="store_true", help="Output JSON status summary"
@@ -4177,6 +4167,20 @@ def _run_events_import(args) -> None:
             f"{summary.snippets_inserted} snippets across "
             f"{len(summary.session_keys)} session(s)."
         )
+        unresolved = (
+            summary.token_usage_skipped_unresolved
+            + summary.cost_anomalies_skipped_unresolved
+            + summary.incidents_skipped_unresolved
+        )
+        if unresolved:
+            print(
+                f"  (dropped {summary.token_usage_skipped_unresolved} token_usage, "
+                f"{summary.cost_anomalies_skipped_unresolved} cost_anomalies, "
+                f"{summary.incidents_skipped_unresolved} incidents with unresolvable "
+                f"cross-references — typically from events that already exist under a "
+                f"different session)",
+                file=sys.stderr,
+            )
 
 
 _INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024

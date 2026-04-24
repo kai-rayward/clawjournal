@@ -9,11 +9,11 @@
    ``status='open'`` finding blocks).
 3. Read events / overrides / token_usage / cost_anomalies / incidents.
 4. Anonymize raw_ref source paths (and snippet keys for the same path).
-5. Apply the anonymizer + regex secrets (``redact_text``) +
-   ``custom_strings`` to event payloads, override payloads, and source
-   snippets. AI-PII review is NOT run inline — per plan 07 the findings
-   gate in step 2 blocks the export when AI-PII findings remain unresolved
-   (``pii-review`` / ``pii-apply`` is the supported workflow).
+5. Apply the same share-time redaction layers to event payloads, override
+   payloads, and source snippets: custom strings, blocked domains,
+   anonymizer, then findings-backed deterministic/PII redactions. The
+   findings gate in step 2 blocks unresolved findings; accepted findings
+   are redacted and ignored findings are left intact.
 6. Assemble the bundle dict, compute manifest sha256.
 7. Run TruffleHog on the assembled bundle JSON; on a finding, write a
    manifest-only artifact and exit 2.
@@ -35,12 +35,11 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from clawjournal.events.capabilities import capabilities_json
 from clawjournal.events.view import fetch_vendor_line
 from clawjournal.redaction.anonymizer import Anonymizer
-from clawjournal.redaction.secrets import redact_text
 from clawjournal.redaction import trufflehog as th
 
 BUNDLE_SCHEMA_VERSION = "1.0"
@@ -51,6 +50,7 @@ _DEFAULT_EXPORT_DIRNAME = "exports"
 _BUNDLE_FILENAME_PREFIX = "clawjournal-bundle-"
 _PRE_PUBLISH_SIZE_WARN_BYTES = 50 * 1024 * 1024
 _SNIPPET_UNAVAILABLE_SENTINEL = "source-unavailable-at-export"
+_REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
 
 
 class ExportError(Exception):
@@ -416,33 +416,310 @@ class _RedactionCounts:
             self.by_type[t] = self.by_type.get(t, 0) + 1
         self.secrets += len(log)
 
+    def add(self, type_name: str, count: int) -> None:
+        if count <= 0:
+            return
+        self.by_type[type_name] = self.by_type.get(type_name, 0) + count
+        self.secrets += count
+
+
+@dataclass
+class _BundleRedactor:
+    conn: sqlite3.Connection
+    anonymizer: Anonymizer
+    custom_strings: list[str]
+    user_allowlist: list[dict] | None
+    blocked_domains: list[str]
+    counts: _RedactionCounts
+    workbench_session_ids: dict[str, str] = field(default_factory=dict)
+    _reviewed_replacements_cache: dict[str, list[tuple[str, str, str]]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        from clawjournal.workbench.index import _compile_blocked_domain_pattern
+
+        self._domain_patterns = [
+            pattern
+            for pattern in (
+                _compile_blocked_domain_pattern(domain)
+                for domain in (self.blocked_domains or [])
+            )
+            if pattern is not None
+        ]
+
+    def text(
+        self,
+        text: str | None,
+        *,
+        session_key: str | None,
+        field: str,
+    ) -> str | None:
+        if text is None:
+            return text
+
+        out = text
+        if self.custom_strings:
+            from clawjournal.redaction.secrets import redact_custom_strings
+
+            out, n = redact_custom_strings(out, self.custom_strings)
+            self.counts.add("custom", n)
+
+        if self._domain_patterns:
+            from clawjournal.workbench.index import _redact_blocked_domains_in_value
+
+            out, n, log = _redact_blocked_domains_in_value(
+                out,
+                self._domain_patterns,
+                field=field,
+            )
+            self.counts.record(log)
+
+        out = self.anonymizer.text(out)
+
+        workbench_session_id = (
+            self.workbench_session_ids.get(session_key)
+            if session_key is not None
+            else None
+        )
+        out = self._apply_reviewed_entity_replacements(
+            out,
+            workbench_session_id=workbench_session_id,
+        )
+        out = self._apply_findings_backed_redactions(
+            out,
+            workbench_session_id=workbench_session_id,
+        )
+        return out
+
+    def _apply_reviewed_entity_replacements(
+        self,
+        text: str,
+        *,
+        workbench_session_id: str | None,
+    ) -> str:
+        if not workbench_session_id:
+            return text
+
+        replacements = self._reviewed_replacements(workbench_session_id)
+        if not replacements:
+            return text
+
+        import re
+
+        out = text
+        for entity_text, replacement, entity_type in replacements:
+            if len(entity_text) < 3:
+                continue
+            pattern = re.compile(
+                rf"(?<!\w){re.escape(entity_text)}(?!\w)",
+                re.IGNORECASE,
+            )
+            out, n = pattern.subn(replacement, out)
+            self.counts.add(entity_type or "reviewed_finding", n)
+        return out
+
+    def _reviewed_replacements(
+        self,
+        workbench_session_id: str,
+    ) -> list[tuple[str, str, str]]:
+        cached = self._reviewed_replacements_cache.get(workbench_session_id)
+        if cached is not None:
+            return cached
+
+        replacements: list[tuple[str, str, str]] = []
+        try:
+            row = self.conn.execute(
+                "SELECT blob_path FROM sessions WHERE session_id = ?",
+                (workbench_session_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            self._reviewed_replacements_cache[workbench_session_id] = replacements
+            return replacements
+
+        blob_path = row["blob_path"] if row is not None else None
+        if not blob_path:
+            self._reviewed_replacements_cache[workbench_session_id] = replacements
+            return replacements
+
+        try:
+            blob = json.loads(Path(blob_path).read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError):
+            self._reviewed_replacements_cache[workbench_session_id] = replacements
+            return replacements
+
+        try:
+            from clawjournal.findings import (
+                _resolve_field_text,
+                hash_entity,
+                load_findings_from_db,
+            )
+            from clawjournal.redaction.pii import replacement_for_type
+
+            findings = load_findings_from_db(
+                self.conn,
+                workbench_session_id,
+                status_filter={"accepted"},
+            )
+        except (sqlite3.OperationalError, ImportError):
+            self._reviewed_replacements_cache[workbench_session_id] = replacements
+            return replacements
+
+        seen: set[str] = set()
+        for finding in findings:
+            source_text = _resolve_field_text(blob, finding)
+            if source_text is None:
+                continue
+            start = max(0, finding.offset)
+            end = min(len(source_text), start + max(0, finding.length))
+            if start >= end:
+                continue
+            entity_text = source_text[start:end]
+            if hash_entity(entity_text) != finding.entity_hash:
+                continue
+            if entity_text in seen:
+                continue
+            seen.add(entity_text)
+            replacements.append(
+                (
+                    entity_text,
+                    replacement_for_type(finding.entity_type),
+                    finding.entity_type or "reviewed_finding",
+                )
+            )
+
+        replacements.sort(key=lambda item: len(item[0]), reverse=True)
+        self._reviewed_replacements_cache[workbench_session_id] = replacements
+        return replacements
+
+    def _apply_findings_backed_redactions(
+        self,
+        text: str,
+        *,
+        workbench_session_id: str | None,
+    ) -> str:
+        # No workbench row → no per-session findings can match; run the
+        # pure deterministic pass directly rather than building a
+        # synthetic blob around a placeholder session_id.
+        if workbench_session_id is None:
+            from clawjournal.redaction.secrets import redact_text
+
+            out, _count, log = redact_text(
+                text,
+                user_allowlist=self.user_allowlist,
+            )
+            self.counts.record(log)
+            return out
+
+        blob = {
+            "session_id": workbench_session_id,
+            "messages": [{"role": "user", "content": text}],
+        }
+        try:
+            from clawjournal.redaction.secrets import apply_findings_to_blob
+            from clawjournal.workbench.index import _build_deterministic_redaction_log
+
+            log = _build_deterministic_redaction_log(
+                self.conn,
+                blob,
+                user_allowlist=self.user_allowlist,
+            )
+            redacted, count = apply_findings_to_blob(
+                blob,
+                self.conn,
+                workbench_session_id,
+                user_allowlist=self.user_allowlist,
+            )
+        except sqlite3.OperationalError:
+            from clawjournal.redaction.secrets import redact_text
+
+            out, _count, log = redact_text(
+                text,
+                user_allowlist=self.user_allowlist,
+            )
+            self.counts.record(log)
+            return out
+
+        self.counts.record(log)
+        extra = count - len(log)
+        if extra > 0:
+            self.counts.add("deterministic_extra", extra)
+        redacted_messages = redacted.get("messages") or []
+        if not redacted_messages:
+            return text
+        redacted_text = redacted_messages[0].get("content")
+        return redacted_text if isinstance(redacted_text, str) else text
+
 
 def _redact_text_with(
-    anonymizer: Anonymizer,
-    text: str,
-    custom_strings: list[str],
-    user_allowlist: list[dict] | None,
-    counts: _RedactionCounts,
-) -> str:
-    if text is None:
-        return text
-    out = anonymizer.text(text)
-    out, _, log = redact_text(out, user_allowlist=user_allowlist)
-    counts.record(log)
-    if custom_strings:
-        from clawjournal.redaction.secrets import redact_custom_strings
-
-        out, n = redact_custom_strings(out, custom_strings)
-        if n:
-            counts.by_type["custom"] = counts.by_type.get("custom", 0) + n
-            counts.secrets += n
-    return out
+    redactor: _BundleRedactor,
+    text: str | None,
+    *,
+    session_key: str | None,
+    field: str,
+) -> str | None:
+    return redactor.text(text, session_key=session_key, field=field)
 
 
 def _redact_path_with(anonymizer: Anonymizer, path: str | None) -> str | None:
     if path is None:
         return None
     return anonymizer.path(path)
+
+
+def _redacted_path_token(index: int) -> str:
+    return f"[REDACTED_PATH_{index:04d}]"
+
+
+def _collect_source_paths(
+    events: list[dict],
+    token_usage: list[dict],
+    cost_anomalies: list[dict],
+    incidents: list[dict],
+) -> list[str]:
+    paths: list[str] = []
+    for ev in events:
+        if ev.get("source_path"):
+            paths.append(ev["source_path"])
+    for row in token_usage:
+        if row.get("source_path"):
+            paths.append(row["source_path"])
+    for row in cost_anomalies:
+        if row.get("turn_source_path"):
+            paths.append(row["turn_source_path"])
+    for row in incidents:
+        for key in ("first_source_path", "last_source_path"):
+            if row.get(key):
+                paths.append(row[key])
+    return paths
+
+
+def _build_redacted_path_map(
+    anonymizer: Anonymizer,
+    paths: list[str],
+) -> dict[str, str]:
+    """Map original paths to bundle-safe identities.
+
+    ``Anonymizer.path`` intentionally collapses home-directory paths to a
+    single display sentinel. In an events bundle, ``raw_ref.source_path``
+    is also part of the import identity, so collapsing distinct files to
+    the same sentinel can drop events under the recorder UNIQUE key. Use
+    deterministic per-file tokens for collapsed paths while leaving
+    non-sensitive paths unchanged.
+    """
+    unique_paths = sorted({path for path in paths if path})
+    redacted = {
+        path: _redact_path_with(anonymizer, path) or path
+        for path in unique_paths
+    }
+    collapsed_paths = [
+        path
+        for path in unique_paths
+        if redacted[path] == _REDACTED_PATH_SENTINEL
+    ]
+    for index, path in enumerate(collapsed_paths, start=1):
+        redacted[path] = _redacted_path_token(index)
+    return redacted
 
 
 # --------------------------------------------------------------------------- #
@@ -598,12 +875,9 @@ def _build_incident_record(
 
 
 def _generate_snippets(
-    anonymizer: Anonymizer,
+    redactor: _BundleRedactor,
     events: list[dict],
-    *,
-    custom_strings: list[str],
-    user_allowlist: list[dict] | None,
-    counts: _RedactionCounts,
+    path_for: Callable[[str | None], str | None],
 ) -> tuple[dict[str, str], int]:
     """For each unique event identity tuple, fetch the vendor line and
     redact it. Returns (snippets, unavailable_count).
@@ -628,14 +902,16 @@ def _generate_snippets(
             continue
         seen.add(identity)
         line = fetch_vendor_line(original_path, offset)
-        anon_path = anonymizer.path(original_path)
+        anon_path = path_for(original_path)
         snippet_key = f"{source}:{anon_path}:{offset}:{seq}"
         if line is None:
             snippets[snippet_key] = _SNIPPET_UNAVAILABLE_SENTINEL
             unavailable += 1
             continue
-        redacted = _redact_text_with(
-            anonymizer, line, custom_strings, user_allowlist, counts
+        redacted = redactor.text(
+            line,
+            session_key=ev["session_key"],
+            field="source_snippets",
         )
         snippets[snippet_key] = redacted
     return snippets, unavailable
@@ -806,10 +1082,31 @@ def export_session_bundle(
 
     anonymizer = Anonymizer(extra_usernames=settings["extra_usernames"])
     counts = _RedactionCounts()
-    custom_strings = settings["custom_strings"]
-    allowlist_entries = settings["allowlist_entries"]
+    custom_strings = settings.get("custom_strings", [])
+    allowlist_entries = settings.get("allowlist_entries", [])
+    blocked_domains = settings.get("blocked_domains", [])
 
-    redacted_paths: dict[str, str] = {}
+    workbench_session_ids: dict[str, str] = {}
+    if workbench_row is not None:
+        workbench_session_ids[parent["session_key"]] = workbench_row["session_id"]
+    for child_key, child_row in child_workbench_rows.items():
+        if child_row is not None:
+            workbench_session_ids[child_key] = child_row["session_id"]
+
+    redactor = _BundleRedactor(
+        conn=conn,
+        anonymizer=anonymizer,
+        custom_strings=custom_strings,
+        user_allowlist=allowlist_entries,
+        blocked_domains=blocked_domains,
+        counts=counts,
+        workbench_session_ids=workbench_session_ids,
+    )
+
+    redacted_paths = _build_redacted_path_map(
+        anonymizer,
+        _collect_source_paths(events, token_usage, cost_anomalies, incidents),
+    )
 
     def _path(p: str | None) -> str | None:
         if p is None:
@@ -818,6 +1115,8 @@ def export_session_bundle(
         if cached is not None:
             return cached
         result = _redact_path_with(anonymizer, p)
+        if result == _REDACTED_PATH_SENTINEL:
+            result = _redacted_path_token(len(redacted_paths) + 1)
         redacted_paths[p] = result
         return result
 
@@ -825,7 +1124,10 @@ def export_session_bundle(
     for ev in events:
         red_path = _path(ev["source_path"])
         red_raw = _redact_text_with(
-            anonymizer, ev["raw_json"], custom_strings, allowlist_entries, counts
+            redactor,
+            ev["raw_json"],
+            session_key=ev["session_key"],
+            field="raw_json",
         )
         redacted_events.append(
             _build_event_record(
@@ -836,7 +1138,10 @@ def export_session_bundle(
     redacted_overrides: list[dict] = []
     for o in overrides:
         red_payload = _redact_text_with(
-            anonymizer, o["payload_json"], custom_strings, allowlist_entries, counts
+            redactor,
+            o["payload_json"],
+            session_key=o["session_key"],
+            field="payload_json",
         )
         redacted_overrides.append(
             _build_override_record(o, redacted_payload_json=red_payload)
@@ -875,11 +1180,9 @@ def export_session_bundle(
     snippet_unavailable = 0
     if include_snippets and events:
         snippets, snippet_unavailable = _generate_snippets(
-            anonymizer,
+            redactor,
             events,
-            custom_strings=custom_strings,
-            user_allowlist=allowlist_entries,
-            counts=counts,
+            _path,
         )
 
     children_blocks = [

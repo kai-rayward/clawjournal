@@ -11,11 +11,15 @@ Key invariants (per plan 07):
   against classifier drift between exporter and importer.
 - **ID-modulo round-trip**: ``events.id`` is local autoincrement. The
   bundle identifies cross-row references via ``raw_ref =
-  (source_path, source_offset, seq)``. The importer inserts events,
-  builds a raw_ref → local-id map, then rewrites every
+  (source, source_path, source_offset, seq)``. The importer inserts events,
+  builds a bundle-raw_ref → local-id map, then rewrites every
   ``token_usage.event_id`` / ``cost_anomalies.turn_event_id`` /
   ``incidents.first_event_id`` / ``incidents.last_event_id`` reference
   through that map.
+- **No-snippets local inspectability**: bundles without
+  ``source_snippets`` may restore this machine's ``sessions.raw_source_path``
+  for events whose bundle path is ``[REDACTED_PATH]``. Cross-row references
+  still bind through the original bundle raw_ref.
 - **Idempotent re-import**: events use ``INSERT OR IGNORE`` against 02's
   unique index; overrides go through the rank-guarded
   ``write_hook_override`` upsert; cost_anomalies / incidents have UNIQUE
@@ -48,6 +52,9 @@ from clawjournal.events.view import (
     ensure_view_schema,
 )
 
+_REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
+_REDACTED_PATH_TOKEN_PREFIX = "[REDACTED_PATH_"
+
 
 SUPPORTED_BUNDLE_MAJOR = "1"
 SUPPORTED_BUNDLE_MINOR = 0  # warn on minor > this; reject on major mismatch
@@ -68,8 +75,11 @@ class ImportSummary:
     overrides_inserted: int = 0
     overrides_rejected: int = 0
     token_usage_inserted: int = 0
+    token_usage_skipped_unresolved: int = 0
     cost_anomalies_inserted: int = 0
+    cost_anomalies_skipped_unresolved: int = 0
     incidents_inserted: int = 0
+    incidents_skipped_unresolved: int = 0
     snippets_inserted: int = 0
     workbench_session_keys_backfilled: int = 0
 
@@ -83,8 +93,11 @@ class ImportSummary:
             "overrides_inserted": self.overrides_inserted,
             "overrides_rejected": self.overrides_rejected,
             "token_usage_inserted": self.token_usage_inserted,
+            "token_usage_skipped_unresolved": self.token_usage_skipped_unresolved,
             "cost_anomalies_inserted": self.cost_anomalies_inserted,
+            "cost_anomalies_skipped_unresolved": self.cost_anomalies_skipped_unresolved,
             "incidents_inserted": self.incidents_inserted,
+            "incidents_skipped_unresolved": self.incidents_skipped_unresolved,
             "snippets_inserted": self.snippets_inserted,
             "workbench_session_keys_backfilled": self.workbench_session_keys_backfilled,
         }
@@ -107,10 +120,12 @@ def _check_bundle_version(bundle: dict[str, Any]) -> None:
             f"unsupported bundle_schema_version major: {version!r} "
             f"(this clawjournal supports major {SUPPORTED_BUNDLE_MAJOR}.x)"
         )
-    try:
-        minor = int(minor_str.split(".", 1)[0])
-    except ValueError:
-        minor = -1  # malformed minor, but major matched — keep going
+    minor_head = minor_str.split(".", 1)[0]
+    if not minor_head.isdigit():
+        raise ImportError_(
+            f"malformed bundle_schema_version minor: {version!r}"
+        )
+    minor = int(minor_head)
     if minor > SUPPORTED_BUNDLE_MINOR:
         warnings.warn(
             f"bundle_schema_version {version!r} is newer than this importer "
@@ -252,24 +267,105 @@ def _normalize_raw_ref(raw_ref: list) -> tuple[str, str, int, int]:
     raise ImportError_(f"malformed raw_ref (expected 4 elements): {raw_ref!r}")
 
 
+def _local_source_path_from_workbench(
+    conn: sqlite3.Connection,
+    block: dict[str, Any],
+) -> str | None:
+    """Return this machine's raw source path for a bundle session, if known."""
+    candidates: list[tuple[str, str]] = []
+    workbench_session_id = block.get("workbench_session_id")
+    if workbench_session_id:
+        candidates.append(("session_id", str(workbench_session_id)))
+    session_key = block.get("session_key")
+    if session_key:
+        candidates.append(("session_key", str(session_key)))
+
+    for column, value in candidates:
+        try:
+            row = conn.execute(
+                f"SELECT raw_source_path FROM sessions WHERE {column} = ?",
+                (value,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if row is not None and row["raw_source_path"]:
+            return str(row["raw_source_path"])
+    return None
+
+
+def _local_source_paths_by_session_key(
+    conn: sqlite3.Connection,
+    session_blocks: list[dict[str, Any]],
+) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    for block in session_blocks:
+        session_key = block.get("session_key")
+        if not session_key:
+            continue
+        path = _local_source_path_from_workbench(conn, block)
+        if path:
+            paths[str(session_key)] = path
+    return paths
+
+
+def _is_redacted_path_placeholder(path: str) -> bool:
+    return (
+        path == _REDACTED_PATH_SENTINEL
+        or (
+            path.startswith(_REDACTED_PATH_TOKEN_PREFIX)
+            and path.endswith("]")
+        )
+    )
+
+
+def _redacted_paths_by_session_key(events: list[dict]) -> dict[str, set[str]]:
+    paths: dict[str, set[str]] = {}
+    for ev in events:
+        try:
+            ref = _normalize_raw_ref(ev["raw_ref"])
+        except (KeyError, TypeError):
+            continue
+        if _is_redacted_path_placeholder(ref[1]):
+            paths.setdefault(str(ev["session_key"]), set()).add(ref[1])
+    return paths
+
+
+def _source_path_for_import(
+    ref: tuple[str, str, int, int],
+    *,
+    session_key: str,
+    restore_local_source_paths: bool,
+    local_source_paths: dict[str, str],
+) -> str:
+    if not restore_local_source_paths:
+        return ref[1]
+    if not _is_redacted_path_placeholder(ref[1]):
+        return ref[1]
+    return local_source_paths.get(session_key) or ref[1]
+
+
 def _insert_events_and_map(
     conn: sqlite3.Connection,
     events: list[dict],
     session_id_by_key: dict[str, int],
+    *,
+    restore_local_source_paths: bool = False,
+    local_source_paths: dict[str, str] | None = None,
 ) -> tuple[dict[tuple[str, str, int, int], int], int, int]:
-    """Insert events; return (raw_ref → events.id map, inserted, skipped).
+    """Insert events; return (bundle raw_ref → events.id map, inserted, skipped).
 
-    The map is keyed on the full 4-tuple
-    ``(source, source_path, source_offset, seq)`` matching events.UNIQUE
-    so cross-source events with colliding (path, offset, seq) don't
-    overwrite each other. The map is restricted to the sessions we just
-    upserted so unrelated local events don't pollute the binding for
-    cross-references (token_usage / incidents / cost_anomalies).
+    The map is keyed on the bundle's full 4-tuple
+    ``(source, source_path, source_offset, seq)`` so cross-reference
+    sections can still bind when the importer restores a local source
+    path for inspectability. The lookup is restricted to the sessions we
+    just upserted so unrelated local events don't pollute the binding for
+    token_usage / incidents / cost_anomalies.
     """
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     inserted = 0
     skipped = 0
-    imported_session_ids = set(session_id_by_key.values())
+    raw_ref_to_id: dict[tuple[str, str, int, int], int] = {}
+    local_source_paths = local_source_paths or {}
 
     for ev in events:
         sid = session_id_by_key.get(ev["session_key"])
@@ -278,6 +374,12 @@ def _insert_events_and_map(
                 f"event references unknown session_key {ev['session_key']!r}"
             )
         ref = _normalize_raw_ref(ev["raw_ref"])
+        stored_source_path = _source_path_for_import(
+            ref,
+            session_key=ev["session_key"],
+            restore_local_source_paths=restore_local_source_paths,
+            local_source_paths=local_source_paths,
+        )
         # `ev["source"]` is the bundle's per-event source; ref[0] should
         # match. Defend against bundle inconsistencies.
         if ref[0] != "__legacy__" and ref[0] != ev["source"]:
@@ -294,7 +396,7 @@ def _insert_events_and_map(
                 ev.get("event_at"),
                 now,
                 ev["source"],
-                ref[1],
+                stored_source_path,
                 ref[2],
                 ref[3],
                 ev["client"],
@@ -305,23 +407,22 @@ def _insert_events_and_map(
         )
         if cur.rowcount > 0:
             inserted += 1
+            # Fresh insert: lastrowid is the new events.id — no SELECT needed.
+            raw_ref_to_id[ref] = int(cur.lastrowid)
         else:
             skipped += 1
-
-    if not imported_session_ids:
-        return {}, inserted, skipped
-
-    placeholders = ",".join("?" * len(imported_session_ids))
-    rows = conn.execute(
-        f"SELECT id, source, source_path, source_offset, seq "
-        f"FROM events WHERE session_id IN ({placeholders})",
-        list(imported_session_ids),
-    )
-    raw_ref_to_id: dict[tuple[str, str, int, int], int] = {}
-    for r in rows:
-        raw_ref_to_id[
-            (r["source"], r["source_path"], r["source_offset"], r["seq"])
-        ] = r["id"]
+            # Insert was ignored because a row already exists with the same
+            # (source, source_path, source_offset, seq). Resolve the local
+            # id, but ONLY within the sessions we just upserted — otherwise
+            # cross-references would bind to unrelated sessions' events.
+            row = conn.execute(
+                "SELECT id FROM events "
+                "WHERE session_id = ? AND source = ? AND source_path = ? "
+                "AND source_offset = ? AND seq = ?",
+                (sid, ref[0], stored_source_path, ref[2], ref[3]),
+            ).fetchone()
+            if row is not None:
+                raw_ref_to_id[ref] = row["id"]
     return raw_ref_to_id, inserted, skipped
 
 
@@ -344,21 +445,28 @@ def _insert_token_usage(
     rows: list[dict],
     session_id_by_key: dict[str, int],
     raw_ref_to_id: dict[tuple[str, str, int, int], int],
-) -> int:
+) -> tuple[int, int]:
     """Insert token_usage rows from the bundle.
 
     Uses INSERT OR IGNORE so re-importing a bundle does not overwrite
     locally-recosted values (cost_estimate, pricing_table_version).
-    Returns the count of newly-inserted rows.
+    Returns (inserted, skipped_unresolved). ``skipped_unresolved``
+    counts rows the importer dropped because the bundle's raw_ref
+    couldn't be bound to a local events.id — typically because the
+    pre-existing event lives under a different session (see
+    events.UNIQUE's per-DB scope).
     """
     n = 0
+    unresolved = 0
     for r in rows:
         sid = session_id_by_key.get(r["session_key"])
         if sid is None:
+            unresolved += 1
             continue
         ref = _normalize_raw_ref(r["raw_ref"])
         eid = raw_ref_to_id.get(ref)
         if eid is None:
+            unresolved += 1
             continue
         cur = conn.execute(
             _INSERT_TOKEN_USAGE_SQL,
@@ -383,7 +491,7 @@ def _insert_token_usage(
         )
         if cur.rowcount > 0:
             n += 1
-    return n
+    return n, unresolved
 
 
 _INSERT_COST_ANOMALY_SQL = """
@@ -398,15 +506,24 @@ def _insert_cost_anomalies(
     rows: list[dict],
     session_id_by_key: dict[str, int],
     raw_ref_to_id: dict[tuple[str, str, int, int], int],
-) -> int:
+) -> tuple[int, int]:
+    """Returns (inserted, skipped_unresolved). See ``_insert_token_usage``."""
     n = 0
+    unresolved = 0
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for r in rows:
         sid = session_id_by_key.get(r["session_key"])
         if sid is None:
+            unresolved += 1
             continue
         turn_ref = r.get("turn_raw_ref")
-        eid = raw_ref_to_id.get(_normalize_raw_ref(turn_ref)) if turn_ref else None
+        if turn_ref:
+            eid = raw_ref_to_id.get(_normalize_raw_ref(turn_ref))
+            if eid is None:
+                unresolved += 1
+                continue
+        else:
+            eid = None
         cur = conn.execute(
             _INSERT_COST_ANOMALY_SQL,
             (
@@ -420,7 +537,7 @@ def _insert_cost_anomalies(
         )
         if cur.rowcount > 0:
             n += 1
-    return n
+    return n, unresolved
 
 
 _INSERT_INCIDENT_SQL = """
@@ -436,18 +553,22 @@ def _insert_incidents(
     rows: list[dict],
     session_id_by_key: dict[str, int],
     raw_ref_to_id: dict[tuple[str, str, int, int], int],
-) -> int:
+) -> tuple[int, int]:
+    """Returns (inserted, skipped_unresolved). See ``_insert_token_usage``."""
     n = 0
+    unresolved = 0
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for r in rows:
         sid = session_id_by_key.get(r["session_key"])
         if sid is None:
+            unresolved += 1
             continue
         first_ref = _normalize_raw_ref(r["first_raw_ref"])
         last_ref = _normalize_raw_ref(r["last_raw_ref"])
         first_id = raw_ref_to_id.get(first_ref)
         last_id = raw_ref_to_id.get(last_ref)
         if first_id is None or last_id is None:
+            unresolved += 1
             continue
         cur = conn.execute(
             _INSERT_INCIDENT_SQL,
@@ -464,7 +585,7 @@ def _insert_incidents(
         )
         if cur.rowcount > 0:
             n += 1
-    return n
+    return n, unresolved
 
 
 # --------------------------------------------------------------------------- #
@@ -643,6 +764,25 @@ def import_session_bundle(
 
     parent_block = bundle["session"]
     children_blocks = list(bundle.get("children") or [])
+    events = bundle.get("events") or []
+    session_blocks = [parent_block] + children_blocks
+    restore_local_source_paths = "source_snippets" not in bundle
+    redacted_paths_by_session = (
+        _redacted_paths_by_session_key(events)
+        if restore_local_source_paths
+        else {}
+    )
+    local_source_paths = (
+        _local_source_paths_by_session_key(conn, session_blocks)
+        if restore_local_source_paths
+        else {}
+    )
+    if restore_local_source_paths:
+        local_source_paths = {
+            session_key: source_path
+            for session_key, source_path in local_source_paths.items()
+            if len(redacted_paths_by_session.get(session_key, set())) <= 1
+        }
 
     with conn:  # one transaction for the whole import
         session_id_by_key: dict[str, int] = {}
@@ -666,9 +806,12 @@ def import_session_bundle(
             ):
                 summary.workbench_session_keys_backfilled += 1
 
-        events = bundle.get("events") or []
         raw_ref_to_id, inserted, skipped = _insert_events_and_map(
-            conn, events, session_id_by_key
+            conn,
+            events,
+            session_id_by_key,
+            restore_local_source_paths=restore_local_source_paths,
+            local_source_paths=local_source_paths,
         )
         summary.events_inserted = inserted
         summary.events_skipped_existing = skipped
@@ -679,17 +822,26 @@ def import_session_bundle(
         summary.overrides_rejected = ov_rejected
 
         token_usage = bundle.get("token_usage") or []
-        summary.token_usage_inserted = _insert_token_usage(
+        (
+            summary.token_usage_inserted,
+            summary.token_usage_skipped_unresolved,
+        ) = _insert_token_usage(
             conn, token_usage, session_id_by_key, raw_ref_to_id
         )
 
         cost_anomalies = bundle.get("cost_anomalies") or []
-        summary.cost_anomalies_inserted = _insert_cost_anomalies(
+        (
+            summary.cost_anomalies_inserted,
+            summary.cost_anomalies_skipped_unresolved,
+        ) = _insert_cost_anomalies(
             conn, cost_anomalies, session_id_by_key, raw_ref_to_id
         )
 
         incidents = bundle.get("incidents") or []
-        summary.incidents_inserted = _insert_incidents(
+        (
+            summary.incidents_inserted,
+            summary.incidents_skipped_unresolved,
+        ) = _insert_incidents(
             conn, incidents, session_id_by_key, raw_ref_to_id
         )
 
@@ -701,22 +853,41 @@ def import_session_bundle(
     ]
 
     if rebuild_derived:
-        # Best-effort per-session rebuild; tolerated if 04/05 not present.
-        from clawjournal.events.cost import ingest_cost_pending
-        from clawjournal.events.incidents import ingest_loop_incidents
-
         # 04/05's existing --rebuild flags are global today; the plan calls
         # for a per-session-scoped rebuild, but plumbing that through both
         # subsystems is a larger change. For v0.1 we run the global rebuild
         # paths so the imported sessions get fresh derived state — at the
         # cost of also touching unrelated sessions. Tracked as follow-up.
         try:
-            ingest_cost_pending(conn, rebuild=True)
-        except Exception:
-            pass
+            from clawjournal.events.cost import ingest_cost_pending
+        except ImportError:
+            warnings.warn(
+                "rebuild_derived: cost ledger module not available; skipping",
+                stacklevel=2,
+            )
+        else:
+            try:
+                ingest_cost_pending(conn, rebuild=True)
+            except Exception as exc:
+                warnings.warn(
+                    f"rebuild_derived: cost-ledger rebuild failed: {exc!r}",
+                    stacklevel=2,
+                )
+
         try:
-            ingest_loop_incidents(conn, rebuild=True)
-        except Exception:
-            pass
+            from clawjournal.events.incidents import ingest_loop_incidents
+        except ImportError:
+            warnings.warn(
+                "rebuild_derived: loop detector module not available; skipping",
+                stacklevel=2,
+            )
+        else:
+            try:
+                ingest_loop_incidents(conn, rebuild=True)
+            except Exception as exc:
+                warnings.warn(
+                    f"rebuild_derived: loop-detector rebuild failed: {exc!r}",
+                    stacklevel=2,
+                )
 
     return summary

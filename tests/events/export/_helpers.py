@@ -24,6 +24,51 @@ def make_conn() -> sqlite3.Connection:
     return conn
 
 
+def ensure_workbench_schema(conn: sqlite3.Connection) -> None:
+    """Install the workbench tables/columns needed by export gate tests."""
+    from clawjournal.workbench.index import (
+        SCHEMA_SQL,
+        _migrate_security_refactor,
+        _migrate_session_identity_bridge,
+    )
+
+    conn.executescript(SCHEMA_SQL)
+    _migrate_security_refactor(conn)
+    _migrate_session_identity_bridge(conn)
+    conn.commit()
+
+
+def insert_workbench_session(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    session_key: str,
+    raw_source_path: str | None = None,
+    project: str = "project",
+    source: str = "claude",
+    hold_state: str = "released",
+    blob_path: str | None = None,
+) -> None:
+    ensure_workbench_schema(conn)
+    conn.execute(
+        "INSERT INTO sessions ("
+        "session_id, project, source, indexed_at, session_key, raw_source_path, "
+        "hold_state, blob_path"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            project,
+            source,
+            "2026-04-22T09:00:00Z",
+            session_key,
+            raw_source_path,
+            hold_state,
+            blob_path,
+        ),
+    )
+    conn.commit()
+
+
 def insert_event_session(
     conn: sqlite3.Connection,
     *,
