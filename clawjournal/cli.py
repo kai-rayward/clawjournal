@@ -3317,7 +3317,7 @@ def main() -> None:
         "--rebuild-derived",
         action="store_true",
         help="Re-run cost ledger + loop detector against imported events instead of "
-             "importing the bundle's cost_anomalies / incidents rows",
+             "importing the bundle's token_usage / cost_anomalies / incidents rows",
     )
     events_import.add_argument(
         "--json", action="store_true", help="Output JSON status summary"

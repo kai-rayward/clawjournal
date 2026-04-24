@@ -27,6 +27,7 @@ from clawjournal.events.incidents.ingest import (
     LoopIngestSummary,
     ingest_loop_incidents,
     rebuild_loop_incidents,
+    rebuild_loop_incidents_for_sessions,
 )
 from clawjournal.events.incidents.loop_detector import (
     DEFAULT_SHELL_THRESHOLD,
@@ -53,4 +54,5 @@ __all__ = [
     "ingest_loop_incidents",
     "normalize_outcome_text",
     "rebuild_loop_incidents",
+    "rebuild_loop_incidents_for_sessions",
 ]

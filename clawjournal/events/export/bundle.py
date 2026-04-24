@@ -667,8 +667,11 @@ def _redact_path_with(anonymizer: Anonymizer, path: str | None) -> str | None:
     return anonymizer.path(path)
 
 
-def _redacted_path_token(index: int) -> str:
-    return f"[REDACTED_PATH_{index:04d}]"
+def _redacted_path_token(session_key: str, path: str) -> str:
+    digest = hashlib.sha256(
+        f"clawjournal:redacted-path:v1\0{session_key}\0{path}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"[REDACTED_PATH_{digest}]"
 
 
 def _collect_source_paths(
@@ -676,49 +679,45 @@ def _collect_source_paths(
     token_usage: list[dict],
     cost_anomalies: list[dict],
     incidents: list[dict],
-) -> list[str]:
-    paths: list[str] = []
+) -> list[tuple[str, str]]:
+    paths: list[tuple[str, str]] = []
     for ev in events:
         if ev.get("source_path"):
-            paths.append(ev["source_path"])
+            paths.append((ev["session_key"], ev["source_path"]))
     for row in token_usage:
         if row.get("source_path"):
-            paths.append(row["source_path"])
+            paths.append((row["session_key"], row["source_path"]))
     for row in cost_anomalies:
         if row.get("turn_source_path"):
-            paths.append(row["turn_source_path"])
+            paths.append((row["session_key"], row["turn_source_path"]))
     for row in incidents:
         for key in ("first_source_path", "last_source_path"):
             if row.get(key):
-                paths.append(row[key])
+                paths.append((row["session_key"], row[key]))
     return paths
 
 
 def _build_redacted_path_map(
     anonymizer: Anonymizer,
-    paths: list[str],
-) -> dict[str, str]:
+    paths: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
     """Map original paths to bundle-safe identities.
 
     ``Anonymizer.path`` intentionally collapses home-directory paths to a
     single display sentinel. In an events bundle, ``raw_ref.source_path``
     is also part of the import identity, so collapsing distinct files to
-    the same sentinel can drop events under the recorder UNIQUE key. Use
-    deterministic per-file tokens for collapsed paths while leaving
-    non-sensitive paths unchanged.
+    the same sentinel can drop events under the recorder UNIQUE key. Use a
+    stable session/path discriminator for collapsed paths so independently
+    exported bundles cannot all reuse the same ordinal token.
     """
-    unique_paths = sorted({path for path in paths if path})
+    unique_paths = sorted({(session_key, path) for session_key, path in paths if path})
     redacted = {
-        path: _redact_path_with(anonymizer, path) or path
-        for path in unique_paths
+        (session_key, path): _redact_path_with(anonymizer, path) or path
+        for session_key, path in unique_paths
     }
-    collapsed_paths = [
-        path
-        for path in unique_paths
-        if redacted[path] == _REDACTED_PATH_SENTINEL
-    ]
-    for index, path in enumerate(collapsed_paths, start=1):
-        redacted[path] = _redacted_path_token(index)
+    for session_key, path in unique_paths:
+        if redacted[(session_key, path)] == _REDACTED_PATH_SENTINEL:
+            redacted[(session_key, path)] = _redacted_path_token(session_key, path)
     return redacted
 
 
@@ -877,7 +876,7 @@ def _build_incident_record(
 def _generate_snippets(
     redactor: _BundleRedactor,
     events: list[dict],
-    path_for: Callable[[str | None], str | None],
+    path_for: Callable[[str, str | None], str | None],
 ) -> tuple[dict[str, str], int]:
     """For each unique event identity tuple, fetch the vendor line and
     redact it. Returns (snippets, unavailable_count).
@@ -902,7 +901,7 @@ def _generate_snippets(
             continue
         seen.add(identity)
         line = fetch_vendor_line(original_path, offset)
-        anon_path = path_for(original_path)
+        anon_path = path_for(ev["session_key"], original_path)
         snippet_key = f"{source}:{anon_path}:{offset}:{seq}"
         if line is None:
             snippets[snippet_key] = _SNIPPET_UNAVAILABLE_SENTINEL
@@ -1108,21 +1107,22 @@ def export_session_bundle(
         _collect_source_paths(events, token_usage, cost_anomalies, incidents),
     )
 
-    def _path(p: str | None) -> str | None:
+    def _path(session_key: str, p: str | None) -> str | None:
         if p is None:
             return None
-        cached = redacted_paths.get(p)
+        key = (session_key, p)
+        cached = redacted_paths.get(key)
         if cached is not None:
             return cached
         result = _redact_path_with(anonymizer, p)
         if result == _REDACTED_PATH_SENTINEL:
-            result = _redacted_path_token(len(redacted_paths) + 1)
-        redacted_paths[p] = result
+            result = _redacted_path_token(session_key, p)
+        redacted_paths[key] = result
         return result
 
     redacted_events: list[dict] = []
     for ev in events:
-        red_path = _path(ev["source_path"])
+        red_path = _path(ev["session_key"], ev["source_path"])
         red_raw = _redact_text_with(
             redactor,
             ev["raw_json"],
@@ -1150,7 +1150,7 @@ def export_session_bundle(
     redacted_token_usage = [
         _build_token_usage_record(
             r,
-            redacted_source_path=_path(r["source_path"]),
+            redacted_source_path=_path(r["session_key"], r["source_path"]),
             source=r["source"],
         )
         for r in token_usage
@@ -1159,7 +1159,7 @@ def export_session_bundle(
     redacted_cost_anomalies = [
         _build_cost_anomaly_record(
             r,
-            redacted_source_path=_path(r.get("turn_source_path")),
+            redacted_source_path=_path(r["session_key"], r.get("turn_source_path")),
             turn_source=r.get("turn_source"),
         )
         for r in cost_anomalies
@@ -1168,8 +1168,8 @@ def export_session_bundle(
     redacted_incidents = [
         _build_incident_record(
             r,
-            first_path=_path(r["first_source_path"]),
-            last_path=_path(r["last_source_path"]),
+            first_path=_path(r["session_key"], r["first_source_path"]),
+            last_path=_path(r["session_key"], r["last_source_path"]),
             first_source=r["first_source"],
             last_source=r["last_source"],
         )

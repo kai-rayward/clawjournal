@@ -18,8 +18,8 @@ Key invariants (per plan 07):
   through that map.
 - **No-snippets local inspectability**: bundles without
   ``source_snippets`` may restore this machine's ``sessions.raw_source_path``
-  for events whose bundle path is ``[REDACTED_PATH]``. Cross-row references
-  still bind through the original bundle raw_ref.
+  for events whose bundle path is a redacted-path placeholder. Cross-row
+  references still bind through the original bundle raw_ref.
 - **Idempotent re-import**: events use ``INSERT OR IGNORE`` against 02's
   unique index; overrides go through the rank-guarded
   ``write_hook_override`` upsert; cost_anomalies / incidents have UNIQUE
@@ -719,9 +719,9 @@ def import_session_bundle(
     ImportError_ on validation failure (unsupported version, malformed
     structure).
 
-    `rebuild_derived` is accepted but not yet wired through to 04/05's
-    rebuild paths — the v0.1 implementation always preserves the bundle's
-    cost_anomalies / incidents verbatim. Pass-through for forward-compat.
+    With `rebuild_derived=True`, token_usage, cost_anomalies, and loop
+    incidents are recomputed for the imported sessions only instead of
+    importing the bundle's derived rows verbatim.
     """
     ensure_events_schema(conn)
     ensure_view_schema(conn)
@@ -761,6 +761,7 @@ def import_session_bundle(
     sha256 = manifest.get("sha256")
 
     summary = ImportSummary(bundle_path=path, sha256=sha256)
+    imported_session_ids: list[int] = []
 
     parent_block = bundle["session"]
     children_blocks = list(bundle.get("children") or [])
@@ -805,6 +806,7 @@ def import_session_bundle(
                 child_block["session_key"],
             ):
                 summary.workbench_session_keys_backfilled += 1
+        imported_session_ids = list(session_id_by_key.values())
 
         raw_ref_to_id, inserted, skipped = _insert_events_and_map(
             conn,
@@ -821,29 +823,30 @@ def import_session_bundle(
         summary.overrides_inserted = ov_inserted
         summary.overrides_rejected = ov_rejected
 
-        token_usage = bundle.get("token_usage") or []
-        (
-            summary.token_usage_inserted,
-            summary.token_usage_skipped_unresolved,
-        ) = _insert_token_usage(
-            conn, token_usage, session_id_by_key, raw_ref_to_id
-        )
+        if not rebuild_derived:
+            token_usage = bundle.get("token_usage") or []
+            (
+                summary.token_usage_inserted,
+                summary.token_usage_skipped_unresolved,
+            ) = _insert_token_usage(
+                conn, token_usage, session_id_by_key, raw_ref_to_id
+            )
 
-        cost_anomalies = bundle.get("cost_anomalies") or []
-        (
-            summary.cost_anomalies_inserted,
-            summary.cost_anomalies_skipped_unresolved,
-        ) = _insert_cost_anomalies(
-            conn, cost_anomalies, session_id_by_key, raw_ref_to_id
-        )
+            cost_anomalies = bundle.get("cost_anomalies") or []
+            (
+                summary.cost_anomalies_inserted,
+                summary.cost_anomalies_skipped_unresolved,
+            ) = _insert_cost_anomalies(
+                conn, cost_anomalies, session_id_by_key, raw_ref_to_id
+            )
 
-        incidents = bundle.get("incidents") or []
-        (
-            summary.incidents_inserted,
-            summary.incidents_skipped_unresolved,
-        ) = _insert_incidents(
-            conn, incidents, session_id_by_key, raw_ref_to_id
-        )
+            incidents = bundle.get("incidents") or []
+            (
+                summary.incidents_inserted,
+                summary.incidents_skipped_unresolved,
+            ) = _insert_incidents(
+                conn, incidents, session_id_by_key, raw_ref_to_id
+            )
 
         snippets = bundle.get("source_snippets") or {}
         summary.snippets_inserted = _insert_snippets(conn, snippets)
@@ -853,13 +856,8 @@ def import_session_bundle(
     ]
 
     if rebuild_derived:
-        # 04/05's existing --rebuild flags are global today; the plan calls
-        # for a per-session-scoped rebuild, but plumbing that through both
-        # subsystems is a larger change. For v0.1 we run the global rebuild
-        # paths so the imported sessions get fresh derived state — at the
-        # cost of also touching unrelated sessions. Tracked as follow-up.
         try:
-            from clawjournal.events.cost import ingest_cost_pending
+            from clawjournal.events.cost import rebuild_cost_ledger_for_sessions
         except ImportError:
             warnings.warn(
                 "rebuild_derived: cost ledger module not available; skipping",
@@ -867,7 +865,11 @@ def import_session_bundle(
             )
         else:
             try:
-                ingest_cost_pending(conn, rebuild=True)
+                cost_summary = rebuild_cost_ledger_for_sessions(
+                    conn, imported_session_ids
+                )
+                summary.token_usage_inserted = cost_summary.token_rows_written
+                summary.cost_anomalies_inserted = cost_summary.anomalies_written
             except Exception as exc:
                 warnings.warn(
                     f"rebuild_derived: cost-ledger rebuild failed: {exc!r}",
@@ -875,7 +877,7 @@ def import_session_bundle(
                 )
 
         try:
-            from clawjournal.events.incidents import ingest_loop_incidents
+            from clawjournal.events.incidents import rebuild_loop_incidents_for_sessions
         except ImportError:
             warnings.warn(
                 "rebuild_derived: loop detector module not available; skipping",
@@ -883,7 +885,10 @@ def import_session_bundle(
             )
         else:
             try:
-                ingest_loop_incidents(conn, rebuild=True)
+                loop_summary = rebuild_loop_incidents_for_sessions(
+                    conn, imported_session_ids
+                )
+                summary.incidents_inserted = loop_summary.incidents_written
             except Exception as exc:
                 warnings.warn(
                     f"rebuild_derived: loop-detector rebuild failed: {exc!r}",

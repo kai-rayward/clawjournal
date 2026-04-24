@@ -24,6 +24,7 @@ from clawjournal.events.cost.ingest import (
     CostIngestSummary,
     ingest_cost_pending,
     rebuild_cost_ledger,
+    rebuild_cost_ledger_for_sessions,
 )
 from clawjournal.events.cost.pricing import (
     PRICING_TABLE,
@@ -61,4 +62,5 @@ __all__ = [
     "ingest_cost_pending",
     "normalize_model",
     "rebuild_cost_ledger",
+    "rebuild_cost_ledger_for_sessions",
 ]

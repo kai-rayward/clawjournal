@@ -157,6 +157,85 @@ def test_redacted_home_paths_keep_per_file_identity(tmp_path, monkeypatch):
     assert dst.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0] == 2
 
 
+def test_redacted_home_path_tokens_do_not_collide_across_bundles(
+    tmp_path, monkeypatch
+):
+    """Two independent redacted bundles must not reuse the same first-file
+    token and collide on import."""
+    monkeypatch.setattr(
+        "clawjournal.redaction.anonymizer._detect_home_dir",
+        lambda: ("/Users/testuser", "testuser"),
+    )
+
+    src = make_conn()
+    first_sid = insert_event_session(src, session_key="claude:p:first")
+    second_sid = insert_event_session(src, session_key="claude:p:second")
+    first_event = insert_event(
+        src,
+        session_id=first_sid,
+        event_type="user_message",
+        source="claude-jsonl",
+        source_path="/Users/testuser/.claude/projects/-p/first.jsonl",
+        source_offset=0,
+        seq=0,
+        raw_json={"id": "first"},
+    )
+    second_event = insert_event(
+        src,
+        session_id=second_sid,
+        event_type="user_message",
+        source="claude-jsonl",
+        source_path="/Users/testuser/.claude/projects/-p/second.jsonl",
+        source_offset=0,
+        seq=0,
+        raw_json={"id": "second"},
+    )
+    insert_token_usage(src, event_id=first_event, session_id=first_sid, model="first-model")
+    insert_token_usage(
+        src,
+        event_id=second_event,
+        session_id=second_sid,
+        model="second-model",
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    first_summary = export_session_bundle(
+        src,
+        "claude:p:first",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+    second_summary = export_session_bundle(
+        src,
+        "claude:p:second",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    import json
+
+    first_bundle = json.loads(first_summary.bundle_path.read_text(encoding="utf-8"))
+    second_bundle = json.loads(second_summary.bundle_path.read_text(encoding="utf-8"))
+    first_path = first_bundle["events"][0]["raw_ref"][1]
+    second_path = second_bundle["events"][0]["raw_ref"][1]
+    assert first_path.startswith("[REDACTED_PATH_")
+    assert second_path.startswith("[REDACTED_PATH_")
+    assert first_path != second_path
+
+    dst = make_conn()
+    import_session_bundle(dst, first_summary.bundle_path)
+    import_session_bundle(dst, second_summary.bundle_path)
+
+    assert dst.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+    models = [
+        row["model"]
+        for row in dst.execute("SELECT model FROM token_usage ORDER BY model")
+    ]
+    assert models == ["first-model", "second-model"]
+
+
 def test_pre_existing_local_event_does_not_pollute_bind(tmp_path, monkeypatch):
     """If the importing DB has a pre-existing events row with the same
     raw_ref under a DIFFERENT session, the importer's map must not see

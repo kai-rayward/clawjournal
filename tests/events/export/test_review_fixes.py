@@ -41,8 +41,10 @@ from clawjournal.events.export import (
 
 from ._helpers import (
     PERMISSIVE_CONFIG,
+    insert_cost_anomaly,
     insert_event,
     insert_event_session,
+    insert_incident,
     insert_workbench_session,
     insert_token_usage,
     make_conn,
@@ -611,6 +613,151 @@ def test_no_snippets_import_restores_local_source_path_for_inspect(
 
     assert fetch_vendor_line(row["source_path"], row["source_offset"]) == (
         '{"text": "inspect me"}'
+    )
+
+
+def test_rebuild_derived_is_scoped_to_imported_sessions(tmp_path, monkeypatch):
+    """--rebuild-derived must refresh only bundle sessions and leave local
+    sessions' cost/incident rows alone."""
+    src = make_conn()
+    imported_sid = insert_event_session(src, session_key="claude:rebuild:imported")
+    imported_event = insert_event(
+        src,
+        session_id=imported_sid,
+        event_type="assistant_message",
+        event_key="assistant:usage",
+        source_path="/tmp/imported.jsonl",
+        source_offset=0,
+        seq=0,
+        raw_json={
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4",
+                "usage": {"input_tokens": 12, "output_tokens": 5},
+            },
+        },
+    )
+    insert_token_usage(
+        src,
+        event_id=imported_event,
+        session_id=imported_sid,
+        model="bundle-stale-model",
+        input=1,
+        output=1,
+    )
+    insert_cost_anomaly(src, session_id=imported_sid, turn_event_id=imported_event)
+    insert_incident(
+        src,
+        session_id=imported_sid,
+        first_event_id=imported_event,
+        last_event_id=imported_event,
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:rebuild:imported",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    dst = make_conn()
+    local_sid = insert_event_session(dst, session_key="claude:local:keep")
+    local_event = insert_event(
+        dst,
+        session_id=local_sid,
+        event_type="assistant_message",
+        event_key="assistant:local",
+        source_path="/tmp/local.jsonl",
+        source_offset=0,
+        seq=0,
+        raw_json={"type": "assistant", "message": {"text": "already processed"}},
+    )
+    insert_token_usage(
+        dst,
+        event_id=local_event,
+        session_id=local_sid,
+        model="locally-recosted",
+        input=999,
+        output=111,
+    )
+    insert_cost_anomaly(dst, session_id=local_sid, turn_event_id=local_event)
+    insert_incident(
+        dst,
+        session_id=local_sid,
+        first_event_id=local_event,
+        last_event_id=local_event,
+    )
+
+    import_summary = import_session_bundle(
+        dst,
+        summary.bundle_path,
+        rebuild_derived=True,
+    )
+
+    assert import_summary.token_usage_inserted == 1
+    assert import_summary.cost_anomalies_inserted == 0
+    assert import_summary.incidents_inserted == 0
+
+    local_usage = dst.execute(
+        "SELECT model, input, output FROM token_usage WHERE session_id = ?",
+        (local_sid,),
+    ).fetchone()
+    assert dict(local_usage) == {
+        "model": "locally-recosted",
+        "input": 999,
+        "output": 111,
+    }
+    assert (
+        dst.execute(
+            "SELECT COUNT(*) FROM cost_anomalies WHERE session_id = ?",
+            (local_sid,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        dst.execute(
+            "SELECT COUNT(*) FROM incidents WHERE session_id = ?",
+            (local_sid,),
+        ).fetchone()[0]
+        == 1
+    )
+
+    imported_usage = dst.execute(
+        """
+        SELECT tu.model, tu.input, tu.output
+          FROM token_usage tu
+          JOIN event_sessions es ON es.id = tu.session_id
+         WHERE es.session_key = 'claude:rebuild:imported'
+        """
+    ).fetchone()
+    assert dict(imported_usage) == {
+        "model": "claude-sonnet-4",
+        "input": 12,
+        "output": 5,
+    }
+    assert (
+        dst.execute(
+            """
+            SELECT COUNT(*)
+              FROM cost_anomalies ca
+              JOIN event_sessions es ON es.id = ca.session_id
+             WHERE es.session_key = 'claude:rebuild:imported'
+            """
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        dst.execute(
+            """
+            SELECT COUNT(*)
+              FROM incidents i
+              JOIN event_sessions es ON es.id = i.session_id
+             WHERE es.session_key = 'claude:rebuild:imported'
+            """
+        ).fetchone()[0]
+        == 0
     )
 
 
