@@ -64,6 +64,13 @@ _REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
 # crafting a path string like ``[REDACTED_PATH_evil]``.
 _REDACTED_PATH_TOKEN_RE = re.compile(r"^\[REDACTED_PATH_[0-9a-f]{16}\]$")
 
+# Import-side size guard. Bundles from our exporter are typically
+# KB–MB sized; a multi-GB bundle is either a hostile input or a broken
+# exporter. The limit is generous (a 1 GB bundle holding JSON text
+# would contain hundreds of thousands of events) but protects against
+# OOM on a malicious multi-GB JSON payload.
+_MAX_BUNDLE_FILE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+
 
 SUPPORTED_BUNDLE_MAJOR = "1"
 SUPPORTED_BUNDLE_MINOR = 0  # warn on minor > this; reject on major mismatch
@@ -145,7 +152,14 @@ def _check_bundle_version(bundle: dict[str, Any]) -> None:
 
     recorder_version = bundle.get("recorder_schema_version")
     if recorder_version is None:
-        return  # absent on bundles older than this field
+        # Every bundle our 1.x exporter writes carries this field. Absence
+        # is a tamper signal, not a forward-compat gesture.
+        raise ImportError_(
+            "recorder_schema_version missing — every schema-1.x bundle "
+            "from this exporter carries it; an absent value means the "
+            "bundle was tampered with or built outside the supported "
+            "export path"
+        )
     if not isinstance(recorder_version, str) or "." not in recorder_version:
         raise ImportError_(
             f"malformed recorder_schema_version: {recorder_version!r}"
@@ -756,6 +770,18 @@ def import_session_bundle(
     ensure_export_schema(conn)
 
     path = Path(bundle_path).expanduser().resolve()
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ImportError_(f"bundle file not readable: {exc}") from exc
+    if size > _MAX_BUNDLE_FILE_BYTES:
+        raise ImportError_(
+            f"bundle file is {size} bytes, exceeds the "
+            f"{_MAX_BUNDLE_FILE_BYTES}-byte import limit — refusing "
+            "to load the JSON into memory. Legitimate bundles from "
+            "this exporter are typically far smaller; a multi-GB "
+            "payload is either hostile or a broken exporter."
+        )
     text = path.read_text(encoding="utf-8")
     try:
         bundle = json.loads(text)

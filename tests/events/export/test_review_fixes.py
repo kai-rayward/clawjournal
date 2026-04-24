@@ -487,6 +487,134 @@ def test_malformed_bundle_minor_version_rejected(tmp_path, monkeypatch):
         import_session_bundle(dst, summary.bundle_path)
 
 
+def test_missing_recorder_schema_version_rejected(tmp_path, monkeypatch):
+    """Every schema-1.x bundle carries a recorder_schema_version; absence
+    is treated as tamper, not a forward-compat gesture."""
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:rsv-missing:s")
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        source_path="/tmp/x.jsonl",
+        raw_json={"x": 1},
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:rsv-missing:s",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+    del bundle["recorder_schema_version"]
+    digest_input = {k: v for k, v in bundle.items() if k != "manifest"}
+    canonical = json.dumps(
+        digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    bundle["manifest"]["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    summary.bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="recorder_schema_version missing"):
+        import_session_bundle(dst, summary.bundle_path)
+
+
+def test_bundle_file_size_limit_enforced(tmp_path, monkeypatch):
+    """Hand-crafted multi-GB bundles must be rejected before they reach
+    json.loads. The importer stat-checks the file and refuses anything
+    above the size cap."""
+    import clawjournal.events.export.import_ as imp_mod
+
+    fake = tmp_path / "big.json"
+    fake.write_text("{}", encoding="utf-8")
+
+    # Lower the cap for this test so we don't need to write a GB of data.
+    monkeypatch.setattr(imp_mod, "_MAX_BUNDLE_FILE_BYTES", 1)
+
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="exceeds the .* import limit"):
+        import_session_bundle(dst, fake)
+
+
+def test_redactor_runs_findings_pass_once_per_workbench_session(
+    tmp_path, monkeypatch
+):
+    """The batched redactor fires ``_build_deterministic_redaction_log``
+    and ``apply_findings_to_blob`` once per workbench_session_id — not
+    once per event. Each of those helpers spawns a TruffleHog
+    subprocess internally, so the batching is what keeps export
+    wall-clock reasonable on sessions with many events.
+    """
+    import clawjournal.events.export.bundle as bundle_mod
+
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:batch:s")
+    insert_workbench_session(
+        src,
+        session_id="wb-batch",
+        session_key="claude:batch:s",
+    )
+    for i in range(10):
+        insert_event(
+            src,
+            session_id=sid,
+            event_type="user_message",
+            event_key=f"msg:{i}",
+            source_path="/tmp/batch.jsonl",
+            source_offset=i * 100,
+            seq=0,
+            raw_json={"text": f"event {i}"},
+        )
+    # Add one override too, to prove it batches with events.
+    from clawjournal.events.view import write_hook_override
+
+    write_hook_override(
+        src,
+        session_key="claude:batch:s",
+        event_key="msg:0",
+        event_type="user_message",
+        source="hook",
+        confidence="high",
+        lossiness="none",
+        event_at=None,
+        payload_json=json.dumps({"corrected": True}),
+        origin="test",
+    )
+
+    call_counts = {"log": 0, "apply": 0}
+    real_build_log = bundle_mod._BundleRedactor._finalize_group_for_workbench
+
+    def _count_build(self, *args, **kwargs):
+        call_counts["apply"] += 1
+        return real_build_log(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        bundle_mod._BundleRedactor,
+        "_finalize_group_for_workbench",
+        _count_build,
+    )
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+
+    export_session_bundle(
+        src,
+        "claude:batch:s",
+        config=PERMISSIVE_CONFIG,
+        skip_global_gates=True,
+    )
+
+    # One workbench session, so the findings-backed finalize should run
+    # exactly once — not 10+ times. Was previously ~(events+overrides+snippets)
+    # calls, each spawning TruffleHog subprocesses.
+    assert call_counts["apply"] == 1, (
+        f"expected 1 findings-backed batch, got {call_counts['apply']} — "
+        "regression in the batched redactor path"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # edge cases
 # --------------------------------------------------------------------------- #

@@ -48,7 +48,6 @@ EXPORT_BUNDLE_FORMAT = "events-bundle"
 
 _DEFAULT_EXPORT_DIRNAME = "exports"
 _BUNDLE_FILENAME_PREFIX = "clawjournal-bundle-"
-_PRE_PUBLISH_SIZE_WARN_BYTES = 50 * 1024 * 1024
 _SNIPPET_UNAVAILABLE_SENTINEL = "source-unavailable-at-export"
 _REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
 
@@ -425,6 +424,29 @@ class _RedactionCounts:
 
 @dataclass
 class _BundleRedactor:
+    """Two-phase redactor.
+
+    The findings-backed pass (``_build_deterministic_redaction_log`` +
+    ``apply_findings_to_blob``) spawns two TruffleHog subprocesses per
+    invocation. Calling it per event would cost O(events) TH subprocess
+    startups — several minutes on a real session. We instead:
+
+    1. ``prepare(piece_id, text, session_key, field)`` applies the cheap
+       per-piece layers (custom strings, blocked domains, anonymizer,
+       reviewed-entity regex replacements) and queues the partially
+       redacted text.
+    2. ``finalize()`` groups queued pieces by workbench_session_id and
+       runs the expensive findings-backed pass ONCE per group: all the
+       group's pieces go into a single synthetic session blob, one TH
+       subprocess scan covers the batch, and the redacted pieces are
+       extracted back.
+    3. ``get(piece_id)`` returns the final redacted text.
+
+    ``text(...)`` is a sugar wrapper for one-shot use; it calls
+    ``prepare`` / ``finalize`` / ``get`` for a fresh piece_id. Prefer the
+    batch API when redacting many pieces.
+    """
+
     conn: sqlite3.Connection
     anonymizer: Anonymizer
     custom_strings: list[str]
@@ -432,9 +454,13 @@ class _BundleRedactor:
     blocked_domains: list[str]
     counts: _RedactionCounts
     workbench_session_ids: dict[str, str] = field(default_factory=dict)
-    _reviewed_replacements_cache: dict[str, list[tuple[str, str, str]]] = field(
+    _reviewed_replacements_cache: dict[str, list[tuple[Any, str, str]]] = field(
         default_factory=dict
     )
+    _decisions_cache: dict[str, dict[str, str]] = field(default_factory=dict)
+    _pending: dict[Any, tuple[str, str | None]] = field(default_factory=dict)
+    _finalized: dict[Any, str] = field(default_factory=dict)
+    _finalize_seq: int = 0
 
     def __post_init__(self) -> None:
         from clawjournal.workbench.index import _compile_blocked_domain_pattern
@@ -448,6 +474,63 @@ class _BundleRedactor:
             if pattern is not None
         ]
 
+    # --- public API ------------------------------------------------------- #
+
+    def prepare(
+        self,
+        piece_id: Any,
+        text: str | None,
+        *,
+        session_key: str | None,
+        field: str,
+    ) -> None:
+        """Queue ``text`` for batched findings-backed redaction.
+
+        Applies the cheap per-piece layers now; the result is retrievable
+        via ``get(piece_id)`` after ``finalize()`` runs.
+        """
+        if text is None:
+            self._pending[piece_id] = (None, None)
+            return
+
+        out = self._apply_light_layers(text, field=field)
+
+        workbench_session_id = (
+            self.workbench_session_ids.get(session_key)
+            if session_key is not None
+            else None
+        )
+        out = self._apply_reviewed_entity_replacements(
+            out,
+            workbench_session_id=workbench_session_id,
+        )
+        self._pending[piece_id] = (out, workbench_session_id)
+
+    def finalize(self) -> None:
+        """Run findings-backed redactions on the queued batch, once per
+        workbench_session_id group. Pieces without a workbench_session_id
+        get the pure ``redact_text`` path instead — no findings table is
+        queried and no per-session TruffleHog subprocess is spawned."""
+        # Group pieces by workbench_session_id, preserving insertion order.
+        by_wb: dict[str | None, list[Any]] = {}
+        for piece_id, (lightly_redacted, wb_id) in self._pending.items():
+            if lightly_redacted is None:
+                self._finalized[piece_id] = None  # type: ignore[assignment]
+                continue
+            by_wb.setdefault(wb_id, []).append(piece_id)
+
+        for wb_id, piece_ids in by_wb.items():
+            if wb_id is None:
+                self._finalize_group_without_workbench(piece_ids)
+            else:
+                self._finalize_group_for_workbench(wb_id, piece_ids)
+        self._pending.clear()
+
+    def get(self, piece_id: Any) -> str | None:
+        if piece_id not in self._finalized:
+            raise RuntimeError(f"piece_id not finalized: {piece_id!r}")
+        return self._finalized[piece_id]
+
     def text(
         self,
         text: str | None,
@@ -455,9 +538,18 @@ class _BundleRedactor:
         session_key: str | None,
         field: str,
     ) -> str | None:
-        if text is None:
-            return text
+        """One-shot redaction sugar. Prefer ``prepare``+``finalize``+``get``
+        in loops — this method calls finalize once per invocation and
+        does not batch."""
+        piece_id = ("__text__", self._finalize_seq)
+        self._finalize_seq += 1
+        self.prepare(piece_id, text, session_key=session_key, field=field)
+        self.finalize()
+        return self.get(piece_id)
 
+    # --- light layers (cheap, per-piece) ---------------------------------- #
+
+    def _apply_light_layers(self, text: str, *, field: str) -> str:
         out = text
         if self.custom_strings:
             from clawjournal.redaction.secrets import redact_custom_strings
@@ -476,20 +568,6 @@ class _BundleRedactor:
             self.counts.record(log)
 
         out = self.anonymizer.text(out)
-
-        workbench_session_id = (
-            self.workbench_session_ids.get(session_key)
-            if session_key is not None
-            else None
-        )
-        out = self._apply_reviewed_entity_replacements(
-            out,
-            workbench_session_id=workbench_session_id,
-        )
-        out = self._apply_findings_backed_redactions(
-            out,
-            workbench_session_id=workbench_session_id,
-        )
         return out
 
     def _apply_reviewed_entity_replacements(
@@ -505,16 +583,8 @@ class _BundleRedactor:
         if not replacements:
             return text
 
-        import re
-
         out = text
-        for entity_text, replacement, entity_type in replacements:
-            if len(entity_text) < 3:
-                continue
-            pattern = re.compile(
-                rf"(?<!\w){re.escape(entity_text)}(?!\w)",
-                re.IGNORECASE,
-            )
+        for pattern, replacement, entity_type in replacements:
             out, n = pattern.subn(replacement, out)
             self.counts.add(entity_type or "reviewed_finding", n)
         return out
@@ -522,12 +592,18 @@ class _BundleRedactor:
     def _reviewed_replacements(
         self,
         workbench_session_id: str,
-    ) -> list[tuple[str, str, str]]:
+    ) -> list[tuple[Any, str, str]]:
+        """Return cached (compiled_pattern, replacement, entity_type)
+        tuples. Compilation happens once per session — subsequent calls
+        read from the cache.
+        """
+        import re
+
         cached = self._reviewed_replacements_cache.get(workbench_session_id)
         if cached is not None:
             return cached
 
-        replacements: list[tuple[str, str, str]] = []
+        replacements: list[tuple[Any, str, str]] = []
         try:
             row = self.conn.execute(
                 "SELECT blob_path FROM sessions WHERE session_id = ?",
@@ -566,6 +642,7 @@ class _BundleRedactor:
             return replacements
 
         seen: set[str] = set()
+        raw_entries: list[tuple[str, str, str]] = []
         for finding in findings:
             source_text = _resolve_field_text(blob, finding)
             if source_text is None:
@@ -575,12 +652,18 @@ class _BundleRedactor:
             if start >= end:
                 continue
             entity_text = source_text[start:end]
+            # Entities shorter than 3 chars produce too many spurious
+            # matches to be safely regex-substituted across arbitrary
+            # text — the user-accepted decision is still recorded in the
+            # findings table but we skip it in the bundle redaction.
+            if len(entity_text) < 3:
+                continue
             if hash_entity(entity_text) != finding.entity_hash:
                 continue
             if entity_text in seen:
                 continue
             seen.add(entity_text)
-            replacements.append(
+            raw_entries.append(
                 (
                     entity_text,
                     replacement_for_type(finding.entity_type),
@@ -588,37 +671,63 @@ class _BundleRedactor:
                 )
             )
 
-        replacements.sort(key=lambda item: len(item[0]), reverse=True)
+        # Longest-first so "foo.bar@example.com" replaces before "@example.com".
+        raw_entries.sort(key=lambda item: len(item[0]), reverse=True)
+        for entity_text, replacement, entity_type in raw_entries:
+            compiled = re.compile(
+                rf"(?<!\w){re.escape(entity_text)}(?!\w)",
+                re.IGNORECASE,
+            )
+            replacements.append((compiled, replacement, entity_type))
+
         self._reviewed_replacements_cache[workbench_session_id] = replacements
         return replacements
 
-    def _apply_findings_backed_redactions(
-        self,
-        text: str,
-        *,
-        workbench_session_id: str | None,
-    ) -> str:
-        # No workbench row → no per-session findings can match; run the
-        # pure deterministic pass directly rather than building a
-        # synthetic blob around a placeholder session_id.
-        if workbench_session_id is None:
-            from clawjournal.redaction.secrets import redact_text
+    # --- findings-backed pass (expensive, batched) ------------------------ #
 
-            out, _count, log = redact_text(
-                text,
+    def _finalize_group_without_workbench(self, piece_ids: list[Any]) -> None:
+        """No workbench row for this group → fall through to the pure
+        regex-only ``redact_text`` path per piece. No findings query, no
+        TruffleHog subprocess."""
+        from clawjournal.redaction.secrets import redact_text
+
+        for pid in piece_ids:
+            lightly_redacted, _ = self._pending[pid]
+            redacted, _count, log = redact_text(
+                lightly_redacted,
                 user_allowlist=self.user_allowlist,
             )
             self.counts.record(log)
-            return out
+            self._finalized[pid] = redacted
 
-        blob = {
-            "session_id": workbench_session_id,
-            "messages": [{"role": "user", "content": text}],
-        }
+    def _finalize_group_for_workbench(
+        self, workbench_session_id: str, piece_ids: list[Any]
+    ) -> None:
+        """Batched findings-backed redaction: one synthetic session blob
+        per workbench_session_id. ``apply_findings_to_blob`` and
+        ``_build_deterministic_redaction_log`` each spawn TruffleHog
+        subprocesses internally, so batching turns O(pieces) TH calls
+        into O(sessions) TH calls.
+        """
         try:
             from clawjournal.redaction.secrets import apply_findings_to_blob
             from clawjournal.workbench.index import _build_deterministic_redaction_log
+        except ImportError:
+            # Extremely unlikely since the workbench ships with the
+            # exporter, but gracefully fall back if not available.
+            self._finalize_group_without_workbench(piece_ids)
+            return
 
+        messages = [
+            {"role": "user", "content": self._pending[pid][0]}
+            for pid in piece_ids
+        ]
+        blob = {
+            "session_id": workbench_session_id,
+            "messages": messages,
+        }
+
+        try:
             log = _build_deterministic_redaction_log(
                 self.conn,
                 blob,
@@ -631,34 +740,30 @@ class _BundleRedactor:
                 user_allowlist=self.user_allowlist,
             )
         except sqlite3.OperationalError:
-            from clawjournal.redaction.secrets import redact_text
-
-            out, _count, log = redact_text(
-                text,
-                user_allowlist=self.user_allowlist,
-            )
-            self.counts.record(log)
-            return out
+            self._finalize_group_without_workbench(piece_ids)
+            return
 
         self.counts.record(log)
         extra = count - len(log)
         if extra > 0:
             self.counts.add("deterministic_extra", extra)
+
         redacted_messages = redacted.get("messages") or []
-        if not redacted_messages:
-            return text
-        redacted_text = redacted_messages[0].get("content")
-        return redacted_text if isinstance(redacted_text, str) else text
+        for pid, msg in zip(piece_ids, redacted_messages):
+            redacted_content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(redacted_content, str):
+                self._finalized[pid] = redacted_content
+            else:
+                # Fall back to the lightly-redacted text if the
+                # findings-backed pass returned something unexpected.
+                self._finalized[pid] = self._pending[pid][0]
 
-
-def _redact_text_with(
-    redactor: _BundleRedactor,
-    text: str | None,
-    *,
-    session_key: str | None,
-    field: str,
-) -> str | None:
-    return redactor.text(text, session_key=session_key, field=field)
+        # If _iter_text_locations returned fewer messages than we queued
+        # (shouldn't happen with the blob shape we construct, but defend
+        # against schema drift), fill in the missing ones from light.
+        for pid in piece_ids:
+            if pid not in self._finalized:
+                self._finalized[pid] = self._pending[pid][0]
 
 
 def _redact_path_with(anonymizer: Anonymizer, path: str | None) -> str | None:
@@ -886,13 +991,16 @@ def _build_incident_record(
     }
 
 
-def _generate_snippets(
+def _build_snippets_from_jobs(
     redactor: _BundleRedactor,
-    events: list[dict],
-    path_for: Callable[[str, str | None], str | None],
+    snippet_jobs: list[tuple[str, str | None, str]],
 ) -> tuple[dict[str, str], int]:
-    """For each unique event identity tuple, fetch the vendor line and
-    redact it. Returns (snippets, unavailable_count).
+    """Assemble the ``source_snippets`` map from finalized redactor state.
+
+    The caller has already called ``redactor.prepare`` for every job
+    whose ``line`` is not None, and ``redactor.finalize()`` has been
+    invoked. Jobs with ``line is None`` are emitted as the
+    ``source-unavailable-at-export`` sentinel.
 
     Snippet keys are 4-segment strings ``<source>:<anon_path>:<offset>:<seq>``
     matching the events' raw_ref 4-tuple. Including ``source`` is
@@ -902,30 +1010,13 @@ def _generate_snippets(
     snippet entries would silently overwrite each other.
     """
     snippets: dict[str, str] = {}
-    seen: set[tuple[str, str, int, int]] = set()
     unavailable = 0
-    for ev in events:
-        source = ev["source"]
-        original_path = ev["source_path"]
-        offset = ev["source_offset"]
-        seq = ev["seq"]
-        identity = (source, original_path, offset, seq)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        line = fetch_vendor_line(original_path, offset)
-        anon_path = path_for(ev["session_key"], original_path)
-        snippet_key = f"{source}:{anon_path}:{offset}:{seq}"
+    for snippet_key, line, _session_key in snippet_jobs:
         if line is None:
             snippets[snippet_key] = _SNIPPET_UNAVAILABLE_SENTINEL
             unavailable += 1
             continue
-        redacted = redactor.text(
-            line,
-            session_key=ev["session_key"],
-            field="source_snippets",
-        )
-        snippets[snippet_key] = redacted
+        snippets[snippet_key] = redactor.get(("snippet", snippet_key))
     return snippets, unavailable
 
 
@@ -1133,15 +1224,63 @@ def export_session_bundle(
         redacted_paths[key] = result
         return result
 
-    redacted_events: list[dict] = []
-    for ev in events:
-        red_path = _path(ev["session_key"], ev["source_path"])
-        red_raw = _redact_text_with(
-            redactor,
+    # Phase 1: queue text-redaction jobs for every piece that needs
+    # findings-backed redaction. The path anonymization happens inline
+    # because it doesn't depend on the findings-backed pass.
+    snippet_unavailable = 0
+    snippet_jobs: list[tuple[str, str, str]] = []  # (key, line, session_key)
+    if include_snippets and events:
+        seen_identities: set[tuple[str, str, int, int]] = set()
+        for ev in events:
+            source = ev["source"]
+            original_path = ev["source_path"]
+            offset = ev["source_offset"]
+            seq = ev["seq"]
+            identity = (source, original_path, offset, seq)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            anon_path = _path(ev["session_key"], original_path)
+            snippet_key = f"{source}:{anon_path}:{offset}:{seq}"
+            line = fetch_vendor_line(original_path, offset)
+            if line is None:
+                snippet_jobs.append((snippet_key, None, ev["session_key"]))  # type: ignore[arg-type]
+            else:
+                snippet_jobs.append((snippet_key, line, ev["session_key"]))
+
+    for idx, ev in enumerate(events):
+        redactor.prepare(
+            ("event", idx),
             ev["raw_json"],
             session_key=ev["session_key"],
             field="raw_json",
         )
+    for idx, o in enumerate(overrides):
+        redactor.prepare(
+            ("override", idx),
+            o["payload_json"],
+            session_key=o["session_key"],
+            field="payload_json",
+        )
+    for snippet_key, line, sk in snippet_jobs:
+        if line is None:
+            continue
+        redactor.prepare(
+            ("snippet", snippet_key),
+            line,
+            session_key=sk,
+            field="source_snippets",
+        )
+
+    # Phase 2: batched findings-backed pass (one TruffleHog subprocess
+    # per workbench_session_id instead of one per piece).
+    redactor.finalize()
+
+    # Phase 3: build output records with the finalized redacted text.
+    redacted_events: list[dict] = []
+    for idx, ev in enumerate(events):
+        red_path = _path(ev["session_key"], ev["source_path"])
+        red_raw = redactor.get(("event", idx))
         redacted_events.append(
             _build_event_record(
                 ev, redacted_raw_json=red_raw, redacted_source_path=red_path
@@ -1149,13 +1288,8 @@ def export_session_bundle(
         )
 
     redacted_overrides: list[dict] = []
-    for o in overrides:
-        red_payload = _redact_text_with(
-            redactor,
-            o["payload_json"],
-            session_key=o["session_key"],
-            field="payload_json",
-        )
+    for idx, o in enumerate(overrides):
+        red_payload = redactor.get(("override", idx))
         redacted_overrides.append(
             _build_override_record(o, redacted_payload_json=red_payload)
         )
@@ -1190,12 +1324,10 @@ def export_session_bundle(
     ]
 
     snippets: dict[str, str] = {}
-    snippet_unavailable = 0
     if include_snippets and events:
-        snippets, snippet_unavailable = _generate_snippets(
+        snippets, snippet_unavailable = _build_snippets_from_jobs(
             redactor,
-            events,
-            _path,
+            snippet_jobs,
         )
 
     children_blocks = [
