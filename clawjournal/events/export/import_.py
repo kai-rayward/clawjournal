@@ -162,15 +162,20 @@ def _check_bundle_version(bundle: dict[str, Any]) -> None:
 def _verify_manifest_sha256(bundle: dict[str, Any]) -> None:
     """Recompute the canonical sha256 of the bundle minus its manifest
     and compare against ``bundle.manifest.sha256``. Raises ImportError_
-    on mismatch — closes the trust gap where a tampered-in-transit
-    bundle would otherwise import silently.
-
-    No-op when the bundle has no manifest sha256 (older bundles) or the
-    sha256 field is malformed."""
+    on mismatch or when the sha256 is missing on a bundle whose
+    ``bundle_schema_version`` is 1.x — every 1.x bundle our exporter
+    writes carries a sha256, so an absent or malformed value means the
+    bundle was hand-edited and must not be trusted.
+    """
     manifest = bundle.get("manifest") or {}
     expected = manifest.get("sha256")
     if not isinstance(expected, str) or len(expected) != 64:
-        return
+        raise ImportError_(
+            "manifest.sha256 missing or malformed — every schema-1.x "
+            "bundle from this exporter carries a 64-hex sha256; "
+            "an absent value means the bundle was tampered with or "
+            "built outside the supported export path"
+        )
     digest_input = {k: v for k, v in bundle.items() if k != "manifest"}
     canonical = json.dumps(
         digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -731,18 +736,23 @@ def import_session_bundle(
     """
     ensure_events_schema(conn)
     ensure_view_schema(conn)
+    # Cost / incidents subsystems are optional — if the modules aren't
+    # installed (e.g. trimmed wheel), skip the schema install. Real
+    # schema-install failures (SQL errors, filesystem issues) must
+    # surface; catching them silently would leave the importer writing
+    # into missing tables and failing later with a confusing error.
     try:
         from clawjournal.events.cost.schema import ensure_cost_schema
-
-        ensure_cost_schema(conn)
-    except Exception:
+    except ImportError:
         pass
+    else:
+        ensure_cost_schema(conn)
     try:
         from clawjournal.events.incidents.schema import ensure_incidents_schema
-
-        ensure_incidents_schema(conn)
-    except Exception:
+    except ImportError:
         pass
+    else:
+        ensure_incidents_schema(conn)
     ensure_export_schema(conn)
 
     path = Path(bundle_path).expanduser().resolve()

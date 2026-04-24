@@ -162,6 +162,49 @@ def test_tampered_bundle_fails_sha256_check(tmp_path, monkeypatch):
         import_session_bundle(dst, summary.bundle_path)
 
 
+def test_bundle_without_manifest_sha256_is_rejected(tmp_path, monkeypatch):
+    """Pre-fix, a missing or malformed sha256 silently no-oped the tamper
+    check — an attacker could strip the sha256 and ship an edited bundle.
+    Every schema-1.x bundle our exporter writes carries a 64-hex sha256,
+    so an absent/malformed value must fail the verifier outright."""
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:unsigned:s")
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        source_path="/tmp/x.jsonl",
+        raw_json={"text": "original"},
+    )
+
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:unsigned:s",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+
+    # Case 1: sha256 key entirely absent
+    stripped = dict(bundle)
+    stripped["manifest"] = {k: v for k, v in bundle["manifest"].items() if k != "sha256"}
+    summary.bundle_path.write_text(json.dumps(stripped, indent=2), encoding="utf-8")
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="sha256 missing or malformed"):
+        import_session_bundle(dst, summary.bundle_path)
+
+    # Case 2: sha256 present but malformed (not 64 hex chars)
+    malformed = dict(bundle)
+    malformed["manifest"] = {**bundle["manifest"], "sha256": "too-short"}
+    summary.bundle_path.write_text(json.dumps(malformed, indent=2), encoding="utf-8")
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="sha256 missing or malformed"):
+        import_session_bundle(dst, summary.bundle_path)
+
+
 # --------------------------------------------------------------------------- #
 # token_usage idempotency (no OR REPLACE clobber)
 # --------------------------------------------------------------------------- #
