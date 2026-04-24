@@ -12,6 +12,7 @@ from clawjournal.events.cost import (
     PRICING_TABLE_VERSION,
     ensure_cost_schema,
     ingest_cost_pending,
+    rebuild_cost_ledger_for_sessions,
 )
 from clawjournal.events.schema import ensure_schema as ensure_events_schema
 
@@ -607,3 +608,67 @@ def test_anomaly_kinds_set_matches_spec():
         "model_shift",
         "service_tier_shift",
     }
+
+
+# --------------------------------------------------------------------------- #
+# scoped rebuild (plan 07)
+# --------------------------------------------------------------------------- #
+
+
+def test_rebuild_cost_ledger_for_sessions_touches_only_requested(conn):
+    """Pins the extractor's ``sessions_touched`` accounting for the scoped
+    rebuild path. A silent regression in ``_extract_token_usage_rows``
+    (e.g. dropping the ``sessions_touched.add`` line) would flip this."""
+    sid_a = _insert_session(conn, session_key="s:a", client="claude")
+    sid_b = _insert_session(conn, session_key="s:b", client="claude")
+    sid_untouched = _insert_session(conn, session_key="s:keep", client="claude")
+    _insert_event(
+        conn,
+        session_id=sid_a,
+        client="claude",
+        event_type="assistant_message",
+        raw=_claude_assistant(input_tokens=10, output_tokens=5),
+    )
+    _insert_event(
+        conn,
+        session_id=sid_b,
+        client="claude",
+        event_type="assistant_message",
+        raw=_claude_assistant(input_tokens=3, output_tokens=2),
+    )
+    _insert_event(
+        conn,
+        session_id=sid_untouched,
+        client="claude",
+        event_type="assistant_message",
+        raw=_claude_assistant(input_tokens=1, output_tokens=1),
+    )
+
+    summary = rebuild_cost_ledger_for_sessions(conn, [sid_a, sid_b])
+
+    assert summary.sessions_touched == {sid_a, sid_b}
+    assert sid_untouched not in summary.sessions_touched
+    assert summary.token_rows_written == 2
+
+    # Untouched session's token_usage must remain untouched on disk.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM token_usage WHERE session_id = ?",
+        (sid_untouched,),
+    ).fetchone()[0] == 0
+
+
+def test_rebuild_cost_ledger_for_sessions_empty_list_is_noop(conn):
+    sid = _insert_session(conn, session_key="s:x", client="claude")
+    _insert_event(
+        conn,
+        session_id=sid,
+        client="claude",
+        event_type="assistant_message",
+        raw=_claude_assistant(),
+    )
+
+    summary = rebuild_cost_ledger_for_sessions(conn, [])
+
+    assert summary.token_rows_written == 0
+    assert summary.anomalies_written == 0
+    assert summary.sessions_touched == set()

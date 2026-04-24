@@ -311,6 +311,13 @@ def rebuild_loop_incidents_for_sessions(
     This intentionally leaves ``loop_ingest_state`` untouched. Importers can
     rebuild derived rows for imported sessions without resetting the global
     incremental cursor or deleting unrelated sessions' incidents.
+
+    Because the cursor is not advanced, a subsequent
+    ``ingest_loop_incidents`` run will re-evaluate the imported events if
+    they sit past the current cursor. That is safe: ``incidents`` has a
+    UNIQUE index on ``(session_id, kind, first_event_id)`` and the
+    upsert clause updates fields in place, so the only cost is redoing
+    the detector work for those events once.
     """
     ensure_events_schema(conn)
     ensure_incidents_schema(conn)

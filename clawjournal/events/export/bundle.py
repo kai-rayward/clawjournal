@@ -668,6 +668,19 @@ def _redact_path_with(anonymizer: Anonymizer, path: str | None) -> str | None:
 
 
 def _redacted_path_token(session_key: str, path: str) -> str:
+    """Deterministic per-(session_key, path) token for a collapsed home-dir path.
+
+    The suffix is the first 16 hex chars (64 bits) of sha256 over
+    ``clawjournal:redacted-path:v1\\0<session_key>\\0<path>``. Importers
+    must treat the suffix as **opaque** — they only string-compare the
+    token against other raw_ref / snippet-key values to line up identity
+    tuples. The digest input is versioned (``v1``) so future changes can
+    coexist with bundles produced before the change.
+
+    64 bits is collision-resistant within a single bundle (birthday bound
+    ≈ 2^32 paths); if the token ever becomes a cross-bundle identifier
+    the width should grow.
+    """
     digest = hashlib.sha256(
         f"clawjournal:redacted-path:v1\0{session_key}\0{path}".encode("utf-8")
     ).hexdigest()[:16]

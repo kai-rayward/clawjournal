@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import hashlib
+import re
 import warnings
 
 from clawjournal.events.export.schema import ensure_export_schema
@@ -53,7 +54,15 @@ from clawjournal.events.view import (
 )
 
 _REDACTED_PATH_SENTINEL = "[REDACTED_PATH]"
-_REDACTED_PATH_TOKEN_PREFIX = "[REDACTED_PATH_"
+# Matches the exporter's emitted token shape: 16 hex chars from a
+# session/path sha256. See ``bundle._redacted_path_token``. The bare
+# ``[REDACTED_PATH]`` sentinel is accepted separately for the (rare)
+# case where an anonymizer collapse hit a path that was not routed
+# through the exporter's path map. Any other suffix — a caller-chosen
+# literal designed to look like a placeholder — is rejected so an
+# attacker can't trigger the "restore local source path" fallback by
+# crafting a path string like ``[REDACTED_PATH_evil]``.
+_REDACTED_PATH_TOKEN_RE = re.compile(r"^\[REDACTED_PATH_[0-9a-f]{16}\]$")
 
 
 SUPPORTED_BUNDLE_MAJOR = "1"
@@ -311,10 +320,7 @@ def _local_source_paths_by_session_key(
 def _is_redacted_path_placeholder(path: str) -> bool:
     return (
         path == _REDACTED_PATH_SENTINEL
-        or (
-            path.startswith(_REDACTED_PATH_TOKEN_PREFIX)
-            and path.endswith("]")
-        )
+        or bool(_REDACTED_PATH_TOKEN_RE.match(path))
     )
 
 
