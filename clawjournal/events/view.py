@@ -151,6 +151,7 @@ def write_hook_override(
     event_at: str | None,
     payload_json: str,
     origin: str | None,
+    created_at: str | None = None,
 ) -> bool:
     """Write a hook-originated override. Returns True if the row landed
     (fresh insert or a strict-greater override replacement), False if the
@@ -159,6 +160,52 @@ def write_hook_override(
     Raises ValueError on invalid enum inputs; KeyError if the session_key
     doesn't exist in `event_sessions` yet (hooks fire against live
     sessions that 02's ingest has already created).
+
+    `created_at` defaults to wall-clock now. The replay-export importer
+    (plan 07) passes the bundle's recorded `created_at` so re-imports
+    don't mutate the timestamp on every run.
+    """
+    # Single-statement UPSERT is atomic under SQLite's default
+    # isolation — the rank-guard and the `created_at` bump both live
+    # inside the ON CONFLICT clause, so two concurrent writers can't
+    # race between a pre-check and the write.
+    with conn:
+        return _write_hook_override_inner(
+            conn,
+            session_key=session_key,
+            event_key=event_key,
+            event_type=event_type,
+            source=source,
+            confidence=confidence,
+            lossiness=lossiness,
+            event_at=event_at,
+            payload_json=payload_json,
+            origin=origin,
+            created_at=created_at,
+        )
+
+
+def _write_hook_override_inner(
+    conn: sqlite3.Connection,
+    *,
+    session_key: str,
+    event_key: str,
+    event_type: str,
+    source: str,
+    confidence: str,
+    lossiness: str,
+    event_at: str | None,
+    payload_json: str,
+    origin: str | None,
+    created_at: str | None,
+) -> bool:
+    """Validate + execute the upsert WITHOUT opening a transaction.
+
+    Used by the replay-export importer (plan 07) which manages a single
+    outer transaction around the whole import. Calling
+    ``write_hook_override`` from inside another ``with conn:`` would
+    commit the outer transaction prematurely (Python's
+    ``Connection.__exit__`` always commits, regardless of nesting).
     """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"Unsupported event type: {event_type}")
@@ -184,28 +231,24 @@ def write_hook_override(
     if session_id is None:
         raise KeyError(f"session_key not found in event_sessions: {session_key}")
 
-    created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    # Single-statement UPSERT is atomic under SQLite's default
-    # isolation — the rank-guard and the `created_at` bump both live
-    # inside the ON CONFLICT clause, so two concurrent writers can't
-    # race between a pre-check and the write.
-    with conn:
-        cursor = conn.execute(
-            _UPSERT_OVERRIDE_SQL,
-            (
-                session_id,
-                event_key,
-                event_type,
-                source,
-                confidence,
-                lossiness,
-                event_at,
-                payload_json,
-                origin,
-                created_at,
-            ),
-        )
-        return cursor.rowcount > 0
+    if created_at is None:
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    cursor = conn.execute(
+        _UPSERT_OVERRIDE_SQL,
+        (
+            session_id,
+            event_key,
+            event_type,
+            source,
+            confidence,
+            lossiness,
+            event_at,
+            payload_json,
+            origin,
+            created_at,
+        ),
+    )
+    return cursor.rowcount > 0
 
 
 def _resolve_session_id(conn: sqlite3.Connection, session_key: str) -> int | None:

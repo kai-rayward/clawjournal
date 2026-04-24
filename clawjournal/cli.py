@@ -3260,6 +3260,79 @@ def main() -> None:
         "--json", action="store_true", help="Output JSON summary"
     )
 
+    events_export = events_sub.add_parser(
+        "export",
+        help="Export a session to a single self-describing JSON bundle (plan 07)",
+    )
+    events_export.add_argument(
+        "session_key",
+        help="event_sessions.session_key (per ADR-001) — never the workbench session_id",
+    )
+    events_export.add_argument(
+        "--out",
+        dest="output",
+        type=str,
+        default=None,
+        help="Output path (default: ~/.clawjournal/exports/clawjournal-bundle-<hash>.json)",
+    )
+    events_export.add_argument(
+        "--no-snippets",
+        action="store_true",
+        help="Omit source_snippets from the bundle (smaller file, breaks off-machine inspect)",
+    )
+    events_export.add_argument(
+        "--no-children",
+        action="store_true",
+        help="Don't include subagent child sessions whose parent_session_key matches",
+    )
+    events_export.add_argument(
+        "--allow-no-workbench-row",
+        action="store_true",
+        help="Opt past the hold-state gate for events-only sessions (no workbench review)",
+    )
+    events_export.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive pre-publish summary",
+    )
+    pretty_group = events_export.add_mutually_exclusive_group()
+    pretty_group.add_argument(
+        "--pretty",
+        dest="pretty",
+        action="store_true",
+        help="Pretty-print the bundle JSON (default)",
+    )
+    pretty_group.add_argument(
+        "--compact",
+        dest="pretty",
+        action="store_false",
+        help="Compact bundle JSON (smaller file, harder to diff)",
+    )
+    events_export.set_defaults(pretty=True)
+    events_export.add_argument(
+        "--json", action="store_true", help="Output JSON status summary"
+    )
+
+    events_import = events_sub.add_parser(
+        "import",
+        help="Import a bundle JSON file produced by `events export` (plan 07)",
+    )
+    events_import.add_argument("bundle_path", help="Path to bundle.json")
+    events_import.add_argument(
+        "--rebuild-derived",
+        action="store_true",
+        help="Re-run cost ledger + loop detector against imported events instead of "
+             "importing the bundle's cost_anomalies / incidents rows",
+    )
+    events_import.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip any interactive prompts (currently unused; reserved)",
+    )
+    events_import.add_argument(
+        "--json", action="store_true", help="Output JSON status summary"
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -3940,6 +4013,14 @@ def _run_events(args) -> None:
         _run_events_incidents(args)
         return
 
+    if args.events_command == "export":
+        _run_events_export(args)
+        return
+
+    if args.events_command == "import":
+        _run_events_import(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -4007,6 +4088,95 @@ def _run_events_incidents(args) -> None:
         f"wrote {payload['incidents_written']} loop incidents "
         f"across {payload['sessions_touched']} sessions."
     )
+
+
+def _run_events_export(args) -> None:
+    from .events.export import (
+        ExportError,
+        ExportGateBlocked,
+        export_session_bundle,
+    )
+    from .workbench.index import open_index
+
+    output_path = Path(args.output) if args.output else None
+
+    conn = open_index()
+    try:
+        try:
+            summary = export_session_bundle(
+                conn,
+                args.session_key,
+                output_path=output_path,
+                include_snippets=not args.no_snippets,
+                include_children=not args.no_children,
+                allow_no_workbench_row=args.allow_no_workbench_row,
+                pretty=args.pretty,
+            )
+        except ExportGateBlocked as exc:
+            print(exc.message, file=sys.stderr)
+            sys.exit(exc.exit_code)
+        except ExportError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+    finally:
+        conn.close()
+
+    payload = summary.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        if summary.blocked:
+            print(
+                f"Export BLOCKED ({summary.block_reason}): "
+                f"{summary.bundle_path} (manifest-only diagnostic artifact)"
+            )
+        else:
+            print(
+                f"Wrote {summary.bundle_path} "
+                f"({summary.event_count} events, "
+                f"{summary.override_count} overrides, "
+                f"{summary.token_usage_count} token_usage rows, "
+                f"{summary.incident_count} incidents, "
+                f"{summary.snippet_count} snippets, "
+                f"sha256={summary.sha256[:12] if summary.sha256 else '?'})"
+            )
+
+    if summary.blocked:
+        sys.exit(2)
+
+
+def _run_events_import(args) -> None:
+    from .events.export import ImportError_, import_session_bundle
+    from .workbench.index import open_index
+
+    conn = open_index()
+    try:
+        try:
+            summary = import_session_bundle(
+                conn,
+                args.bundle_path,
+                rebuild_derived=args.rebuild_derived,
+            )
+        except ImportError_ as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+    finally:
+        conn.close()
+
+    payload = summary.to_dict()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Imported {summary.events_inserted} events "
+            f"(skipped {summary.events_skipped_existing} existing), "
+            f"{summary.overrides_inserted} overrides, "
+            f"{summary.token_usage_inserted} token_usage, "
+            f"{summary.cost_anomalies_inserted} cost_anomalies, "
+            f"{summary.incidents_inserted} incidents, "
+            f"{summary.snippets_inserted} snippets across "
+            f"{len(summary.session_keys)} session(s)."
+        )
 
 
 _INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024
