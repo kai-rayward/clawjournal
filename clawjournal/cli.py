@@ -4253,56 +4253,81 @@ def _run_events_doctor(args) -> None:
         render_human,
         render_json,
     )
+    from .events.doctor.envelope import KIND_UNSPECIFIED, emit_error
 
-    report = collect()
     request_id = getattr(args, "request_id", None)
-
-    if getattr(args, "fix", False):
-        result = fix_additive_drift(report)
-        if result["added"]:
-            sys.stderr.write(
-                f"events doctor --fix: wrote {len(result['added'])} additive "
-                f"entries to {result['path']}\n"
-            )
-            for entry in result["added"]:
-                sys.stderr.write(
-                    f"  + {entry['client']}/{entry['event_type']}: "
-                    f"{entry['reason']}\n"
-                )
-        else:
-            sys.stderr.write(
-                "events doctor --fix: no additive drift detected\n"
-            )
-        if result["skipped_structural"]:
-            sys.stderr.write(
-                f"events doctor --fix: refusing structural drift "
-                f"({len(result['skipped_structural'])} unknown event type(s)); "
-                f"file an issue\n"
-            )
-            for entry in result["skipped_structural"]:
-                sys.stderr.write(
-                    f"  ! {entry['client']}/{entry['event_type']} "
-                    f"(observed in {entry['client_version']!r})\n"
-                )
-        # Re-collect after overlay write so the post-fix report reflects
-        # the new effective_matrix() state.
+    try:
         report = collect()
 
-    if args.json:
-        text = render_json(report, request_id=request_id)
-        sys.stdout.write(text)
-        sys.stdout.write("\n")
-    else:
-        sys.stdout.write(render_human(report))
+        if getattr(args, "fix", False):
+            result = fix_additive_drift(report)
+            if result["added"]:
+                sys.stderr.write(
+                    f"events doctor --fix: wrote {len(result['added'])} additive "
+                    f"entries to {result['path']}\n"
+                )
+                for entry in result["added"]:
+                    sys.stderr.write(
+                        f"  + {entry['client']}/{entry['event_type']}: "
+                        f"{entry['reason']}\n"
+                    )
+            else:
+                sys.stderr.write(
+                    "events doctor --fix: no additive drift detected\n"
+                )
+            if result["skipped_structural"]:
+                sys.stderr.write(
+                    f"events doctor --fix: refusing structural drift "
+                    f"({len(result['skipped_structural'])} unknown event type(s)); "
+                    f"file an issue\n"
+                )
+                for entry in result["skipped_structural"]:
+                    sys.stderr.write(
+                        f"  ! {entry['client']}/{entry['event_type']} "
+                        f"(observed in {entry['client_version']!r})\n"
+                    )
+            # Re-collect after overlay write so the post-fix report reflects
+            # the new effective_matrix() state.
+            report = collect()
 
+        if args.json:
+            text = render_json(report, request_id=request_id)
+            sys.stdout.write(text)
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write(render_human(report))
+    except Exception as exc:
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"events doctor failed: {exc!r}",
+                hint="re-run with --json for a structured report",
+                request_id=request_id,
+                json_mode=bool(args.json),
+            )
+        )
     sys.exit(exit_code_for(report))
 
 
 def _run_events_features(args) -> None:
+    from .events.doctor.envelope import KIND_UNSPECIFIED, emit_error
     from .events.doctor.features import features_payload
 
     request_id = getattr(args, "request_id", None)
-    payload = features_payload(request_id=request_id)
+    try:
+        payload = features_payload(request_id=request_id)
+    except Exception as exc:
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"events features failed: {exc!r}",
+                hint="check that the wheel ships clawjournal/events/docs/_features.yaml",
+                request_id=request_id,
+                json_mode=True,
+            )
+        )
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 

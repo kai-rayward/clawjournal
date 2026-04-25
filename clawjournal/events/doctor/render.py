@@ -141,10 +141,42 @@ def render_human(report: DoctorReport, *, stream: TextIO | None = None) -> str:
                 f"  caught up to event_id {report.incidents.last_event_id}\n"
             )
 
+    suggestions = _suggested_next_steps(report)
+    if suggestions:
+        buf.write("\nSuggested next steps:\n")
+        for line in suggestions:
+            buf.write(f"  • {line}\n")
+
     text = buf.getvalue()
     if stream is not None:
         stream.write(text)
     return text
+
+
+def _suggested_next_steps(report: DoctorReport) -> list[str]:
+    """Per-state hints surfaced at the end of human output when any
+    verdict requires user action."""
+
+    has_partial = any(c.verdict == VERDICT_PARTIAL for c in report.clients)
+    has_unknown = any(c.verdict == VERDICT_UNKNOWN_SCHEMA for c in report.clients)
+    if not (has_partial or has_unknown):
+        return []
+    lines: list[str] = []
+    if has_partial:
+        lines.append(
+            "run `clawjournal events doctor --fix` to write a user overlay "
+            "(additive drift only)"
+        )
+        lines.append(
+            "inspect schema_unknown rows: "
+            "`clawjournal events inspect --session <key> --type schema_unknown`"
+        )
+    if has_unknown:
+        lines.append(
+            "file an issue with the --json payload attached "
+            "(structural drift requires a code change; --fix refuses it)"
+        )
+    return lines
 
 
 def _maybe_write_fs_clients(buf: StringIO, report: DoctorReport) -> bool:

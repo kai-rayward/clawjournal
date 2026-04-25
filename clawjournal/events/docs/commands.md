@@ -23,9 +23,11 @@ Flags: `--json`, `--truncate N`.
 
 ## events capabilities
 
-Dump the per-client event-type capability matrix as JSON. Combines
-the wheel-shipped `CAPABILITY_MATRIX` with the user's overlay (if
-any).
+Dump the wheel-shipped per-client event-type capability matrix as
+JSON. Reads `CAPABILITY_MATRIX` directly — the user overlay at
+`{HOME}/.clawjournal/capability_overlay.yaml` is **not** applied here
+(use `events doctor` to see overlay-aware verdicts; the overlay file
+itself is the source of truth for what was added).
 
 ## events cost ingest
 
