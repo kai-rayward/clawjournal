@@ -299,6 +299,73 @@ def rebuild_loop_incidents(
     return ingest_loop_incidents(conn, now=now, rebuild=True)
 
 
+def rebuild_loop_incidents_for_sessions(
+    conn: sqlite3.Connection,
+    session_ids: list[int],
+    *,
+    now: datetime | None = None,
+    rules: tuple[LoopRule, ...] = DEFAULT_RULES,
+) -> LoopIngestSummary:
+    """Refresh loop incidents for only the requested sessions.
+
+    This intentionally leaves ``loop_ingest_state`` untouched. Importers can
+    rebuild derived rows for imported sessions without resetting the global
+    incremental cursor or deleting unrelated sessions' incidents.
+
+    Because the cursor is not advanced, a subsequent
+    ``ingest_loop_incidents`` run will re-evaluate the imported events if
+    they sit past the current cursor. That is safe: ``incidents`` has a
+    UNIQUE index on ``(session_id, kind, first_event_id)`` and the
+    upsert clause updates fields in place, so the only cost is redoing
+    the detector work for those events once.
+    """
+    ensure_events_schema(conn)
+    ensure_incidents_schema(conn)
+    ensure_view_schema(conn)
+
+    ids = sorted({int(sid) for sid in session_ids})
+    summary = LoopIngestSummary()
+    if not ids:
+        return summary
+
+    created_at = _utc_now_iso(now)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for session_id in ids:
+            summary.sessions_evaluated += 1
+            hits = detect_session_loops(conn, session_id, rules=rules)
+            conn.execute(
+                _DELETE_LOOP_INCIDENTS_FOR_SESSION_SQL,
+                (session_id, LOOP_INCIDENT_KIND),
+            )
+            if not hits:
+                continue
+            conn.executemany(
+                _INSERT_INCIDENT_SQL,
+                [
+                    (
+                        hit.session_id,
+                        hit.kind,
+                        hit.first_event_id,
+                        hit.last_event_id,
+                        json.dumps(hit.evidence, sort_keys=True),
+                        hit.count,
+                        hit.confidence,
+                        created_at,
+                    )
+                    for hit in hits
+                ],
+            )
+            summary.incidents_written += len(hits)
+            summary.sessions_touched.add(session_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return summary
+
+
 def _get_last_processed_cursor(conn: sqlite3.Connection) -> LoopIngestCursor:
     row = conn.execute(_SELECT_LAST_CURSOR_SQL, (LOOP_CONSUMER_ID,)).fetchone()
     if row is None:

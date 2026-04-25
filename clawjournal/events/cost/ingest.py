@@ -110,6 +110,11 @@ _DELETE_ALL_TOKEN_USAGE_SQL = """
 DELETE FROM token_usage
 """
 
+_DELETE_SESSION_TOKEN_USAGE_SQL = """
+DELETE FROM token_usage
+ WHERE session_id = ?
+"""
+
 _DELETE_SESSION_ANOMALIES_SQL = """
 DELETE FROM cost_anomalies
  WHERE session_id = ?
@@ -143,12 +148,157 @@ def ingest_cost_pending(
 
     summary = CostIngestSummary()
     created_at = _utc_now_iso(now)
-    last_model_per_session: dict[int, str] = {}
     last_event_id = 0 if rebuild else _get_last_processed_event_id(conn)
 
     rows = conn.execute(_SELECT_NEW_EVENTS_SQL, (last_event_id,)).fetchall()
+    pending, extracted_max_event_id = _extract_token_usage_rows(conn, rows, summary)
+    max_event_id = max(last_event_id, extracted_max_event_id)
+
+    if summary.events_scanned or rebuild:
+        with conn:
+            if rebuild:
+                _reset_cost_ledger(conn)
+            if pending:
+                conn.executemany(_INSERT_TOKEN_USAGE_SQL, pending)
+                summary.token_rows_written = len(pending)
+
+            # Anomaly detection runs against the post-insert state, so any
+            # session that just received a new token_usage row gets fully
+            # recomputed. Delete-then-insert keeps the table aligned with the
+            # current session view and drops stale hits.
+            for session_id in sorted(summary.sessions_touched):
+                hits = detect_session_anomalies(conn, session_id)
+                conn.execute(_DELETE_SESSION_ANOMALIES_SQL, (session_id,))
+                if not hits:
+                    continue
+                conn.executemany(
+                    _INSERT_ANOMALY_SQL,
+                    [
+                        (
+                            hit.session_id,
+                            hit.turn_event_id,
+                            hit.kind,
+                            hit.confidence,
+                            json.dumps(hit.evidence, sort_keys=True),
+                            created_at,
+                        )
+                        for hit in hits
+                    ],
+                )
+                summary.anomalies_written += len(hits)
+
+            conn.execute(
+                _UPSERT_LAST_EVENT_ID_SQL,
+                (COST_CONSUMER_ID, max_event_id),
+            )
+
+    return summary
+
+
+def rebuild_cost_ledger_for_sessions(
+    conn: sqlite3.Connection,
+    session_ids: list[int],
+    *,
+    now: datetime | None = None,
+) -> CostIngestSummary:
+    """Replay cost-derived rows for only the requested sessions.
+
+    Unlike ``ingest_cost_pending(..., rebuild=True)``, this does not clear
+    global derived state or reset/advance the cost-ingest cursor. It is meant
+    for import flows that need fresh derived data for newly imported sessions
+    without clobbering unrelated local sessions.
+    """
+    ensure_events_schema(conn)
+    ensure_cost_schema(conn)
+
+    ids = sorted({int(sid) for sid in session_ids})
+    summary = CostIngestSummary()
+    if not ids:
+        return summary
+
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"""
+        SELECT events.id           AS event_id,
+               events.session_id   AS session_id,
+               events.client       AS client,
+               events.type         AS type,
+               events.event_at     AS event_at,
+               events.raw_json     AS raw_json
+          FROM events
+         WHERE events.session_id IN ({placeholders})
+         ORDER BY events.session_id, events.event_at IS NULL, events.event_at, events.id
+        """,
+        ids,
+    ).fetchall()
+    pending, _ = _extract_token_usage_rows(conn, rows, summary)
+    created_at = _utc_now_iso(now)
+
+    with conn:
+        for session_id in ids:
+            conn.execute(_DELETE_SESSION_ANOMALIES_SQL, (session_id,))
+            conn.execute(_DELETE_SESSION_TOKEN_USAGE_SQL, (session_id,))
+
+        if pending:
+            conn.executemany(_INSERT_TOKEN_USAGE_SQL, pending)
+            summary.token_rows_written = len(pending)
+
+        for session_id in ids:
+            hits = detect_session_anomalies(conn, session_id)
+            if not hits:
+                continue
+            conn.executemany(
+                _INSERT_ANOMALY_SQL,
+                [
+                    (
+                        hit.session_id,
+                        hit.turn_event_id,
+                        hit.kind,
+                        hit.confidence,
+                        json.dumps(hit.evidence, sort_keys=True),
+                        created_at,
+                    )
+                    for hit in hits
+                ],
+            )
+            summary.anomalies_written += len(hits)
+            summary.sessions_touched.add(session_id)
+
+    return summary
+
+
+def rebuild_cost_ledger(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> CostIngestSummary:
+    """Replay the full cost ledger from raw events."""
+    return ingest_cost_pending(conn, now=now, rebuild=True)
+
+
+def _get_last_processed_event_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(_SELECT_LAST_EVENT_ID_SQL, (COST_CONSUMER_ID,)).fetchone()
+    if row is None:
+        return 0
+    return int(row["last_event_id"])
+
+
+def _reset_cost_ledger(conn: sqlite3.Connection) -> None:
+    """Clear derived cost-ledger state so the next ingest replays all events."""
+    conn.execute(_DELETE_ALL_ANOMALIES_SQL)
+    conn.execute(_DELETE_ALL_TOKEN_USAGE_SQL)
+    conn.execute(_DELETE_INGEST_STATE_SQL, (COST_CONSUMER_ID,))
+
+
+def _extract_token_usage_rows(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    summary: CostIngestSummary,
+) -> tuple[list[tuple], int]:
+    last_model_per_session: dict[int, str] = {}
     pending: list[tuple] = []
-    max_event_id = last_event_id
+    max_event_id = 0
+
     for row in rows:
         summary.events_scanned += 1
         event_id = int(row["event_id"])
@@ -162,7 +312,7 @@ def ingest_cost_pending(
         if not isinstance(line, dict):
             continue
 
-        # For Codex, threads the latest model from turn_context onto
+        # For Codex, thread the latest model from turn_context onto
         # later token_count events in the same session.
         if client == "codex":
             model_from_turn = _codex_model_from_turn_context(line)
@@ -218,68 +368,7 @@ def ingest_cost_pending(
         )
         summary.sessions_touched.add(session_id)
 
-    if summary.events_scanned or rebuild:
-        with conn:
-            if rebuild:
-                _reset_cost_ledger(conn)
-            if pending:
-                conn.executemany(_INSERT_TOKEN_USAGE_SQL, pending)
-                summary.token_rows_written = len(pending)
-
-            # Anomaly detection runs against the post-insert state, so any
-            # session that just received a new token_usage row gets fully
-            # recomputed. Delete-then-insert keeps the table aligned with the
-            # current session view and drops stale hits.
-            for session_id in sorted(summary.sessions_touched):
-                hits = detect_session_anomalies(conn, session_id)
-                conn.execute(_DELETE_SESSION_ANOMALIES_SQL, (session_id,))
-                if not hits:
-                    continue
-                conn.executemany(
-                    _INSERT_ANOMALY_SQL,
-                    [
-                        (
-                            hit.session_id,
-                            hit.turn_event_id,
-                            hit.kind,
-                            hit.confidence,
-                            json.dumps(hit.evidence, sort_keys=True),
-                            created_at,
-                        )
-                        for hit in hits
-                    ],
-                )
-                summary.anomalies_written += len(hits)
-
-            conn.execute(
-                _UPSERT_LAST_EVENT_ID_SQL,
-                (COST_CONSUMER_ID, max_event_id),
-            )
-
-    return summary
-
-
-def rebuild_cost_ledger(
-    conn: sqlite3.Connection,
-    *,
-    now: datetime | None = None,
-) -> CostIngestSummary:
-    """Replay the full cost ledger from raw events."""
-    return ingest_cost_pending(conn, now=now, rebuild=True)
-
-
-def _get_last_processed_event_id(conn: sqlite3.Connection) -> int:
-    row = conn.execute(_SELECT_LAST_EVENT_ID_SQL, (COST_CONSUMER_ID,)).fetchone()
-    if row is None:
-        return 0
-    return int(row["last_event_id"])
-
-
-def _reset_cost_ledger(conn: sqlite3.Connection) -> None:
-    """Clear derived cost-ledger state so the next ingest replays all events."""
-    conn.execute(_DELETE_ALL_ANOMALIES_SQL)
-    conn.execute(_DELETE_ALL_TOKEN_USAGE_SQL)
-    conn.execute(_DELETE_INGEST_STATE_SQL, (COST_CONSUMER_ID,))
+    return pending, max_event_id
 
 
 def _latest_codex_model_before_event(
