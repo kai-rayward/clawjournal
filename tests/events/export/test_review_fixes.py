@@ -797,6 +797,81 @@ def test_malformed_raw_ref_three_tuple_rejected(tmp_path, monkeypatch):
         import_session_bundle(dst, summary.bundle_path)
 
 
+def test_null_raw_ref_rejected_with_typed_error(tmp_path, monkeypatch):
+    """Pre-fix, a hand-edited bundle with ``raw_ref: null`` produced a
+    bare ``TypeError: 'NoneType' object is not subscriptable`` from
+    ``ref[1]`` access in the caller. The normalizer now raises a typed
+    ``ImportError_`` instead so the user gets a clear cause.
+    """
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:nullref:s")
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        source_path="/tmp/x.jsonl",
+        raw_json={"x": 1},
+    )
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:nullref:s",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+    bundle["events"][0]["raw_ref"] = None
+    digest_input = {k: v for k, v in bundle.items() if k != "manifest"}
+    canonical = json.dumps(
+        digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    bundle["manifest"]["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    summary.bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="raw_ref is null"):
+        import_session_bundle(dst, summary.bundle_path)
+
+
+def test_non_integer_raw_ref_offset_rejected_with_typed_error(tmp_path, monkeypatch):
+    """A raw_ref whose offset/seq aren't ints (e.g. strings) raises a
+    typed ``ImportError_`` rather than letting ``int()`` propagate as
+    ``ValueError`` from the caller."""
+    src = make_conn()
+    sid = insert_event_session(src, session_key="claude:badint:s")
+    insert_event(
+        src,
+        session_id=sid,
+        event_type="user_message",
+        source_path="/tmp/x.jsonl",
+        raw_json={"x": 1},
+    )
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    summary = export_session_bundle(
+        src,
+        "claude:badint:s",
+        config=PERMISSIVE_CONFIG,
+        allow_no_workbench_row=True,
+        skip_global_gates=True,
+    )
+
+    bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
+    raw_ref = bundle["events"][0]["raw_ref"]
+    bundle["events"][0]["raw_ref"] = [raw_ref[0], raw_ref[1], "not-an-int", raw_ref[3]]
+    digest_input = {k: v for k, v in bundle.items() if k != "manifest"}
+    canonical = json.dumps(
+        digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    bundle["manifest"]["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    summary.bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+
+    dst = make_conn()
+    with pytest.raises(ImportError_, match="offset/seq must be integers"):
+        import_session_bundle(dst, summary.bundle_path)
+
+
 def test_no_snippets_import_restores_local_source_path_for_inspect(
     tmp_path, monkeypatch
 ):

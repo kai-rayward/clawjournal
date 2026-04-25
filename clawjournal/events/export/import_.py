@@ -285,14 +285,25 @@ def _normalize_raw_ref(raw_ref: list) -> tuple[str, str, int, int]:
     different sources can share (source_path, source_offset, seq).
 
     No legacy 3-tuple fallback: bundle_schema_version 1.0 is the first
-    public schema and ships with the 4-tuple. Anything else is a
-    malformed bundle.
+    public schema and ships with the 4-tuple. Anything else — null,
+    short, or non-integer offset/seq — is a malformed bundle and raises
+    so the typed import error reaches the user instead of a downstream
+    TypeError or IndexError on ref[i] access.
     """
     if raw_ref is None:
-        return None  # type: ignore[return-value]
-    if len(raw_ref) == 4:
+        raise ImportError_("raw_ref is null (every record must carry a 4-element raw_ref)")
+    if not isinstance(raw_ref, (list, tuple)):
+        raise ImportError_(
+            f"malformed raw_ref (expected list, got {type(raw_ref).__name__}): {raw_ref!r}"
+        )
+    if len(raw_ref) != 4:
+        raise ImportError_(f"malformed raw_ref (expected 4 elements): {raw_ref!r}")
+    try:
         return (raw_ref[0], raw_ref[1], int(raw_ref[2]), int(raw_ref[3]))
-    raise ImportError_(f"malformed raw_ref (expected 4 elements): {raw_ref!r}")
+    except (TypeError, ValueError) as exc:
+        raise ImportError_(
+            f"malformed raw_ref (offset/seq must be integers): {raw_ref!r}"
+        ) from exc
 
 
 def _local_source_path_from_workbench(
