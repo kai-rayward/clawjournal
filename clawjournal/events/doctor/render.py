@@ -184,26 +184,12 @@ def _format_client_detail_lines(client) -> list[str]:
                 f"{client.schema_unknown_rows} schema_unknown row(s) in this "
                 f"client's sessions"
             )
-        unsupported = _unsupported_event_types(client)
-        if unsupported:
+        if client.unsupported_event_types:
             lines.append(
-                f"event types observed but not in matrix as supported: "
-                f"{', '.join(unsupported)}"
+                f"event types observed but not supported in matrix: "
+                f"{', '.join(client.unsupported_event_types)}"
             )
     return lines
-
-
-def _unsupported_event_types(client) -> list[str]:
-    # The verdict-side check (probes._verdict) computes this against the
-    # effective matrix; here we approximate it for human output by
-    # treating any observed event type that isn't a known structural
-    # type as "supported" (since unknown structural types are caught by
-    # the unknown-schema branch).
-    return [
-        et
-        for et in client.event_types_observed
-        if et not in client.unknown_event_types and et == "schema_unknown"
-    ]
 
 
 def render_json(

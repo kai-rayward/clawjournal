@@ -3344,10 +3344,8 @@ def main() -> None:
 
     events_features = events_sub.add_parser(
         "features",
-        help="Static product feature surface (commands, limits, schema versions)",
-    )
-    events_features.add_argument(
-        "--json", action="store_true", help="Output JSON feature surface (default)"
+        help="Static product feature surface (commands, limits, schema versions); "
+             "always emits JSON",
     )
     events_features.add_argument(
         "--request-id",
@@ -4248,16 +4246,47 @@ def _run_events_import(args) -> None:
 
 
 def _run_events_doctor(args) -> None:
-    from .events.doctor import collect, exit_code_for, render_human, render_json
+    from .events.doctor import (
+        collect,
+        exit_code_for,
+        fix_additive_drift,
+        render_human,
+        render_json,
+    )
 
     report = collect()
     request_id = getattr(args, "request_id", None)
 
     if getattr(args, "fix", False):
-        sys.stderr.write(
-            "events doctor --fix: structural drift detection not yet implemented; "
-            "for now, edit ~/.clawjournal/capability_overlay.yaml manually\n"
-        )
+        result = fix_additive_drift(report)
+        if result["added"]:
+            sys.stderr.write(
+                f"events doctor --fix: wrote {len(result['added'])} additive "
+                f"entries to {result['path']}\n"
+            )
+            for entry in result["added"]:
+                sys.stderr.write(
+                    f"  + {entry['client']}/{entry['event_type']}: "
+                    f"{entry['reason']}\n"
+                )
+        else:
+            sys.stderr.write(
+                "events doctor --fix: no additive drift detected\n"
+            )
+        if result["skipped_structural"]:
+            sys.stderr.write(
+                f"events doctor --fix: refusing structural drift "
+                f"({len(result['skipped_structural'])} unknown event type(s)); "
+                f"file an issue\n"
+            )
+            for entry in result["skipped_structural"]:
+                sys.stderr.write(
+                    f"  ! {entry['client']}/{entry['event_type']} "
+                    f"(observed in {entry['client_version']!r})\n"
+                )
+        # Re-collect after overlay write so the post-fix report reflects
+        # the new effective_matrix() state.
+        report = collect()
 
     if args.json:
         text = render_json(report, request_id=request_id)

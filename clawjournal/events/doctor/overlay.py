@@ -174,6 +174,72 @@ def _read_overlay(path: Path) -> dict[str, Any] | None:
     return data
 
 
+def fix_additive_drift(
+    report,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Detect additive drift in a ``DoctorReport`` and write the overlay.
+
+    "Additive drift" = a (client, event_type) tuple observed in
+    ``event_sessions`` where:
+      - ``event_type`` is in ``EVENT_TYPES`` (known structural type), AND
+      - the shipped matrix has ``supported: false`` for it.
+
+    Refuses on **structural** drift (event types not in ``EVENT_TYPES``)
+    — those are reported separately and require a code change.
+
+    Returns ``{"added": [...], "skipped_structural": [...], "no_op": bool, "path": str}``.
+    """
+
+    from clawjournal.events.capabilities import CAPABILITY_MATRIX
+
+    additive: list[dict[str, Any]] = []
+    structural: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    for client_obs in report.clients:
+        if client_obs.unknown_event_types:
+            for unknown in client_obs.unknown_event_types:
+                structural.append(
+                    {
+                        "client": client_obs.client,
+                        "event_type": unknown,
+                        "client_version": client_obs.client_version,
+                    }
+                )
+        for event_type in client_obs.unsupported_event_types:
+            key = (client_obs.client, event_type)
+            if key in seen_keys:
+                continue
+            shipped = CAPABILITY_MATRIX.get(key, (False, ""))
+            if shipped[0] is True:
+                continue
+            seen_keys.add(key)
+            additive.append(
+                {
+                    "client": client_obs.client,
+                    "event_type": event_type,
+                    "supported": True,
+                    "reason": (
+                        f"observed in client_version {client_obs.client_version!r} "
+                        f"({client_obs.sessions_count} session(s))"
+                    ),
+                }
+            )
+
+    target = path or overlay_path()
+    if additive:
+        write_overlay_entries(additive, path=target)
+
+    return {
+        "added": additive,
+        "skipped_structural": structural,
+        "no_op": not additive,
+        "path": str(target),
+    }
+
+
 def write_overlay_entries(
     entries: list[dict[str, Any]],
     *,

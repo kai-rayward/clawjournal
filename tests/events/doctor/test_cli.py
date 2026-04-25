@@ -52,7 +52,7 @@ def test_doctor_request_id_echoed(isolated_home):
 
 
 def test_features_returns_zero(isolated_home):
-    result = _run(["events", "features", "--json"], isolated_home)
+    result = _run(["events", "features"], isolated_home)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["events_features_schema_version"] == "1.0"

@@ -84,6 +84,7 @@ class ClientObservation:
     sessions_count: int
     event_types_observed: list[str]
     unknown_event_types: list[str]
+    unsupported_event_types: list[str]
     schema_unknown_rows: int
     matrix_supported_count: int
     verdict: str
@@ -304,6 +305,14 @@ def _collect_clients(
             if mc == client and sup
         )
 
+        unsupported_event_types = sorted(
+            et
+            for et in event_types_observed
+            if et not in unknown_event_types
+            and et != "schema_unknown"
+            and not matrix.get((client, et), (False, ""))[0]
+        )
+
         verdict = _verdict(
             client,
             event_types_observed,
@@ -318,6 +327,7 @@ def _collect_clients(
                 sessions_count=sessions_count,
                 event_types_observed=event_types_observed,
                 unknown_event_types=unknown_event_types,
+                unsupported_event_types=unsupported_event_types,
                 schema_unknown_rows=schema_unknown_rows,
                 matrix_supported_count=matrix_supported,
                 verdict=verdict,
@@ -485,6 +495,7 @@ def report_to_dict(report: DoctorReport) -> dict[str, Any]:
                 "sessions_count": c.sessions_count,
                 "event_types_observed": list(c.event_types_observed),
                 "unknown_event_types": list(c.unknown_event_types),
+                "unsupported_event_types": list(c.unsupported_event_types),
                 "schema_unknown_rows": c.schema_unknown_rows,
                 "matrix_supported_count": c.matrix_supported_count,
                 "verdict": c.verdict,

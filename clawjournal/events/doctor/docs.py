@@ -5,10 +5,12 @@ Default mode is markdown (printed verbatim); ``--json`` mode parses
 the topic into a structured ``{topic, sections, examples, schemas}``
 shape with ``events_docs_topic_schema_version: "1.0"``.
 
-The content is **not** run through the anonymizer — placeholder
-tokens (``{HOME}``, ``{INDEX_DB}``, ``{CONFIG_DIR}``) are
-renderer-expanded only when the topic explicitly uses them; literal
-example paths like ``~/.clawjournal/index.db`` survive unchanged.
+The content is **not** run through the anonymizer — author-written
+example paths like ``~/.clawjournal/index.db`` are intentional and
+survive unchanged. Topics that need to refer to user-specific paths
+in instruction prose (e.g. examples.md) write the placeholder tokens
+literally (``{HOME}``, ``{INDEX_DB}``); the renderer does not
+substitute them.
 """
 
 from __future__ import annotations

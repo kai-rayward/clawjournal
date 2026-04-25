@@ -161,8 +161,18 @@ def test_write_overlay_entries_round_trip():
     assert matrix[("codex", "stderr_chunk")][0] is True
 
 
-def test_lazy_load_no_pyyaml_on_help(tmp_path):
-    """clawjournal --help must not trigger PyYAML import."""
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["clawjournal", "--help"],
+        ["clawjournal", "events", "--help"],
+        ["clawjournal", "events", "ingest", "--help"],
+        ["clawjournal", "events", "doctor", "--help"],
+    ],
+)
+def test_lazy_load_no_pyyaml_on_help(tmp_path, argv):
+    """No CLI help path imports PyYAML — only paths that actually need
+    the overlay or features should pay the cost."""
 
     import subprocess
     import sys
@@ -170,7 +180,7 @@ def test_lazy_load_no_pyyaml_on_help(tmp_path):
     script = tmp_path / "probe.py"
     script.write_text(
         "import sys, io, contextlib\n"
-        "sys.argv = ['clawjournal', '--help']\n"
+        f"sys.argv = {argv!r}\n"
         "from clawjournal.cli import main\n"
         "buf = io.StringIO()\n"
         "with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):\n"
@@ -189,5 +199,5 @@ def test_lazy_load_no_pyyaml_on_help(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("YAML_ABSENT"), (
-        f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+        f"argv={argv!r}\nstdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )

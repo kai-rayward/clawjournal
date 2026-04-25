@@ -66,6 +66,7 @@ def test_render_human_sanitizes_client_version():
         sessions_count=1,
         event_types_observed=["user_message"],
         unknown_event_types=[],
+        unsupported_event_types=[],
         schema_unknown_rows=0,
         matrix_supported_count=11,
         verdict=VERDICT_COMPATIBLE,
