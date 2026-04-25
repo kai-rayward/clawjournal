@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ from clawjournal.redaction import trufflehog as th
 
 BUNDLE_SCHEMA_VERSION = "1.0"
 RECORDER_SCHEMA_VERSION = "1.0"
+BUNDLE_SOFT_LIMIT_BYTES = 50_000_000
 EXPORT_BUNDLE_FORMAT = "events-bundle"
 
 _DEFAULT_EXPORT_DIRNAME = "exports"
@@ -1448,6 +1450,14 @@ def export_session_bundle(
     text = _serialize_bundle(bundle, pretty=pretty)
     _atomic_write(target, text)
 
+    final_size = len(text.encode("utf-8"))
+    if final_size > BUNDLE_SOFT_LIMIT_BYTES:
+        print(
+            f"warning: bundle is {final_size:,} bytes "
+            f"(soft limit {BUNDLE_SOFT_LIMIT_BYTES:,}); consider --no-snippets",
+            file=sys.stderr,
+        )
+
     return ExportSummary(
         bundle_path=target,
         sha256=sha,
@@ -1463,5 +1473,5 @@ def export_session_bundle(
         snippet_unavailable_count=snippet_unavailable,
         redaction_summary=redaction_summary,
         trufflehog=th_summary,
-        bundle_size_bytes=len(text.encode("utf-8")),
+        bundle_size_bytes=final_size,
     )

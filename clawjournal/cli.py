@@ -3323,6 +3323,58 @@ def main() -> None:
         "--json", action="store_true", help="Output JSON status summary"
     )
 
+    events_doctor = events_sub.add_parser(
+        "doctor",
+        help="Diagnose this clawjournal install (versions, schema, ingest health)",
+    )
+    events_doctor.add_argument(
+        "--json", action="store_true", help="Output structured JSON report"
+    )
+    events_doctor.add_argument(
+        "--fix",
+        action="store_true",
+        help="Write a capability_overlay.yaml for known additive drift "
+             "(refuses structural drift)",
+    )
+    events_doctor.add_argument(
+        "--request-id",
+        dest="request_id",
+        help="Opaque ID echoed into _meta.request_id when --json is set",
+    )
+
+    events_features = events_sub.add_parser(
+        "features",
+        help="Static product feature surface (commands, limits, schema versions)",
+    )
+    events_features.add_argument(
+        "--json", action="store_true", help="Output JSON feature surface (default)"
+    )
+    events_features.add_argument(
+        "--request-id",
+        dest="request_id",
+        help="Opaque ID echoed into _meta.request_id",
+    )
+
+    events_docs = events_sub.add_parser(
+        "docs",
+        help="Topic-based docs corpus for AI agents",
+    )
+    events_docs.add_argument(
+        "topic",
+        nargs="?",
+        help="One of: guide, commands, schemas, examples, exit-codes, errors",
+    )
+    events_docs.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON instead of markdown",
+    )
+    events_docs.add_argument(
+        "--request-id",
+        dest="request_id",
+        help="Opaque ID echoed into _meta.request_id when --json is set",
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -4011,6 +4063,18 @@ def _run_events(args) -> None:
         _run_events_import(args)
         return
 
+    if args.events_command == "doctor":
+        _run_events_doctor(args)
+        return
+
+    if args.events_command == "features":
+        _run_events_features(args)
+        return
+
+    if args.events_command == "docs":
+        _run_events_docs(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -4181,6 +4245,80 @@ def _run_events_import(args) -> None:
                 f"different session)",
                 file=sys.stderr,
             )
+
+
+def _run_events_doctor(args) -> None:
+    from .events.doctor import collect, exit_code_for, render_human, render_json
+
+    report = collect()
+    request_id = getattr(args, "request_id", None)
+
+    if getattr(args, "fix", False):
+        sys.stderr.write(
+            "events doctor --fix: structural drift detection not yet implemented; "
+            "for now, edit ~/.clawjournal/capability_overlay.yaml manually\n"
+        )
+
+    if args.json:
+        text = render_json(report, request_id=request_id)
+        sys.stdout.write(text)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_human(report))
+
+    sys.exit(exit_code_for(report))
+
+
+def _run_events_features(args) -> None:
+    from .events.doctor.features import features_payload
+
+    request_id = getattr(args, "request_id", None)
+    payload = features_payload(request_id=request_id)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _run_events_docs(args) -> None:
+    from .events.doctor.docs import (
+        TOPIC_NAMES,
+        DocsTopicError,
+        render_topic,
+    )
+    from .events.doctor.envelope import (
+        KIND_TOPIC_UNKNOWN,
+        KIND_USAGE_ERROR,
+        emit_error,
+    )
+
+    topic = getattr(args, "topic", None)
+    request_id = getattr(args, "request_id", None)
+    json_mode = bool(args.json)
+
+    if not topic:
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message="missing required argument: topic",
+                hint=f"valid topics: {', '.join(TOPIC_NAMES)}",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        rendered = render_topic(topic, json_mode=json_mode, request_id=request_id)
+    except DocsTopicError as exc:
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_TOPIC_UNKNOWN,
+                message=str(exc),
+                hint=f"valid topics: {', '.join(TOPIC_NAMES)}",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    print(rendered)
 
 
 _INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024

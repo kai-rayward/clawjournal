@@ -77,3 +77,15 @@ def capabilities_json() -> dict[str, dict[str, dict[str, object]]]:
                 "reason": reason,
             }
     return payload
+
+
+def effective_matrix() -> dict[tuple[str, str], tuple[bool, str]]:
+    """Overlay-aware view of ``CAPABILITY_MATRIX``.
+
+    Lazy-imports the loader from ``events.doctor.overlay`` so PyYAML is
+    not pulled in for non-events CLI invocations. Plan 08.
+    """
+
+    from clawjournal.events.doctor.overlay import effective_matrix as _impl
+
+    return _impl()

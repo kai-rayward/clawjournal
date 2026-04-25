@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from clawjournal.events.export.bundle import (
     BUNDLE_SCHEMA_VERSION,
+    BUNDLE_SOFT_LIMIT_BYTES,
     EXPORT_BUNDLE_FORMAT,
     RECORDER_SCHEMA_VERSION,
     ExportError,
@@ -31,6 +32,7 @@ from clawjournal.events.export.schema import ensure_export_schema
 
 __all__ = [
     "BUNDLE_SCHEMA_VERSION",
+    "BUNDLE_SOFT_LIMIT_BYTES",
     "EXPORT_BUNDLE_FORMAT",
     "ExportError",
     "ExportGateBlocked",

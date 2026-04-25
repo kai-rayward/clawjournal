@@ -24,7 +24,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/kai-rayward/clawjournal"
@@ -38,7 +40,12 @@ include = ["clawjournal*"]
 exclude = ["clawjournal.web*"]
 
 [tool.setuptools.package-data]
-"clawjournal" = ["prompts/agents/*/*.md", "web/frontend/dist/**/*"]
+"clawjournal" = [
+    "prompts/agents/*/*.md",
+    "web/frontend/dist/**/*",
+    "events/docs/*.md",
+    "events/docs/_features.yaml",
+]
 
 [project.optional-dependencies]
 dev = ["pytest", "tomli; python_version < '3.11'"]

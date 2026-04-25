@@ -1,6 +1,10 @@
 """Execution recorder + signal/confidence layer for phase-1 plans 02 + 03."""
 
-from clawjournal.events.capabilities import CAPABILITY_MATRIX, capabilities_json
+from clawjournal.events.capabilities import (
+    CAPABILITY_MATRIX,
+    capabilities_json,
+    effective_matrix,
+)
 from clawjournal.events.ingest import EVENT_CONSUMER_ID, IngestSummary, ingest_pending
 from clawjournal.events.schema import ensure_schema
 from clawjournal.events.types import (
@@ -32,6 +36,7 @@ __all__ = [
     "canonical_events",
     "capabilities_json",
     "capability_join",
+    "effective_matrix",
     "ensure_schema",
     "ensure_view_schema",
     "fetch_vendor_line",
