@@ -84,6 +84,17 @@ def test_db_corrupt_returns_five(monkeypatch, tmp_path):
     assert probes.exit_code_for(report) == 5
 
 
+def test_empty_db_file_is_corrupt(monkeypatch, tmp_path):
+    """A 0-byte index.db opens cleanly in SQLite RO mode but has no
+    schema. Doctor must classify it as corrupt, not healthy."""
+    cfg = tmp_path / ".clawjournal"
+    cfg.mkdir(parents=True)
+    (cfg / "index.db").write_bytes(b"")
+    report = probes.collect()
+    assert report.install_state == probes.INSTALL_DB_CORRUPT
+    assert probes.exit_code_for(report) == 5
+
+
 def test_unknown_event_type_triggers_unknown_schema(monkeypatch, tmp_path):
     cfg = tmp_path / ".clawjournal"
     cfg.mkdir(parents=True)

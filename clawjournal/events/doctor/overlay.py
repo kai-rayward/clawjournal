@@ -251,6 +251,11 @@ def write_overlay_entries(
     ``(client, event_type)``, sorts deterministically, writes back, and
     resets the cache. Raises ``ValueError`` if the merged total would
     exceed ``MAX_OVERLAY_ENTRIES``.
+
+    If the existing overlay file is present but unparseable (malformed
+    YAML, wrong version, etc.), the previous content is preserved as
+    ``<target>.bak`` before the new content is written, so a user
+    mid-edit doesn't silently lose their work to ``events doctor --fix``.
     """
 
     target = path or overlay_path()
@@ -260,6 +265,24 @@ def write_overlay_entries(
         loaded = _read_overlay(target)
         if loaded:
             existing = list(loaded.get("entries", []))
+        else:
+            # Existing file is unparseable — back it up before we
+            # overwrite. Distinguish from a clean prior overlay where
+            # `loaded` is a valid (possibly empty) dict.
+            backup = target.with_suffix(target.suffix + ".bak")
+            try:
+                backup.write_bytes(target.read_bytes())
+                warnings.warn(
+                    f"capability overlay at {target} was unparseable; "
+                    f"previous content preserved as {backup} before write",
+                    stacklevel=2,
+                )
+            except OSError as exc:
+                warnings.warn(
+                    f"capability overlay at {target} was unparseable; "
+                    f"could not write backup ({exc}) — proceeding with overwrite",
+                    stacklevel=2,
+                )
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for record in existing:
         client = record.get("client")

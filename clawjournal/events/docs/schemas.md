@@ -75,11 +75,14 @@ When `--json` is set on the new agent commands and an error occurs:
     "kind": "index_missing"|"version_incompatible"|"usage_error"|"topic_unknown"|"unspecified",
     "message": <string>,        # anonymized: home-dir paths replaced with [REDACTED_PATH]
     "hint": <string>,           # anonymized
-    "retryable": <bool>,
-    "_meta": { "request_id": <string> }   # only when --request-id is set
-  }
+    "retryable": <bool>
+  },
+  "_meta": { "request_id": <string> }   # only when --request-id is set; top-level
 }
 ```
+
+Note: `_meta` lives at the top level on both success and error
+responses so agents only have to check one location.
 
 ## bundle (plan 07, summary)
 

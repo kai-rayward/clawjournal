@@ -63,7 +63,10 @@ def test_emit_error_json_envelope_shape():
     assert err["message"] == "Index missing"
     assert err["hint"] == "run scan"
     assert err["retryable"] is False
-    assert err["_meta"]["request_id"] == "rq-1"
+    # `_meta` is at top level on both success and error responses so
+    # agents only check one location.
+    assert payload["_meta"]["request_id"] == "rq-1"
+    assert "_meta" not in err
 
 
 def test_emit_error_anonymizes_path(monkeypatch):

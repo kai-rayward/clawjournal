@@ -161,6 +161,37 @@ def test_write_overlay_entries_round_trip():
     assert matrix[("codex", "stderr_chunk")][0] is True
 
 
+def test_write_overlay_backs_up_malformed_existing():
+    """A user mid-edit (malformed YAML in overlay file) running
+    `events doctor --fix` must not silently lose their work — the
+    pre-existing content is preserved as `.bak`."""
+
+    target = overlay_mod.overlay_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    malformed = "version: 1\nentries:\n  { unclosed"
+    target.write_text(malformed, encoding="utf-8")
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        overlay_mod.write_overlay_entries(
+            [
+                {
+                    "client": "claude",
+                    "event_type": "compaction",
+                    "supported": True,
+                    "reason": "test",
+                }
+            ]
+        )
+
+    backup = target.with_suffix(".yaml.bak")
+    assert backup.exists(), "expected .bak file with previous malformed content"
+    assert backup.read_text() == malformed
+    # New overlay is well-formed.
+    assert "version: 1" in target.read_text()
+    assert "compaction" in target.read_text()
+
+
 @pytest.mark.parametrize(
     "argv",
     [

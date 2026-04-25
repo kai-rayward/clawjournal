@@ -212,6 +212,16 @@ def _classify_install_state(
         )
     has_workbench = _table_exists(conn, "sessions")
     has_events = _table_exists(conn, "event_sessions")
+    if not has_workbench and not has_events:
+        # Valid SQLite file but neither schema present — empty file
+        # produced by a partial / interrupted scan, or a stray DB at
+        # this path. Treat as corrupt; not a healthy "no data yet"
+        # state.
+        return (
+            INSTALL_DB_CORRUPT,
+            "index.db has no clawjournal schema (workbench or events) — run "
+            "`clawjournal scan --rebuild` or move the file aside",
+        )
     if has_workbench and not has_events:
         return (
             INSTALL_WORKBENCH_ONLY,

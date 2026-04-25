@@ -190,11 +190,17 @@ def _maybe_write_fs_clients(buf: StringIO, report: DoctorReport) -> bool:
 
 def _format_client_line(client) -> str:
     version_str = sanitize_for_human(client.client_version) or "(no version)"
+    sessions_word = "session" if client.sessions_count == 1 else "sessions"
     if client.verdict == VERDICT_COMPATIBLE:
+        types_word = (
+            "type"
+            if len(client.event_types_observed) == 1
+            else "types"
+        )
         suffix = (
             f"compatible ({len(client.event_types_observed)} of "
-            f"{client.matrix_supported_count} matrix-supported event types observed, "
-            f"all fields known, {client.sessions_count} sessions)"
+            f"{client.matrix_supported_count} matrix-supported event {types_word} observed, "
+            f"all fields known, {client.sessions_count} {sessions_word})"
         )
     elif client.verdict == VERDICT_PARTIAL:
         suffix = "partially-compatible"

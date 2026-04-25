@@ -77,8 +77,12 @@ def emit_error(
                 "retryable": retryable,
             }
         }
+        # `_meta` lives at the top level on both success and error
+        # responses so agents only have to check one place. Plan §
+        # `--request-id` echo: "echoed into _meta.request_id in both
+        # success and error responses."
         if request_id is not None:
-            payload["error"]["_meta"] = {"request_id": request_id}
+            payload["_meta"] = {"request_id": request_id}
         target.write(json.dumps(payload, indent=2, sort_keys=True))
         target.write("\n")
     else:

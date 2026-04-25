@@ -10,11 +10,14 @@ agent commands and an error occurs):
     "kind": <string>,
     "message": <string>,
     "hint": <string>,
-    "retryable": <bool>,
-    "_meta": { "request_id": <string> }
-  }
+    "retryable": <bool>
+  },
+  "_meta": { "request_id": <string> }
 }
 ```
+
+`_meta` is at the top level (alongside `error`), not nested inside —
+matching the success-response shape so agents only check one location.
 
 ## Closed `kind` enum
 
