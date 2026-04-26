@@ -3,9 +3,15 @@
 
 Field names go through the domain's filter allowlist; unknown fields
 are rejected with a structured error before any SQL is built.
-Values for the ``in`` operator are split on ``|``. Operator parsing
-prefers the longest match so ``>=`` doesn't get parsed as ``>`` plus
-``=value``.
+Values for the ``in`` operator are split on ``|``.
+
+Operator parsing picks the **leftmost** operator boundary in the
+string, with longest-match as tiebreak when two ops start at the
+same position (so ``>=`` beats ``>`` at a tie). Picking leftmost is
+what makes ``--where session=claude:my>=proj`` parse correctly:
+``=`` at position 7 wins over ``>=`` at position 17, and the value
+is the whole substring after the first ``=`` — including the inner
+``>=`` literal that's part of the value, not a second operator.
 """
 
 from __future__ import annotations
@@ -13,8 +19,11 @@ from __future__ import annotations
 from clawjournal.events.aggregate.registry import DomainRegistry
 from clawjournal.events.aggregate.spec import Predicate
 
-# Order matters: longest-match first so ``>=`` is found before ``>``.
-_OPERATORS_LONGEST_FIRST: tuple[str, ...] = (
+# Operator alphabet. Order in this tuple no longer matters for
+# correctness — the parser scans for the leftmost match across all
+# of them — but listing the multi-char ops first keeps the source
+# readable.
+_OPERATORS: tuple[str, ...] = (
     "in:",
     ">=",
     "<=",
@@ -42,20 +51,26 @@ def parse_where_clauses(
 
 
 def _parse_one(raw: str, registry: DomainRegistry) -> Predicate:
-    op_match: tuple[str, int] | None = None
-    for op in _OPERATORS_LONGEST_FIRST:
+    # Leftmost-match-wins, with longest as tiebreak. Iterating all
+    # operators and tracking the smallest index (preferring longer
+    # tokens at ties) is the natural way to express it.
+    best: tuple[int, str] | None = None
+    for op in _OPERATORS:
         idx = raw.find(op)
-        if idx > 0:  # field name must be non-empty before the op
-            op_match = (op, idx)
-            break
+        if idx <= 0:
+            # idx == 0 would mean an empty field name; idx == -1 means
+            # not found. Either way, skip.
+            continue
+        if best is None or idx < best[0] or (idx == best[0] and len(op) > len(best[1])):
+            best = (idx, op)
 
-    if op_match is None:
+    if best is None:
         raise ValueError(
             f"could not parse --where clause {raw!r}: expected "
             f"field<op>value with op in {{=, !=, >, >=, <, <=, in:}}"
         )
 
-    op_token, idx = op_match
+    idx, op_token = best
     field = raw[:idx].strip()
     value_str = raw[idx + len(op_token):].strip()
 
