@@ -4490,6 +4490,8 @@ def _run_aggregate(args, *, domain: str) -> None:
     through the structured error envelope (plan 08).
     """
 
+    import sqlite3
+
     from .events.aggregate import (
         AggregationSpec,
         DEFAULT_LIMIT,
@@ -4501,7 +4503,6 @@ def _run_aggregate(args, *, domain: str) -> None:
         render_json,
         run as run_aggregation,
     )
-    from .events.aggregate.render import EVENTS_AGGREGATE_SCHEMA_VERSION
     from .events.doctor.envelope import (
         KIND_INDEX_MISSING,
         KIND_UNSPECIFIED,
@@ -4627,6 +4628,47 @@ def _run_aggregate(args, *, domain: str) -> None:
                 message=str(exc),
                 hint=f"see `clawjournal events docs commands` for "
                      f"{domain!r} aggregation reference",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    except sqlite3.OperationalError as exc:
+        # The most common shape here is "no such table: events" /
+        # "no such table: incidents" / "no such table: token_usage" —
+        # the user hasn't run `events ingest` (or `cost ingest` /
+        # `incidents detect`) yet for this domain. Map to
+        # index_missing so agents see exit code 3 and a directed
+        # hint, rather than the unspecified catch-all.
+        conn.close()
+        msg = str(exc)
+        if "no such table" in msg:
+            domain_hint = {
+                "events": "run `clawjournal events ingest` to populate the "
+                          "events tables",
+                "incidents": "run `clawjournal events incidents detect` to "
+                             "populate the incidents table",
+                "cost": "run `clawjournal events cost ingest` to populate "
+                        "token_usage / cost_anomalies",
+            }.get(
+                domain,
+                "run the relevant `clawjournal events ...` ingest command",
+            )
+            sys.exit(
+                emit_error(
+                    code=3,
+                    kind=KIND_INDEX_MISSING,
+                    message=msg,
+                    hint=domain_hint,
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"aggregation failed: {msg}",
+                hint="re-run with --json for the structured payload",
                 request_id=request_id,
                 json_mode=json_mode,
             )

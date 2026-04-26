@@ -86,10 +86,13 @@ partition.
 
 Required: `--by`. Allowed dimensions: `model`, `provider`,
 `data_source`, `service_tier`, `pricing_table_version`, `session`,
-`workspace`, `date`. Allowed metrics: `count`, `sum:<field>`,
-`avg:<field>` over `input_tokens`, `output_tokens`,
-`cache_read_tokens`, `cache_creation_tokens`, `thinking_tokens`,
-`cost_estimate`.
+`workspace`, `date`. Allowed `--where` fields: `model`,
+`data_source`, `service_tier`, `pricing_table_version`, `session`,
+`workspace` (note: `provider` is a derivable dimension but not a
+filterable field; filter by `model` instead). Allowed metrics:
+`count`, `sum:<field>`, `avg:<field>` over `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
+`thinking_tokens`, `cost_estimate`.
 
 Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
 `--request-id <id>`.
@@ -106,9 +109,10 @@ Flags: `--rebuild`, `--json`.
 Cross-session aggregation over the `incidents` table.
 
 Required: `--by`. Allowed dimensions: `kind`, `confidence`,
-`session`, `workspace`, `date`. Metric `count` (default), or
-`sum:count` / `avg:count` over the per-incident `count` column
-(distinct from the aggregation count).
+`session`, `workspace`, `date`. Allowed `--where` fields: `kind`,
+`confidence`, `session`, `workspace`, `created_at`. Metric `count`
+(default), or `sum:count` / `avg:count` over the per-incident
+`count` column (distinct from the aggregation count).
 
 Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
 `--request-id <id>`.

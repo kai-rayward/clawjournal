@@ -243,6 +243,48 @@ def test_since_and_where_event_at_upper_bound_are_allowed(
     assert result.returncode == 0, result.stderr
 
 
+def test_missing_events_table_maps_to_index_missing(isolated_home, tmp_path):
+    """Round 7: when the user has run `clawjournal scan` (so
+    ~/.clawjournal/index.db exists with workbench schema) but never
+    `clawjournal events ingest`, the events tables don't exist.
+    `events aggregate` should map the resulting
+    sqlite3.OperationalError to ``index_missing`` (exit code 3) with
+    a directed hint pointing at `events ingest`, not the
+    unspecified catch-all (exit code 9)."""
+
+    # Workbench DB without events schema: open_index() creates the
+    # workbench tables but ensure_events_schema is never called.
+    cfg = Path(tmp_path) / ".clawjournal"
+    cfg.mkdir(parents=True, exist_ok=True)
+    seed = Path(tmp_path) / "_workbench_only_seed.py"
+    seed.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        f"home = Path({str(tmp_path)!r})\n"
+        "os.environ['HOME'] = str(home)\n"
+        "import clawjournal.config as cfg\n"
+        "cfg.CONFIG_DIR = home / '.clawjournal'\n"
+        "cfg.CONFIG_FILE = cfg.CONFIG_DIR / 'config.json'\n"
+        "import clawjournal.workbench.index as wb\n"
+        "wb.CONFIG_DIR = home / '.clawjournal'\n"
+        "wb.INDEX_DB = home / '.clawjournal' / 'index.db'\n"
+        "from clawjournal.workbench.index import open_index\n"
+        "conn = open_index()\n"
+        "conn.close()\n",
+        encoding="utf-8",
+    )
+    subprocess.run([sys.executable, str(seed)], check=True, timeout=30)
+
+    result = _run(
+        ["events", "aggregate", "--by", "client", "--json"], isolated_home
+    )
+    assert result.returncode == 3, result.stderr
+    payload = json.loads(result.stderr)
+    assert payload["error"]["kind"] == "index_missing"
+    assert "no such table" in payload["error"]["message"]
+    assert "events ingest" in payload["error"]["hint"]
+
+
 def test_canonical_flag_rejected_with_usage_error(isolated_home, tmp_path):
     """Round 1: --canonical is in the parser but the wire-up to
     canonical_events() is deferred to a follow-up. Refuse loudly
