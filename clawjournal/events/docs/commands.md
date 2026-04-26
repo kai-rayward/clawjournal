@@ -42,10 +42,11 @@ pass through unchanged.
 
 Required: `--by <dim>[,<dim>...]` (up to 3 dimensions). Allowed
 dimensions: `client`, `type`, `confidence`, `source`, `lossiness`,
-`session`, `workspace`, `date`, `hour`. Allowed `--where` fields:
-`client`, `type`, `confidence`, `source`, `session`, `workspace`,
-`event_at`. Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`,
-`in:v1|v2|...`.
+`session`, `workspace`, `date`, `hour`. `date` buckets by
+`YYYY-MM-DD` (UTC); `hour` buckets by `YYYY-MM-DDTHH` (UTC).
+Allowed `--where` fields: `client`, `type`, `confidence`, `source`,
+`session`, `workspace`, `event_at`. Operators: `=`, `!=`, `>`,
+`>=`, `<`, `<=`, `in:v1|v2|...`.
 
 Metrics: `count` (default). The events domain does not currently
 expose numeric metric fields, so `sum:<field>` / `avg:<field>` are

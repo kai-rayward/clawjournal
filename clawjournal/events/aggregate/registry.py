@@ -80,7 +80,7 @@ _EVENTS_DIMENSIONS: dict[str, FieldSpec] = {
     "confidence": FieldSpec(sql="e.confidence"),
     "source": FieldSpec(sql="e.source"),
     "lossiness": FieldSpec(sql="e.lossiness"),
-    "session": FieldSpec(sql="s.session_key"),
+    "session": FieldSpec(sql="s.session_key", anonymize_in_output=True),
     "workspace": FieldSpec(sql=_WORKSPACE_SQL, anonymize_in_output=True),
     "date": FieldSpec(sql="substr(e.event_at, 1, 10)"),
     "hour": FieldSpec(sql="substr(e.event_at, 1, 13)"),
@@ -104,7 +104,7 @@ _INCIDENTS_BASE = (
 _INCIDENTS_DIMENSIONS: dict[str, FieldSpec] = {
     "kind": FieldSpec(sql="i.kind"),
     "confidence": FieldSpec(sql="i.confidence"),
-    "session": FieldSpec(sql="s.session_key"),
+    "session": FieldSpec(sql="s.session_key", anonymize_in_output=True),
     "workspace": FieldSpec(sql=_WORKSPACE_SQL, anonymize_in_output=True),
     "date": FieldSpec(sql="substr(i.created_at, 1, 10)"),
 }
@@ -132,7 +132,7 @@ _COST_DIMENSIONS: dict[str, FieldSpec] = {
     "data_source": FieldSpec(sql="t.data_source"),
     "service_tier": FieldSpec(sql="t.service_tier"),
     "pricing_table_version": FieldSpec(sql="t.pricing_table_version"),
-    "session": FieldSpec(sql="s.session_key"),
+    "session": FieldSpec(sql="s.session_key", anonymize_in_output=True),
     "workspace": FieldSpec(sql=_WORKSPACE_SQL, anonymize_in_output=True),
     "date": FieldSpec(sql="substr(t.event_at, 1, 10)"),
 }

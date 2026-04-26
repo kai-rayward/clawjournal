@@ -21,8 +21,11 @@ from clawjournal.events.schema import ensure_schema as ensure_events_schema
 
 @pytest.fixture
 def conn():
+    from clawjournal.events.cost.schema import ensure_cost_schema
+
     c = sqlite3.connect(":memory:")
     ensure_events_schema(c)
+    ensure_cost_schema(c)
     yield c
     c.close()
 
@@ -83,18 +86,17 @@ def test_render_json_omits_request_id_when_unset(conn):
     assert "request_id" not in payload["_meta"]
 
 
-def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch, tmp_path):
-    """Plan 10 §Acceptance: ``workspace`` bucket keys appear as
-    ``~/...`` form on a fixture with real-looking paths. The home
-    username must not survive in rendered output, and the original
-    absolute workspace path must be transformed (not pass through
-    verbatim)."""
+def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch):
+    """Plan 10 §Acceptance: ``workspace`` bucket keys for home-rooted
+    paths must not leak the home username. Tests use a literal
+    ``/Users/synthetic-user/...`` path because the Anonymizer's
+    string-match path is tuned for ``/Users/<u>/`` and ``/home/<u>/``
+    patterns specifically — production session_keys contain those
+    shapes (codex's session_key embeds the working directory)."""
 
-    fake_home = tmp_path / "synthetic-user"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
 
-    workspace_abs = str(fake_home / "important-repo")
+    workspace_abs = "/Users/synthetic-user/important-repo"
     _seed(
         conn,
         session_keys=[
@@ -112,15 +114,12 @@ def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch, tmp_path):
     payload = json.loads(render_json(result))
     rendered = json.dumps(payload)
 
-    # Acceptance: home username basename must not appear anywhere.
-    username = os.path.basename(str(fake_home))
-    assert username not in rendered, (
-        f"home username {username!r} leaked into rendered output: {rendered!r}"
+    # Acceptance: home username must not appear anywhere.
+    assert "synthetic-user" not in rendered, (
+        f"home username leaked into rendered output: {rendered!r}"
     )
 
     # Acceptance: the absolute workspace path must have been transformed.
-    # The anonymizer renders home-rooted paths as ~/... — so the literal
-    # absolute path should not survive.
     assert workspace_abs not in rendered, (
         f"unanonymized absolute path leaked: {workspace_abs!r}"
     )
@@ -128,17 +127,118 @@ def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch, tmp_path):
     workspaces = {
         b["key"]["workspace"] for b in payload["aggregation"]["buckets"]
     }
-    # `Anonymizer().path()` collapses any home-rooted absolute path to
-    # `[REDACTED_PATH]` (the placeholder defined in
-    # ``redaction/anonymizer.py``). That's the actual rendered shape —
-    # plan 10's "~/…" prose was aspirational; we use the placeholder
-    # consistently with all other share-time anonymized fields.
+    # ``Anonymizer().text()`` redacts home-rooted absolute paths to the
+    # `[REDACTED_PATH]` placeholder (consistent with every other
+    # share-time anonymized field). Plan 10's "~/…" prose was
+    # aspirational; we use the placeholder shape that the rest of the
+    # codebase emits.
     assert "[REDACTED_PATH]" in workspaces, (
         f"expected [REDACTED_PATH] for the home-rooted workspace, "
         f"got {workspaces!r}"
     )
     # Non-path workspace stays untouched.
     assert "plain_workspace" in workspaces
+
+
+def test_session_bucket_keys_anonymize_embedded_paths(conn, monkeypatch):
+    """Round 2: codex session_keys are formatted ``codex:<absolute-path>``,
+    so grouping by ``session`` would otherwise emit
+    ``codex:/Users/<currentuser>/myproj`` as a bucket key — leaking
+    the home username. Render must run session keys through the
+    anonymizer; ``.text()`` preserves the ``codex:`` prefix while
+    redacting the embedded home path."""
+
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
+
+    _seed(
+        conn,
+        session_keys=[
+            ("codex:/Users/synthetic-user/myproj", "codex"),
+            ("claude:plain_proj:s1", "claude"),
+        ],
+    )
+    spec = AggregationSpec(
+        domain="events",
+        dimensions=("session",),
+        metrics=(Metric(kind="count"),),
+        limit=10,
+    )
+    result = run(spec, conn)
+    payload = json.loads(render_json(result))
+    rendered = json.dumps(payload)
+
+    assert "synthetic-user" not in rendered, (
+        f"home username leaked via session bucket key: {rendered!r}"
+    )
+    assert "/Users/synthetic-user/myproj" not in rendered, (
+        "unanonymized absolute path leaked via session bucket key"
+    )
+
+    sessions = {
+        b["key"]["session"] for b in payload["aggregation"]["buckets"]
+    }
+    # Codex session: prefix preserved, path redacted to placeholder.
+    assert any(
+        s and s.startswith("codex:") and "REDACTED" in s for s in sessions
+    ), f"expected codex:[REDACTED_PATH] form, got {sessions!r}"
+    # Claude session: nothing to anonymize, passes through.
+    assert "claude:plain_proj:s1" in sessions
+
+
+def test_total_for_sum_metric_matches_pretruncation_sum(conn):
+    """Round 2: ``total`` for a sum metric should equal the SUM of the
+    metric column over all matching rows pre-truncation, regardless
+    of how many buckets ``--limit`` cuts off."""
+
+    sid = _add_session = lambda key, client: conn.execute(
+        "INSERT INTO event_sessions (session_key, client, started_at, status) "
+        "VALUES (?, ?, '2026-04-21T10:00:00Z', 'ended') RETURNING id",
+        (key, client),
+    ).fetchone()[0]
+    sid = _add_session("claude:proj:s1", "claude")
+    seq = 0
+    for _ in range(5):
+        seq += 1
+        conn.execute(
+            "INSERT INTO events (session_id, type, event_at, ingested_at, "
+            "source, source_path, source_offset, seq, client, confidence, "
+            "lossiness, raw_json) VALUES (?, 'user_message', "
+            "'2026-04-21T10:00:00Z', '2026-04-21T10:00:00Z', 'claude-jsonl', "
+            "'/x', 0, ?, 'claude', 'high', 'none', '{}')",
+            (sid, seq),
+        )
+    eids = [r[0] for r in conn.execute("SELECT id FROM events ORDER BY id")]
+    # Five token_usage rows with model/input pairs; --limit 2 should cut
+    # off three.
+    rows = [
+        ("model_a", 100), ("model_a", 200),
+        ("model_b", 50), ("model_c", 30), ("model_d", 5),
+    ]
+    for eid, (model, inp) in zip(eids, rows):
+        conn.execute(
+            "INSERT INTO token_usage "
+            "(event_id, session_id, model, input, data_source, event_at) "
+            "VALUES (?, ?, ?, ?, 'api', '2026-04-21T10:00:00Z')",
+            (eid, sid, model, inp),
+        )
+    conn.commit()
+
+    spec = AggregationSpec(
+        domain="cost",
+        dimensions=("model",),
+        metrics=(Metric(kind="sum", field="input_tokens"),),
+        filters=(
+            __import__(
+                "clawjournal.events.aggregate", fromlist=["Predicate"]
+            ).Predicate(field="data_source", op="=", value="api"),
+        ),
+        limit=2,
+    )
+    result = run(spec, conn)
+    assert result.total == 100 + 200 + 50 + 30 + 5  # full pre-truncation sum
+    bucket_sum = sum(b["sum_input_tokens"] for b in result.buckets)
+    assert bucket_sum == 100 + 200 + 50  # top 2 models: model_a (300), model_b (50)
+    assert result.other_count == result.total - bucket_sum
 
 
 def test_render_human_includes_meta_footer(conn):

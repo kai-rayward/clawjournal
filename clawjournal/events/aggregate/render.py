@@ -55,7 +55,13 @@ def result_to_payload(
                 and field_spec.anonymize_in_output
                 and isinstance(value, str)
             ):
-                new_key[dim] = anonymizer.path(value)
+                # `.text()` handles both pure-path workspace values
+                # (e.g. ``/Users/<u>/proj`` → ``[REDACTED_PATH]``) and
+                # embedded-path session keys (e.g. ``codex:/Users/<u>/proj``
+                # → ``codex:[REDACTED_PATH]``). ``.path()`` also redacts
+                # both, but collapses the whole string for the embedded
+                # case, losing the ``codex:`` prefix.
+                new_key[dim] = anonymizer.text(value)
             else:
                 new_key[dim] = value
         new_bucket = {"key": new_key}
@@ -120,7 +126,7 @@ def render_human(
                 and field_spec.anonymize_in_output
                 and isinstance(value, str)
             ):
-                value = anonymizer.path(value)
+                value = anonymizer.text(value)
             row_cells.append("∅" if value is None else str(value))
         for metric in spec.metrics:
             row_cells.append(str(bucket.get(metric.output_key, "")))
