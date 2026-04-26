@@ -33,8 +33,12 @@ itself is the source of truth for what was added).
 
 Cross-session aggregation over the `events` table. Emits top-N
 buckets with counts and an `other_count` tail. Bucket keys for the
-`workspace` dimension are anonymized (home-dir paths render as
-`~/...`).
+`workspace` dimension are anonymized via
+`clawjournal.redaction.anonymizer.Anonymizer().path()` —
+home-rooted absolute paths render as the literal `[REDACTED_PATH]`
+placeholder (consistent with every other share-time anonymized
+field). Non-path workspace segments (e.g. claude project names)
+pass through unchanged.
 
 Required: `--by <dim>[,<dim>...]` (up to 3 dimensions). Allowed
 dimensions: `client`, `type`, `confidence`, `source`, `lossiness`,
@@ -43,9 +47,16 @@ dimensions: `client`, `type`, `confidence`, `source`, `lossiness`,
 `event_at`. Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`,
 `in:v1|v2|...`.
 
-Flags: `--metric count|sum:<field>|avg:<field>` (repeatable;
-default `count`), `--where`, `--since Nd|Nh|Nm|today|thisweek`,
-`--limit N` (default 10, ceiling 1000), `--canonical`, `--json`,
+Metrics: `count` (default). The events domain does not currently
+expose numeric metric fields, so `sum:<field>` / `avg:<field>` are
+parsed but always reject — those metrics are useful on the cost
+domain (`events cost aggregate`) and the incidents `count` column
+(`events incidents aggregate`).
+
+Flags: `--metric` (default `count`), `--where`, `--since
+Nd|Nh|Nm|today|thisweek`, `--limit N` (default 10, ceiling 1000),
+`--canonical` (reserved; raises a usage error in v0.1 — see plan 10
+§Canonical vs raw for the deferred wire-up), `--json`,
 `--request-id <id>`.
 
 ## events cost ingest

@@ -3384,8 +3384,10 @@ def main() -> None:
     events_aggregate.add_argument(
         "--canonical",
         action="store_true",
-        help="Aggregate over canonical_events (override-promoted, deduped) "
-             "instead of raw events",
+        help="(reserved; not yet wired in v0.1) — when shipped, will route "
+             "the aggregation through canonical_events() so override-promoted "
+             "rows win and native+LA duplicates dedup. Today the flag is "
+             "rejected with a usage error rather than silently no-opping",
     )
 
     events_incidents_aggregate = events_incidents_sub.add_parser(
@@ -4547,6 +4549,15 @@ def _run_aggregate(args, *, domain: str) -> None:
         since_iso = parse_since(args.since)
         limit = args.limit if args.limit is not None else DEFAULT_LIMIT
         canonical = bool(getattr(args, "canonical", False))
+        if canonical:
+            # Plan 10 specifies --canonical but the wire-up to
+            # canonical_events() is deferred. Refuse loudly so users
+            # don't get raw-event results when they asked for deduped.
+            raise ValueError(
+                "--canonical is not yet wired in v0.1; it will route the "
+                "aggregation through canonical_events() in a follow-up. "
+                "Drop the flag to aggregate over raw events."
+            )
 
         spec = AggregationSpec(
             domain=domain,
@@ -4586,6 +4597,22 @@ def _run_aggregate(args, *, domain: str) -> None:
 
     try:
         result = run_aggregation(spec, conn)
+    except ValueError as exc:
+        # Auto-partition refusing to drop a user-supplied --by dim
+        # (cost domain), or a metric/filter field rejected by the
+        # registry. These are usage errors, not catch-all faults.
+        conn.close()
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message=str(exc),
+                hint=f"see `clawjournal events docs commands` for "
+                     f"{domain!r} aggregation reference",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
     except Exception as exc:
         conn.close()
         sys.exit(

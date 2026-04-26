@@ -189,6 +189,82 @@ def test_incidents_aggregate_works_when_table_exists(isolated_home, tmp_path):
     assert payload["aggregation"]["buckets"][0]["key"]["kind"] == "loop_exact_repeat"
 
 
+def test_canonical_flag_rejected_with_usage_error(isolated_home, tmp_path):
+    """Round 1: --canonical is in the parser but the wire-up to
+    canonical_events() is deferred to a follow-up. Refuse loudly
+    rather than silently no-op (which would give raw-events results
+    when the user asked for deduped)."""
+
+    _seed_db(tmp_path)
+    result = _run(
+        [
+            "events",
+            "aggregate",
+            "--by",
+            "client",
+            "--canonical",
+            "--json",
+        ],
+        isolated_home,
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"]["kind"] == "usage_error"
+    assert "canonical" in payload["error"]["message"].lower()
+
+
+def test_cost_three_explicit_dims_with_auto_partition_returns_usage_error(
+    isolated_home, tmp_path
+):
+    """Round 1: when the user maxes the 3-dim cap on a cost query and
+    auto-partition would have to drop one, refuse with a usage error
+    (code 2) — not the catch-all (code 9). Auto-partition raises
+    ValueError from inside ``run``; the CLI must classify that as a
+    usage error."""
+
+    _seed_db(tmp_path)
+    seed = Path(tmp_path) / "_cost_3dim_seed.py"
+    seed.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        f"home = Path({str(tmp_path)!r})\n"
+        "os.environ['HOME'] = str(home)\n"
+        "import clawjournal.config as cfg\n"
+        "cfg.CONFIG_DIR = home / '.clawjournal'\n"
+        "cfg.CONFIG_FILE = cfg.CONFIG_DIR / 'config.json'\n"
+        "import clawjournal.workbench.index as wb\n"
+        "wb.CONFIG_DIR = home / '.clawjournal'\n"
+        "wb.INDEX_DB = home / '.clawjournal' / 'index.db'\n"
+        "from clawjournal.events.cost.schema import ensure_cost_schema\n"
+        "from clawjournal.workbench.index import open_index\n"
+        "conn = open_index()\n"
+        "ensure_cost_schema(conn)\n"
+        "conn.execute(\"INSERT INTO token_usage (event_id, session_id, model, input, data_source, event_at) VALUES (1, 1, 'claude-3-5-sonnet', 100, 'api', '2026-04-21T10:00:00Z')\")\n"
+        "conn.commit()\n"
+        "conn.close()\n",
+        encoding="utf-8",
+    )
+    subprocess.run([sys.executable, str(seed)], check=True, timeout=30)
+
+    result = _run(
+        [
+            "events",
+            "cost",
+            "aggregate",
+            "--by",
+            "model,session,date",
+            "--metric",
+            "sum:input_tokens",
+            "--json",
+        ],
+        isolated_home,
+    )
+    assert result.returncode == 2, result.stderr
+    payload = json.loads(result.stderr)
+    assert payload["error"]["kind"] == "usage_error"
+    assert "data_source" in payload["error"]["message"]
+
+
 def test_cost_aggregate_auto_partitions(isolated_home, tmp_path):
     _seed_db(tmp_path)
     seed = Path(tmp_path) / "_cost_seed.py"

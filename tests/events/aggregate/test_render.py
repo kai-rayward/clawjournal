@@ -85,20 +85,20 @@ def test_render_json_omits_request_id_when_unset(conn):
 
 def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch, tmp_path):
     """Plan 10 §Acceptance: ``workspace`` bucket keys appear as
-    ``~/...`` form. Grep for ``/Users/`` or ``/home/`` in output is
-    empty when the bucket-key paths match HOME."""
+    ``~/...`` form on a fixture with real-looking paths. The home
+    username must not survive in rendered output, and the original
+    absolute workspace path must be transformed (not pass through
+    verbatim)."""
 
     fake_home = tmp_path / "synthetic-user"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
-    # Anonymizer reads HOME at construction time; render_json builds
-    # a fresh Anonymizer per call.
 
-    workspace_path = str(fake_home / "important-repo")
+    workspace_abs = str(fake_home / "important-repo")
     _seed(
         conn,
         session_keys=[
-            (f"codex:{workspace_path}", "codex"),
+            (f"codex:{workspace_abs}", "codex"),
             ("claude:plain_workspace:abc", "claude"),
         ],
     )
@@ -112,15 +112,33 @@ def test_workspace_bucket_keys_are_anonymized(conn, monkeypatch, tmp_path):
     payload = json.loads(render_json(result))
     rendered = json.dumps(payload)
 
-    assert "/Users/" not in rendered or os.path.basename(str(fake_home)) not in str(
-        fake_home
-    )  # paranoia: tmp paths on macOS sit under /var/, /private/
-    # The fake-home path's basename (the username) must not survive.
-    assert os.path.basename(str(fake_home)) not in rendered
+    # Acceptance: home username basename must not appear anywhere.
+    username = os.path.basename(str(fake_home))
+    assert username not in rendered, (
+        f"home username {username!r} leaked into rendered output: {rendered!r}"
+    )
+
+    # Acceptance: the absolute workspace path must have been transformed.
+    # The anonymizer renders home-rooted paths as ~/... — so the literal
+    # absolute path should not survive.
+    assert workspace_abs not in rendered, (
+        f"unanonymized absolute path leaked: {workspace_abs!r}"
+    )
+
     workspaces = {
         b["key"]["workspace"] for b in payload["aggregation"]["buckets"]
     }
-    assert "plain_workspace" in workspaces  # non-path workspace untouched
+    # `Anonymizer().path()` collapses any home-rooted absolute path to
+    # `[REDACTED_PATH]` (the placeholder defined in
+    # ``redaction/anonymizer.py``). That's the actual rendered shape —
+    # plan 10's "~/…" prose was aspirational; we use the placeholder
+    # consistently with all other share-time anonymized fields.
+    assert "[REDACTED_PATH]" in workspaces, (
+        f"expected [REDACTED_PATH] for the home-rooted workspace, "
+        f"got {workspaces!r}"
+    )
+    # Non-path workspace stays untouched.
+    assert "plain_workspace" in workspaces
 
 
 def test_render_human_includes_meta_footer(conn):
