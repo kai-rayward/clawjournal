@@ -50,7 +50,7 @@ source_snippets, manifest). Subject to the same share-time gates as
 `bundle-export`: hold-state, project confirmation, findings.
 
 Required: `<session-key>`. Flags: `--out`, `--no-snippets`,
-`--no-children`, `--allow-no-workbench-row`, `--yes`, `--pretty` /
+`--no-children`, `--allow-no-workbench-row`, `--pretty` /
 `--compact`, `--json`.
 
 ## events import
@@ -80,9 +80,9 @@ DB missing), 5 (index DB unreadable), 6 (unknown-schema), 9
 
 Static product feature surface for AI agents. Lists shipped
 subcommands, connectors, schema versions, and limits. No user-derived
-content.
+content. Always emits JSON — there is no `--json` flag.
 
-Flags: `--json` (default), `--request-id <id>`.
+Flags: `--request-id <id>`.
 
 ## events docs
 

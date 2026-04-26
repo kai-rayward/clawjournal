@@ -168,8 +168,9 @@ def _suggested_next_steps(report: DoctorReport) -> list[str]:
             "(additive drift only)"
         )
         lines.append(
-            "inspect schema_unknown rows: "
-            "`clawjournal events inspect --session <key> --type schema_unknown`"
+            "inspect a schema_unknown row: `clawjournal events inspect "
+            "<event_id>` (find ids via `sqlite3 ~/.clawjournal/index.db "
+            "\"SELECT id FROM events WHERE type='schema_unknown' LIMIT 5\"`)"
         )
     if has_unknown:
         lines.append(

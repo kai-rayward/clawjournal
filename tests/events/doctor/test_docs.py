@@ -91,3 +91,35 @@ def test_static_docs_not_anonymized():
     rendered = render_topic("examples")
     assert "~/.clawjournal/" in rendered or "{HOME}/.clawjournal/" in rendered
     assert "[REDACTED_PATH]" not in rendered
+
+
+def test_commands_topic_does_not_claim_nonexistent_flags():
+    """Round 7: commands.md previously listed ``--yes`` for
+    ``events export`` (never wired) and ``--json`` for
+    ``events features`` (dropped in round 4 — features always emits
+    JSON). Pin the cleaned-up text so the false claims don't drift back.
+    """
+
+    rendered = render_topic("commands")
+
+    # events features section's `Flags:` line must not list --json.
+    features_idx = rendered.index("## events features")
+    next_section = rendered.index("## ", features_idx + 1)
+    features_section = rendered[features_idx:next_section]
+    flags_line = next(
+        (ln for ln in features_section.splitlines() if ln.startswith("Flags:")),
+        "",
+    )
+    assert "--json" not in flags_line, (
+        f"events features has no --json flag; commands.md Flags: line "
+        f"must not list one (got: {flags_line!r})"
+    )
+    assert "always emits json" in features_section.lower()
+
+    # events export section's `Flags:` line must not list --yes.
+    export_idx = rendered.index("## events export")
+    next_section = rendered.index("## ", export_idx + 1)
+    export_section = rendered[export_idx:next_section]
+    assert "--yes" not in export_section, (
+        "events export has no --yes flag; commands.md must not list one"
+    )

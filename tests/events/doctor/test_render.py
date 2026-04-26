@@ -9,6 +9,7 @@ from clawjournal.events.doctor.probes import (
     INSTALL_HEALTHY,
     TruffleHogStatus,
     VERDICT_COMPATIBLE,
+    VERDICT_PARTIAL,
 )
 
 
@@ -90,3 +91,26 @@ def test_render_json_omits_meta_without_request_id():
 
     payload = json.loads(render.render_json(_base_report()))
     assert "_meta" not in payload
+
+
+def test_partial_suggestion_does_not_reference_nonexistent_inspect_flag():
+    """Round 7: the schema_unknown suggestion must not point users at
+    `events inspect --type schema_unknown` — that flag was in the plan
+    sketch but never landed in the parser. The hint must use a CLI
+    shape that actually works today (`events inspect <event_id>`)."""
+
+    obs = ClientObservation(
+        client="claude",
+        client_version="1.45.0",
+        sessions_count=1,
+        event_types_observed=["schema_unknown"],
+        unknown_event_types=[],
+        unsupported_event_types=[],
+        schema_unknown_rows=2,
+        matrix_supported_count=11,
+        verdict=VERDICT_PARTIAL,
+    )
+    text = render.render_human(_base_report(clients=[obs]))
+    assert "Suggested next steps" in text
+    assert "--type schema_unknown" not in text
+    assert "events inspect <event_id>" in text
