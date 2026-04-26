@@ -458,3 +458,106 @@ def test_returns_meta_elapsed_and_rows_scanned(conn):
     result = run(spec, conn)
     assert result.elapsed_ms >= 0
     assert result.rows_scanned == 1
+
+
+def test_run_is_internally_consistent_against_concurrent_writes(tmp_path):
+    """Round 6: the bucket query and the summary query must run
+    against the same snapshot. Without an explicit read transaction,
+    a concurrent write between them would tilt ``total`` /
+    ``rows_scanned`` away from the bucket counts and produce a
+    wrong ``other_count``. Mirrors the doctor's snapshot-isolation
+    pattern (plan 08 §Internal consistency).
+
+    Wraps the reader connection in a small proxy so we can inject
+    a writer-commit between the bucket query and the summary query.
+    With ``BEGIN`` wrapping ``run`` (round 6 fix), both queries run
+    against the snapshot taken at BEGIN time and the injected row
+    is invisible to both.
+    """
+
+    db_path = tmp_path / "agg.db"
+    writer = sqlite3.connect(str(db_path))
+    # Enable WAL so a reader's BEGIN doesn't block a writer's commit;
+    # this is what `serve` runs against in production via
+    # `workbench.index.open_index`.
+    writer.execute("PRAGMA journal_mode=WAL")
+    ensure_events_schema(writer)
+    cur = writer.execute(
+        "INSERT INTO event_sessions (session_key, client, started_at, "
+        "status) VALUES ('claude:proj:s1', 'claude', "
+        "'2026-04-21T10:00:00Z', 'ended')"
+    )
+    sid = cur.lastrowid
+    for seq in range(3):
+        writer.execute(
+            "INSERT INTO events (session_id, type, event_at, ingested_at, "
+            "source, source_path, source_offset, seq, client, confidence, "
+            "lossiness, raw_json) VALUES (?, 'user_message', "
+            "'2026-04-21T10:00:00Z', '2026-04-21T10:00:00Z', 'claude-jsonl', "
+            "'/x', 0, ?, 'claude', 'high', 'none', '{}')",
+            (sid, seq),
+        )
+    writer.commit()
+
+    raw_reader = sqlite3.connect(str(db_path))
+    call_count = {"n": 0}
+
+    class _ReaderProxy:
+        """Forwards every attribute to the underlying connection
+        except ``execute``, which is wrapped to inject a concurrent
+        writer-commit between the bucket and summary queries."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            result = self._conn.execute(sql, *args, **kwargs)
+            call_count["n"] += 1
+            # Calls in order: BEGIN (1), bucket SELECT (2), summary
+            # SELECT (3), COMMIT (4). Inject before #3.
+            if call_count["n"] == 2:
+                writer.execute(
+                    "INSERT INTO events (session_id, type, event_at, "
+                    "ingested_at, source, source_path, source_offset, "
+                    "seq, client, confidence, lossiness, raw_json) "
+                    "VALUES (?, 'user_message', '2026-04-21T10:00:00Z', "
+                    "'2026-04-21T10:00:00Z', 'claude-jsonl', '/x', 0, "
+                    "99, 'claude', 'high', 'none', '{}')",
+                    (sid,),
+                )
+                writer.commit()
+            return result
+
+        @property
+        def in_transaction(self):
+            return self._conn.in_transaction
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    reader = _ReaderProxy(raw_reader)
+    spec = AggregationSpec(
+        domain="events",
+        dimensions=("client",),
+        metrics=(Metric(kind="count"),),
+        limit=10,
+    )
+    try:
+        result = run(spec, reader)  # type: ignore[arg-type]
+    finally:
+        raw_reader.close()
+        writer.close()
+
+    bucket_count = sum(b.get("count", 0) for b in result.buckets)
+    assert result.total == bucket_count, (
+        f"snapshot isolation broken: total={result.total} but buckets "
+        f"summed to {bucket_count} ({result.buckets!r})"
+    )
+    assert result.other_count == 0
+    # Pre-insert state was 3 events; without snapshot isolation,
+    # total would be 4 and bucket_count would still be 3. Both must
+    # be 3.
+    assert result.total == 3, (
+        f"expected pre-insert state (3), got {result.total!r}; "
+        f"snapshot isolation likely broken"
+    )

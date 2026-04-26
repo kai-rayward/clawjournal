@@ -63,7 +63,16 @@ def run(
     conn: sqlite3.Connection,
 ) -> AggregationResult:
     """Execute the aggregation. Caller is responsible for opening
-    ``conn`` and ensuring the relevant schema exists."""
+    ``conn`` and ensuring the relevant schema exists.
+
+    The bucket query and the summary query both run inside one
+    explicit read transaction so the report is internally consistent
+    against a single snapshot, even when ``clawjournal serve`` is
+    concurrently writing. Without the wrap, a write that lands
+    between the two queries would tilt ``total`` and ``rows_scanned``
+    against the bucket counts, producing a wrong ``other_count``.
+    Mirrors the pattern from ``events.doctor.probes.collect``.
+    """
 
     registry = get_registry(spec.domain)
     effective_spec, auto_partitioned = _maybe_auto_partition(spec, registry)
@@ -71,11 +80,21 @@ def run(
     bucket_sql, params = _build_bucket_sql(effective_spec, registry)
     summary_sql, summary_params = _build_summary_sql(effective_spec, registry)
 
-    started = time.perf_counter()
-    cursor = conn.execute(bucket_sql, params)
-    bucket_rows = list(cursor.fetchall())
-    summary_row = conn.execute(summary_sql, summary_params).fetchone()
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    in_explicit_tx = bool(conn.in_transaction)
+    if not in_explicit_tx:
+        conn.execute("BEGIN")
+    try:
+        started = time.perf_counter()
+        cursor = conn.execute(bucket_sql, params)
+        bucket_rows = list(cursor.fetchall())
+        summary_row = conn.execute(summary_sql, summary_params).fetchone()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+    finally:
+        if not in_explicit_tx:
+            try:
+                conn.execute("COMMIT")
+            except sqlite3.OperationalError:
+                pass
 
     primary_key = effective_spec.metrics[0].output_key
     total_raw = summary_row[0] if summary_row else None
