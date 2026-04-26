@@ -189,6 +189,60 @@ def test_incidents_aggregate_works_when_table_exists(isolated_home, tmp_path):
     assert payload["aggregation"]["buckets"][0]["key"]["kind"] == "loop_exact_repeat"
 
 
+def test_since_and_where_event_at_lower_bound_are_mutually_exclusive(
+    isolated_home, tmp_path
+):
+    """Round 4: plan 10 §Time windows says ``--since`` is mutually
+    exclusive with a ``--where event_at >= ...`` filter. Refuse the
+    combination so the user picks one — silently AND-ing them gives
+    a more restrictive bound than they asked for."""
+
+    _seed_db(tmp_path)
+    result = _run(
+        [
+            "events",
+            "aggregate",
+            "--by",
+            "client",
+            "--since",
+            "7d",
+            "--where",
+            "event_at>=2026-01-01T00:00:00Z",
+            "--json",
+        ],
+        isolated_home,
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"]["kind"] == "usage_error"
+    assert "mutually exclusive" in payload["error"]["message"]
+
+
+def test_since_and_where_event_at_upper_bound_are_allowed(
+    isolated_home, tmp_path
+):
+    """The other operators (`<`, `<=`, `=`) on the time field bound
+    the *upper* end / pin a point, so they should compose with
+    ``--since`` without conflict."""
+
+    _seed_db(tmp_path)
+    result = _run(
+        [
+            "events",
+            "aggregate",
+            "--by",
+            "client",
+            "--since",
+            "30d",
+            "--where",
+            "event_at<2030-01-01T00:00:00Z",
+            "--json",
+        ],
+        isolated_home,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_canonical_flag_rejected_with_usage_error(isolated_home, tmp_path):
     """Round 1: --canonical is in the parser but the wire-up to
     canonical_events() is deferred to a follow-up. Refuse loudly

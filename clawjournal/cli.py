@@ -4559,6 +4559,24 @@ def _run_aggregate(args, *, domain: str) -> None:
                 "Drop the flag to aggregate over raw events."
             )
 
+        # Plan 10 §Time windows: --since and a `--where <time_field>
+        # >=...` filter are mutually exclusive — otherwise the user
+        # silently gets the AND of both bounds. Reject the combination
+        # so they pick one. Other operators on the time field (`<`,
+        # `=`, `<=`) are still allowed alongside --since because they
+        # bound the *upper* end / pin a specific point and don't
+        # conflict with --since's lower bound.
+        time_field_logical_name = registry.time_field.split(".", 1)[-1]
+        if since_iso is not None and any(
+            p.field == time_field_logical_name and p.op in (">=", ">")
+            for p in filters
+        ):
+            raise ValueError(
+                f"--since and --where {time_field_logical_name}>=... / >... "
+                f"are mutually exclusive (both bound the same lower edge of "
+                f"the time window). Drop one."
+            )
+
         spec = AggregationSpec(
             domain=domain,
             dimensions=tuple(dimensions),
