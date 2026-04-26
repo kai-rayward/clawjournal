@@ -75,6 +75,15 @@ Cross-session aggregation over `token_usage`. **Auto-partitions by
 `--where data_source=...` is set, so API truth and local estimates
 never silently mix in a sum.
 
+Caveat: `--limit N` truncates by primary metric DESC across the
+whole result, including the prepended `data_source` partition. If
+one partition's totals dominate, all top-N buckets may come from
+that single partition and the other partition's rows fall into
+the `other_count` tail. Use `--where data_source=api` (or
+`estimated`) to scope to one partition explicitly, and check
+`total - sum-of-bucket-primary-metric` to detect a truncated
+partition.
+
 Required: `--by`. Allowed dimensions: `model`, `provider`,
 `data_source`, `service_tier`, `pricing_table_version`, `session`,
 `workspace`, `date`. Allowed metrics: `count`, `sum:<field>`,

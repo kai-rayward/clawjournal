@@ -285,9 +285,15 @@ def _shape_buckets(
             if metric.kind == "count":
                 bucket["count"] = int(value) if value is not None else 0
             elif metric.kind == "sum":
-                bucket[metric.output_key] = (
-                    int(value) if isinstance(value, (int, float)) and value == int(value) else value
-                )
+                # Preserve SQLite's natural type — integer columns return
+                # int, REAL columns return float. The previous heuristic
+                # (coerce whole floats to int) made type unstable across
+                # rows: `sum_cost_estimate` would flip from float to int
+                # for buckets whose total happened to be a whole number,
+                # surprising JSON consumers that expected a stable shape.
+                # COALESCE in SQL ensures `value` is never None here, but
+                # we keep the guard for defense.
+                bucket[metric.output_key] = value if value is not None else 0
             else:  # avg
                 bucket[metric.output_key] = (
                     float(value) if value is not None else 0.0

@@ -356,6 +356,96 @@ def test_metric_field_must_be_numeric(conn):
         run(spec, conn)
 
 
+def test_sum_of_real_column_preserves_float_type(conn):
+    """Round 5: SUM over a REAL column (token_usage.cost_estimate)
+    must always emit float in the bucket, even when the total
+    happens to be a whole number. JSON consumers that parse
+    ``sum_cost_estimate`` as a float-typed value should never get
+    an int back depending on data luck."""
+
+    sid = _add_session(conn, "claude:proj:s1")
+    _add_event(conn, sid)
+    _add_event(conn, sid)
+    eids = [r[0] for r in conn.execute("SELECT id FROM events").fetchall()]
+    # Two cost_estimates that sum to a whole number (3.0).
+    for eid, est in zip(eids, (1.5, 1.5)):
+        conn.execute(
+            "INSERT INTO token_usage "
+            "(event_id, session_id, model, input, data_source, "
+            " cost_estimate, event_at) "
+            "VALUES (?, ?, 'm', 100, 'api', ?, '2026-04-21T10:00:00Z')",
+            (eid, sid, est),
+        )
+    spec = AggregationSpec(
+        domain="cost",
+        dimensions=("model",),
+        metrics=(Metric(kind="sum", field="cost_estimate"),),
+        filters=(Predicate(field="data_source", op="=", value="api"),),
+        limit=10,
+    )
+    result = run(spec, conn)
+    bucket_value = result.buckets[0]["sum_cost_estimate"]
+    assert isinstance(bucket_value, float), (
+        f"sum over REAL column must stay float; got {bucket_value!r} "
+        f"({type(bucket_value).__name__})"
+    )
+    assert bucket_value == 3.0
+
+
+def test_three_predicate_AND_intersection(conn):
+    """Plan 10 §Acceptance: three repeated ``--where`` clauses must
+    AND together (intersection), not OR (union). With
+    ``session=A AND session=B AND session=A`` no row can match
+    because a row has exactly one session, and A != B."""
+
+    sid_a = _add_session(conn, "claude:proj:sA")
+    sid_b = _add_session(conn, "claude:proj:sB")
+    _add_event(conn, sid_a)
+    _add_event(conn, sid_b)
+
+    spec = AggregationSpec(
+        domain="events",
+        dimensions=("client",),
+        metrics=(Metric(kind="count"),),
+        filters=(
+            Predicate(field="session", op="=", value="claude:proj:sA"),
+            Predicate(field="session", op="=", value="claude:proj:sB"),
+            Predicate(field="session", op="=", value="claude:proj:sA"),
+        ),
+        limit=10,
+    )
+    result = run(spec, conn)
+    assert result.total == 0  # AND of contradictory bounds — empty
+    assert result.buckets == []
+
+
+def test_three_dim_by_emits_object_keys(conn):
+    """Plan 10 §Acceptance: ``--by client,type,date`` bucket keys are
+    objects (dict), not concatenated strings. The dict has one entry
+    per ``--by`` dimension."""
+
+    sid = _add_session(conn, "claude:proj:s1")
+    _add_event(conn, sid, type_="user_message", event_at="2026-04-21T10:00:00Z")
+    _add_event(conn, sid, type_="tool_call", event_at="2026-04-21T10:00:00Z")
+    _add_event(conn, sid, type_="user_message", event_at="2026-04-22T10:00:00Z")
+
+    spec = AggregationSpec(
+        domain="events",
+        dimensions=("client", "type", "date"),
+        metrics=(Metric(kind="count"),),
+        limit=10,
+    )
+    result = run(spec, conn)
+    for bucket in result.buckets:
+        assert isinstance(bucket["key"], dict), (
+            f"bucket key must be a dict; got {bucket['key']!r}"
+        )
+        assert set(bucket["key"]) == {"client", "type", "date"}
+    # The 2026-04-21 day has two distinct (type) buckets; the
+    # 2026-04-22 day has one. Three buckets total.
+    assert len(result.buckets) == 3
+
+
 def test_returns_meta_elapsed_and_rows_scanned(conn):
     sid = _add_session(conn, "claude:proj:s1")
     _add_event(conn, sid)
