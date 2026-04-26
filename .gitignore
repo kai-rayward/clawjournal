@@ -21,7 +21,7 @@ node_modules/
 .desloppify/
 .worktrees/
 .claude/
-docs/
+/docs/
 
 # PII review artifacts
 *.pii_findings.json
