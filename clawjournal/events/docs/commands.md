@@ -29,6 +29,25 @@ JSON. Reads `CAPABILITY_MATRIX` directly — the user overlay at
 (use `events doctor` to see overlay-aware verdicts; the overlay file
 itself is the source of truth for what was added).
 
+## events aggregate
+
+Cross-session aggregation over the `events` table. Emits top-N
+buckets with counts and an `other_count` tail. Bucket keys for the
+`workspace` dimension are anonymized (home-dir paths render as
+`~/...`).
+
+Required: `--by <dim>[,<dim>...]` (up to 3 dimensions). Allowed
+dimensions: `client`, `type`, `confidence`, `source`, `lossiness`,
+`session`, `workspace`, `date`, `hour`. Allowed `--where` fields:
+`client`, `type`, `confidence`, `source`, `session`, `workspace`,
+`event_at`. Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`,
+`in:v1|v2|...`.
+
+Flags: `--metric count|sum:<field>|avg:<field>` (repeatable;
+default `count`), `--where`, `--since Nd|Nh|Nm|today|thisweek`,
+`--limit N` (default 10, ceiling 1000), `--canonical`, `--json`,
+`--request-id <id>`.
+
 ## events cost ingest
 
 Extract token usage from already-recorded events and detect anomalies
@@ -37,10 +56,41 @@ Writes to `token_usage` and `cost_anomalies`.
 
 Flags: `--rebuild`, `--json`.
 
+## events cost aggregate
+
+Cross-session aggregation over `token_usage`. **Auto-partitions by
+`data_source`** when neither `--by data_source` nor
+`--where data_source=...` is set, so API truth and local estimates
+never silently mix in a sum.
+
+Required: `--by`. Allowed dimensions: `model`, `provider`,
+`data_source`, `service_tier`, `pricing_table_version`, `session`,
+`workspace`, `date`. Allowed metrics: `count`, `sum:<field>`,
+`avg:<field>` over `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_creation_tokens`, `thinking_tokens`,
+`cost_estimate`.
+
+Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
+`--request-id <id>`.
+
 ## events incidents detect
 
 Detect exact-repeat command and tool-call loops. Writes incidents to
 the `incidents` table keyed by `(session, kind, first_event_id)`.
+
+Flags: `--rebuild`, `--json`.
+
+## events incidents aggregate
+
+Cross-session aggregation over the `incidents` table.
+
+Required: `--by`. Allowed dimensions: `kind`, `confidence`,
+`session`, `workspace`, `date`. Metric `count` (default), or
+`sum:count` / `avg:count` over the per-incident `count` column
+(distinct from the aggregation count).
+
+Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
+`--request-id <id>`.
 
 ## events export
 
