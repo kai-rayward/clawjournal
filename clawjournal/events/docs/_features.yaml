@@ -1,8 +1,8 @@
 # Single source for `events features --json:features` and the
 # `events docs commands` topic. Plan 08 §events features.
 #
-# When 10 ships `events aggregate` and 11 ships `events search`,
-# add their entries here and a per-command section to `commands.md`.
+# When 11 ships `events search`, add its entry here and a per-command
+# section to `commands.md`.
 version: 1
 features:
   - id: events.ingest
@@ -14,12 +14,21 @@ features:
   - id: events.capabilities
     command: clawjournal events capabilities
     summary: "Dump the per-client event-type capability matrix"
+  - id: events.aggregate
+    command: clawjournal events aggregate
+    summary: "Cross-session aggregation over events (counts/sums/avgs by dimension)"
   - id: events.cost.ingest
     command: clawjournal events cost ingest
     summary: "Extract token usage and detect cost anomalies"
+  - id: events.cost.aggregate
+    command: clawjournal events cost aggregate
+    summary: "Cross-session aggregation over token_usage (auto-partitions by data_source)"
   - id: events.incidents.detect
     command: clawjournal events incidents detect
     summary: "Detect exact-repeat command/tool-call loops (loop detector lite)"
+  - id: events.incidents.aggregate
+    command: clawjournal events incidents aggregate
+    summary: "Cross-session aggregation over incidents"
   - id: events.export
     command: clawjournal events export
     summary: "Package a session into a self-describing replay-bundle JSON"

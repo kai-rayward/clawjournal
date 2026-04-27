@@ -3373,6 +3373,36 @@ def main() -> None:
         help="Opaque ID echoed into _meta.request_id when --json is set",
     )
 
+    # Aggregation subcommands (plan 10): events aggregate,
+    # events incidents aggregate, events cost aggregate. Shared flag
+    # shape registered via a helper so all three stay in lockstep.
+    events_aggregate = events_sub.add_parser(
+        "aggregate",
+        help="Cross-session aggregation over events (counts/sums/avgs by dimension)",
+    )
+    _add_aggregate_flags(events_aggregate, domain="events")
+    events_aggregate.add_argument(
+        "--canonical",
+        action="store_true",
+        help="(reserved; not yet wired in v0.1) — when shipped, will route "
+             "the aggregation through canonical_events() so override-promoted "
+             "rows win and native+LA duplicates dedup. Today the flag is "
+             "rejected with a usage error rather than silently no-opping",
+    )
+
+    events_incidents_aggregate = events_incidents_sub.add_parser(
+        "aggregate",
+        help="Cross-session aggregation over incidents",
+    )
+    _add_aggregate_flags(events_incidents_aggregate, domain="incidents")
+
+    events_cost_aggregate = events_cost_sub.add_parser(
+        "aggregate",
+        help="Cross-session aggregation over token_usage / cost_anomalies "
+             "(auto-partitions by data_source)",
+    )
+    _add_aggregate_flags(events_cost_aggregate, domain="cost")
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -4073,6 +4103,10 @@ def _run_events(args) -> None:
         _run_events_docs(args)
         return
 
+    if args.events_command == "aggregate":
+        _run_events_aggregate(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -4093,6 +4127,10 @@ def _run_events(args) -> None:
 def _run_events_cost(args) -> None:
     from .events.cost import ingest_cost_pending
     from .workbench.index import open_index
+
+    if args.cost_command == "aggregate":
+        _run_events_cost_aggregate(args)
+        return
 
     if args.cost_command != "ingest":
         print(f"Unknown cost command: {args.cost_command}", file=sys.stderr)
@@ -4119,6 +4157,10 @@ def _run_events_cost(args) -> None:
 def _run_events_incidents(args) -> None:
     from .events.incidents import ingest_loop_incidents
     from .workbench.index import open_index
+
+    if args.incidents_command == "aggregate":
+        _run_events_incidents_aggregate(args)
+        return
 
     if args.incidents_command != "detect":
         print(f"Unknown incidents command: {args.incidents_command}", file=sys.stderr)
@@ -4373,6 +4415,314 @@ def _run_events_docs(args) -> None:
             )
         )
     print(rendered)
+
+
+def _add_aggregate_flags(parser, *, domain: str) -> None:
+    """Register the shared --by/--metric/--where/--since/--limit/--json/--request-id
+    flags on an aggregation subparser. ``domain`` is stashed on the
+    namespace so the handler doesn't have to disambiguate by parser.
+    """
+
+    parser.add_argument(
+        "--by",
+        action="append",
+        default=[],
+        metavar="DIM[,DIM...]",
+        help="Dimension(s) to group by (repeat or comma-separate; up to 3 total)",
+    )
+    parser.add_argument(
+        "--metric",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Metric: count | sum:<field> | avg:<field> "
+             "(repeat or comma-separate for multi-metric)",
+    )
+    parser.add_argument(
+        "--where",
+        action="append",
+        default=[],
+        metavar="FIELD<op>VALUE",
+        help="Allowlisted filter (op: =, !=, >, >=, <, <=, in:v1|v2|...). "
+             "Repeat to AND together",
+    )
+    parser.add_argument(
+        "--since",
+        default=None,
+        metavar="DURATION",
+        help="Lower-bound time filter: Nd / Nh / Nm / today / thisweek",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Top-N buckets to return (default: 10, ceiling: 1000)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of human table"
+    )
+    parser.add_argument(
+        "--request-id",
+        dest="request_id",
+        help="Opaque ID echoed into _meta.request_id when --json is set",
+    )
+    parser.set_defaults(_aggregate_domain=domain)
+
+
+def _run_events_aggregate(args) -> None:
+    _run_aggregate(args, domain="events")
+
+
+def _run_events_cost_aggregate(args) -> None:
+    _run_aggregate(args, domain="cost")
+
+
+def _run_events_incidents_aggregate(args) -> None:
+    _run_aggregate(args, domain="incidents")
+
+
+def _run_aggregate(args, *, domain: str) -> None:
+    """Shared entry point for the three aggregation subcommands.
+
+    Builds a validated ``AggregationSpec`` from CLI args, opens the
+    workbench index, executes the query, and renders. Errors flow
+    through the structured error envelope (plan 08).
+    """
+
+    import sqlite3
+
+    from .events.aggregate import (
+        AggregationSpec,
+        DEFAULT_LIMIT,
+        Metric,
+        get_registry,
+        parse_since,
+        parse_where_clauses,
+        render_human,
+        render_json,
+        run as run_aggregation,
+    )
+    from .events.doctor.envelope import (
+        KIND_INDEX_MISSING,
+        KIND_UNSPECIFIED,
+        KIND_USAGE_ERROR,
+        emit_error,
+    )
+    from .workbench.index import open_index
+
+    request_id = getattr(args, "request_id", None)
+    json_mode = bool(getattr(args, "json", False))
+
+    try:
+        registry = get_registry(domain)
+        dimensions = _split_csv_flag(args.by)
+        if not dimensions:
+            sys.exit(
+                emit_error(
+                    code=2,
+                    kind=KIND_USAGE_ERROR,
+                    message="missing required flag: --by",
+                    hint=f"available dimensions for {domain!r}: "
+                         f"{', '.join(sorted(registry.dimensions))}",
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        for dim in dimensions:
+            if dim not in registry.dimensions:
+                sys.exit(
+                    emit_error(
+                        code=2,
+                        kind=KIND_USAGE_ERROR,
+                        message=f"unknown dimension: {dim!r}",
+                        hint=f"available dimensions for {domain!r}: "
+                             f"{', '.join(sorted(registry.dimensions))}",
+                        request_id=request_id,
+                        json_mode=json_mode,
+                    )
+                )
+
+        metric_tokens = _split_csv_flag(args.metric) or ["count"]
+        metrics = tuple(_parse_metric_token(t, registry) for t in metric_tokens)
+
+        filters = parse_where_clauses(list(args.where), registry)
+        since_iso = parse_since(args.since)
+        limit = args.limit if args.limit is not None else DEFAULT_LIMIT
+        canonical = bool(getattr(args, "canonical", False))
+        if canonical:
+            # Plan 10 specifies --canonical but the wire-up to
+            # canonical_events() is deferred. Refuse loudly so users
+            # don't get raw-event results when they asked for deduped.
+            raise ValueError(
+                "--canonical is not yet wired in v0.1; it will route the "
+                "aggregation through canonical_events() in a follow-up. "
+                "Drop the flag to aggregate over raw events."
+            )
+
+        # Plan 10 §Time windows: --since and a `--where <time_field>
+        # >=...` filter are mutually exclusive — otherwise the user
+        # silently gets the AND of both bounds. Reject the combination
+        # so they pick one. Other operators on the time field (`<`,
+        # `=`, `<=`) are still allowed alongside --since because they
+        # bound the *upper* end / pin a specific point and don't
+        # conflict with --since's lower bound.
+        time_field_logical_name = registry.time_field.split(".", 1)[-1]
+        if since_iso is not None and any(
+            p.field == time_field_logical_name and p.op in (">=", ">")
+            for p in filters
+        ):
+            raise ValueError(
+                f"--since and --where {time_field_logical_name}>=... / >... "
+                f"are mutually exclusive (both bound the same lower edge of "
+                f"the time window). Drop one."
+            )
+
+        spec = AggregationSpec(
+            domain=domain,
+            dimensions=tuple(dimensions),
+            metrics=metrics,
+            filters=filters,
+            since_iso=since_iso,
+            limit=limit,
+            canonical=canonical,
+        )
+    except ValueError as exc:
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message=str(exc),
+                hint=f"see `clawjournal events docs commands` for "
+                     f"{domain!r} aggregation reference",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        conn = open_index()
+    except FileNotFoundError as exc:
+        sys.exit(
+            emit_error(
+                code=3,
+                kind=KIND_INDEX_MISSING,
+                message=f"index database not found: {exc}",
+                hint="run `clawjournal scan` then `clawjournal events ingest`",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        result = run_aggregation(spec, conn)
+    except ValueError as exc:
+        # Auto-partition refusing to drop a user-supplied --by dim
+        # (cost domain), or a metric/filter field rejected by the
+        # registry. These are usage errors, not catch-all faults.
+        conn.close()
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message=str(exc),
+                hint=f"see `clawjournal events docs commands` for "
+                     f"{domain!r} aggregation reference",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    except sqlite3.OperationalError as exc:
+        # The most common shape here is "no such table: events" /
+        # "no such table: incidents" / "no such table: token_usage" —
+        # the user hasn't run `events ingest` (or `cost ingest` /
+        # `incidents detect`) yet for this domain. Map to
+        # index_missing so agents see exit code 3 and a directed
+        # hint, rather than the unspecified catch-all.
+        conn.close()
+        msg = str(exc)
+        if "no such table" in msg:
+            domain_hint = {
+                "events": "run `clawjournal events ingest` to populate the "
+                          "events tables",
+                "incidents": "run `clawjournal events incidents detect` to "
+                             "populate the incidents table",
+                "cost": "run `clawjournal events cost ingest` to populate "
+                        "token_usage / cost_anomalies",
+            }.get(
+                domain,
+                "run the relevant `clawjournal events ...` ingest command",
+            )
+            sys.exit(
+                emit_error(
+                    code=3,
+                    kind=KIND_INDEX_MISSING,
+                    message=msg,
+                    hint=domain_hint,
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"aggregation failed: {msg}",
+                hint="re-run with --json for the structured payload",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    except Exception as exc:
+        conn.close()
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"aggregation failed: {exc!r}",
+                hint="re-run with --json for the structured payload",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    conn.close()
+
+    if json_mode:
+        sys.stdout.write(render_json(result, request_id=request_id))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_human(result))
+
+
+def _split_csv_flag(values: list[str]) -> list[str]:
+    """Combine repeated flags + comma-separated tokens into a flat list."""
+
+    out: list[str] = []
+    for v in values or []:
+        for token in v.split(","):
+            token = token.strip()
+            if token:
+                out.append(token)
+    return out
+
+
+def _parse_metric_token(token: str, registry) -> "Metric":  # type: ignore[name-defined]
+    """Parse one ``count`` / ``sum:field`` / ``avg:field`` token."""
+
+    from .events.aggregate import Metric
+
+    if token == "count":
+        return Metric(kind="count")
+    if ":" in token:
+        kind, field = token.split(":", 1)
+        kind = kind.strip()
+        field = field.strip()
+        if kind in ("sum", "avg"):
+            return Metric(kind=kind, field=field)
+    raise ValueError(
+        f"unrecognized metric: {token!r} "
+        f"(expected count | sum:<field> | avg:<field>)"
+    )
 
 
 _INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024

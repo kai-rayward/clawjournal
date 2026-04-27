@@ -29,6 +29,37 @@ JSON. Reads `CAPABILITY_MATRIX` directly — the user overlay at
 (use `events doctor` to see overlay-aware verdicts; the overlay file
 itself is the source of truth for what was added).
 
+## events aggregate
+
+Cross-session aggregation over the `events` table. Emits top-N
+buckets with counts and an `other_count` tail. Bucket keys for the
+`workspace` dimension are anonymized via
+`clawjournal.redaction.anonymizer.Anonymizer().path()` —
+home-rooted absolute paths render as the literal `[REDACTED_PATH]`
+placeholder (consistent with every other share-time anonymized
+field). Non-path workspace segments (e.g. claude project names)
+pass through unchanged.
+
+Required: `--by <dim>[,<dim>...]` (up to 3 dimensions). Allowed
+dimensions: `client`, `type`, `confidence`, `source`, `lossiness`,
+`session`, `workspace`, `date`, `hour`. `date` buckets by
+`YYYY-MM-DD` (UTC); `hour` buckets by `YYYY-MM-DDTHH` (UTC).
+Allowed `--where` fields: `client`, `type`, `confidence`, `source`,
+`session`, `workspace`, `event_at`. Operators: `=`, `!=`, `>`,
+`>=`, `<`, `<=`, `in:v1|v2|...`.
+
+Metrics: `count` (default). The events domain does not currently
+expose numeric metric fields, so `sum:<field>` / `avg:<field>` are
+parsed but always reject — those metrics are useful on the cost
+domain (`events cost aggregate`) and the incidents `count` column
+(`events incidents aggregate`).
+
+Flags: `--metric` (default `count`), `--where`, `--since
+Nd|Nh|Nm|today|thisweek`, `--limit N` (default 10, ceiling 1000),
+`--canonical` (reserved; raises a usage error in v0.1 — see plan 10
+§Canonical vs raw for the deferred wire-up), `--json`,
+`--request-id <id>`.
+
 ## events cost ingest
 
 Extract token usage from already-recorded events and detect anomalies
@@ -37,10 +68,54 @@ Writes to `token_usage` and `cost_anomalies`.
 
 Flags: `--rebuild`, `--json`.
 
+## events cost aggregate
+
+Cross-session aggregation over `token_usage`. **Auto-partitions by
+`data_source`** when neither `--by data_source` nor
+`--where data_source=...` is set, so API truth and local estimates
+never silently mix in a sum.
+
+Caveat: `--limit N` truncates by primary metric DESC across the
+whole result, including the prepended `data_source` partition. If
+one partition's totals dominate, all top-N buckets may come from
+that single partition and the other partition's rows fall into
+the `other_count` tail. Use `--where data_source=api` (or
+`estimated`) to scope to one partition explicitly, and check
+`total - sum-of-bucket-primary-metric` to detect a truncated
+partition.
+
+Required: `--by`. Allowed dimensions: `model`, `provider`,
+`data_source`, `service_tier`, `pricing_table_version`, `session`,
+`workspace`, `date`. Allowed `--where` fields: `model`,
+`data_source`, `service_tier`, `pricing_table_version`, `session`,
+`workspace` (note: `provider` is a derivable dimension but not a
+filterable field; filter by `model` instead). Allowed metrics:
+`count`, `sum:<field>`, `avg:<field>` over `input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
+`thinking_tokens`, `cost_estimate`.
+
+Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
+`--request-id <id>`.
+
 ## events incidents detect
 
 Detect exact-repeat command and tool-call loops. Writes incidents to
 the `incidents` table keyed by `(session, kind, first_event_id)`.
+
+Flags: `--rebuild`, `--json`.
+
+## events incidents aggregate
+
+Cross-session aggregation over the `incidents` table.
+
+Required: `--by`. Allowed dimensions: `kind`, `confidence`,
+`session`, `workspace`, `date`. Allowed `--where` fields: `kind`,
+`confidence`, `session`, `workspace`, `created_at`. Metric `count`
+(default), or `sum:count` / `avg:count` over the per-incident
+`count` column (distinct from the aggregation count).
+
+Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
+`--request-id <id>`.
 
 ## events export
 

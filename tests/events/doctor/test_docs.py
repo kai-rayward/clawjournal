@@ -64,6 +64,12 @@ def test_schemas_topic_has_named_schema_records():
     assert "events doctor --json" in names
     assert "events features --json" in names
     assert "structured error envelope" in names
+    # Plan 10's aggregation envelope must be pinned in the schemas
+    # topic — every JSON-emitting agent surface gets a section.
+    assert any("aggregate" in name for name in names), (
+        f"events aggregate --json schema missing from schemas topic; "
+        f"found: {sorted(names)}"
+    )
 
 
 def test_commands_topic_covers_every_feature_record():

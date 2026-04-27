@@ -64,6 +64,44 @@ schemas: [ { name: <string>, version: <semver>, shape: <markdown> }, ... ]
 _meta: { request_id: <string> }   # only when --request-id is set
 ```
 
+## events aggregate --json (also: events incidents aggregate, events cost aggregate)
+
+The same envelope is emitted by all three aggregation subcommands;
+``domain`` distinguishes them. ``buckets`` are sorted by primary
+metric DESC with deterministic dimension-key ASC tie-break.
+
+```
+events_aggregate_schema_version: "1.0"
+domain: "events"|"incidents"|"cost"
+aggregation: {
+  by: [<dim-name>, ...],            # 1-3 dimensions
+  metric: [<metric-output-key>, ...],  # e.g. "count", "sum_input_tokens"
+  buckets: [
+    {
+      "key": { <dim-name>: <value-or-null>, ... },
+      "count": <int>,                # always present when count is a metric
+      "sum_<field>": <int|float>,    # one per sum: metric
+      "avg_<field>": <float>         # one per avg: metric
+    },
+    ...
+  ],
+  other_count: <int|float>,           # primary-metric value of rows truncated by --limit
+  total: <int|float>,                 # primary-metric value over all matching rows
+  auto_partitioned_by: "data_source"  # cost domain only, when fired
+}
+_meta: {
+  elapsed_ms: <int>,
+  rows_scanned: <int>,                # COUNT(*) of post-WHERE rows
+  request_id: <string>                # only when --request-id is set
+}
+```
+
+`workspace` and `session` bucket-key values that contain
+home-rooted absolute paths are anonymized via
+``Anonymizer().text()`` before emission (rendered as
+``[REDACTED_PATH]`` or ``codex:[REDACTED_PATH]`` for embedded
+paths). Plan 10 §Security #2.
+
 ## structured error envelope
 
 When `--json` is set on the new agent commands and an error occurs:
