@@ -3445,9 +3445,13 @@ def main() -> None:
         help="Top-N hits to return (default: 50, ceiling: 1000)",
     )
     events_search.add_argument(
-        "--snippet-length", type=int, default=None, metavar="CHARS",
-        dest="snippet_length",
-        help="Snippet window length in characters (default: 120, range 16-1024)",
+        "--snippet-tokens", type=int, default=None, metavar="N",
+        dest="snippet_tokens",
+        help="Snippet window length in tokens, not characters (default: 16, "
+             "range 1-64). FTS5 caps at 64 tokens internally; values above "
+             "64 are silently clamped, so the cap is enforced here. v0.1 "
+             "originally called this --snippet-length and claimed "
+             "characters — round-1 fix renames to match the FTS5 contract",
     )
     events_search.add_argument(
         "--include-held", action="store_true", dest="include_held",
@@ -4815,7 +4819,7 @@ def _run_events_search(args) -> None:
     )
     from .events.search import (
         DEFAULT_LIMIT,
-        DEFAULT_SNIPPET_LENGTH,
+        DEFAULT_SNIPPET_TOKENS,
         ensure_search_schema,
         parse_search_spec,
         rebuild_search_index,
@@ -4926,9 +4930,9 @@ def _run_events_search(args) -> None:
             source=args.source,
             since_iso=since_iso,
             limit=args.limit if args.limit is not None else DEFAULT_LIMIT,
-            snippet_length=(
-                args.snippet_length if args.snippet_length is not None
-                else DEFAULT_SNIPPET_LENGTH
+            snippet_tokens=(
+                args.snippet_tokens if args.snippet_tokens is not None
+                else DEFAULT_SNIPPET_TOKENS
             ),
             include_held=bool(args.include_held),
         )

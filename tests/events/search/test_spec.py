@@ -7,9 +7,11 @@ import pytest
 from clawjournal.events.aggregate.spec import Predicate
 from clawjournal.events.search import (
     DEFAULT_LIMIT,
-    DEFAULT_SNIPPET_LENGTH,
+    DEFAULT_SNIPPET_TOKENS,
     HARD_LIMIT_CEILING,
     MAX_QUERY_BYTES,
+    MAX_SNIPPET_TOKENS,
+    MIN_SNIPPET_TOKENS,
     SearchSpec,
 )
 
@@ -18,7 +20,7 @@ def test_defaults():
     spec = SearchSpec(query="hello")
     assert spec.query == "hello"
     assert spec.limit == DEFAULT_LIMIT
-    assert spec.snippet_length == DEFAULT_SNIPPET_LENGTH
+    assert spec.snippet_tokens == DEFAULT_SNIPPET_TOKENS
     assert spec.include_held is False
 
 
@@ -45,11 +47,17 @@ def test_limit_above_ceiling_rejected():
         SearchSpec(query="x", limit=HARD_LIMIT_CEILING + 1)
 
 
-def test_snippet_length_bounds():
+def test_snippet_tokens_bounds():
+    """FTS5 caps ``snippet()`` at 64 tokens; SearchSpec enforces the
+    cap so the SQL builder never relies on SQLite's silent clamp."""
+
     with pytest.raises(ValueError):
-        SearchSpec(query="x", snippet_length=4)
+        SearchSpec(query="x", snippet_tokens=MIN_SNIPPET_TOKENS - 1)
     with pytest.raises(ValueError):
-        SearchSpec(query="x", snippet_length=99999)
+        SearchSpec(query="x", snippet_tokens=MAX_SNIPPET_TOKENS + 1)
+    # Boundaries are inclusive.
+    SearchSpec(query="x", snippet_tokens=MIN_SNIPPET_TOKENS)
+    SearchSpec(query="x", snippet_tokens=MAX_SNIPPET_TOKENS)
 
 
 def test_unknown_filter_field_rejected():

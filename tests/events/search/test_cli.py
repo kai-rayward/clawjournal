@@ -230,6 +230,23 @@ def test_oversize_query_rejected(isolated_home, tmp_path):
     assert payload["error"]["kind"] == "usage_error"
 
 
+def test_snippet_tokens_above_64_rejected_at_cli(isolated_home, tmp_path):
+    """Round 1: ``--snippet-tokens`` is enforced at the spec layer to
+    fail loudly above FTS5's 64-token internal cap, instead of letting
+    SQLite silently clamp. The CLI surface must surface the spec
+    rejection as ``usage_error`` (exit 2)."""
+
+    _seed_db(tmp_path)
+    result = _run(
+        ["events", "search", "authentication", "--snippet-tokens", "100", "--json"],
+        isolated_home,
+    )
+    assert result.returncode == 2, result.stderr
+    payload = json.loads(result.stderr)
+    assert payload["error"]["kind"] == "usage_error"
+    assert "snippet-tokens" in payload["error"]["message"]
+
+
 def test_features_topic_advertises_search(isolated_home):
     """Drift gate: `events features --json` must list events.search
     once 11 ships. The ``features`` field is the list of ids."""

@@ -225,7 +225,7 @@ def test_filter_client_narrows_results(conn):
         query="common_token",
         client=("claude",),
         limit=50,
-        snippet_length=120,
+        snippet_tokens=16,
         include_held=False,
     )
     result = run(spec, conn)
@@ -250,7 +250,7 @@ def test_filter_in_clause_with_multiple_values(conn):
         query="shared_token",
         client=("claude", "codex"),
         limit=50,
-        snippet_length=120,
+        snippet_tokens=16,
         include_held=False,
     )
     result = run(spec, conn)

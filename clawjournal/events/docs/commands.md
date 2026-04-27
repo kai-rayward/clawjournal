@@ -159,8 +159,19 @@ in `raw_json` produces a search hit whose snippet shows
 `[SECRET_REDACTED]`, not the plaintext (plan 11 §Security #4).
 
 Result-set caps: default `--limit 50`, ceiling 1000. Query string
-cap: 4096 bytes (UTF-8). Snippet length: default 120 chars, range
-16-1024.
+cap: 4096 bytes (UTF-8). Snippet window: default 16 tokens, range
+1-64 (FTS5's documented hard ceiling on `snippet()` is 64 tokens
+— values above are silently clamped, so the cap is enforced
+locally to fail loudly instead).
+
+Index storage caveat: FTS5 indexes the literal contents of
+`events.raw_json`, so anything in the original vendor JSONL line
+ends up in `~/.clawjournal/index.db`'s FTS structures. The index
+file inherits the same filesystem permissions as the source
+JSONL — no new exfiltration surface — but if you redact secrets
+from the underlying `events.raw_json` post-hoc, re-run
+`events search --rebuild-index` to scrub the FTS table too. Plan 11
+§Security #5.
 
 Special modes:
 - `--rebuild-index` reindexes `events_fts` from `events` (FTS5's
@@ -168,7 +179,7 @@ Special modes:
   or any surgery on `events` that bypassed the triggers.
 
 Flags: `--client`, `--type`, `--confidence`, `--session`,
-`--source`, `--since`, `--limit`, `--snippet-length`,
+`--source`, `--since`, `--limit`, `--snippet-tokens`,
 `--include-held`, `--rebuild-index`, `--json`, `--request-id <id>`.
 
 ## events export

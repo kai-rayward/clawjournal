@@ -34,18 +34,22 @@ from clawjournal.events.search.schema import (
 )
 from clawjournal.events.search.spec import (
     DEFAULT_LIMIT,
-    DEFAULT_SNIPPET_LENGTH,
+    DEFAULT_SNIPPET_TOKENS,
     HARD_LIMIT_CEILING,
     MAX_QUERY_BYTES,
+    MAX_SNIPPET_TOKENS,
+    MIN_SNIPPET_TOKENS,
     SearchSpec,
 )
 
 __all__ = [
     "DEFAULT_LIMIT",
-    "DEFAULT_SNIPPET_LENGTH",
+    "DEFAULT_SNIPPET_TOKENS",
     "EVENTS_SEARCH_SCHEMA_VERSION",
     "HARD_LIMIT_CEILING",
     "MAX_QUERY_BYTES",
+    "MAX_SNIPPET_TOKENS",
+    "MIN_SNIPPET_TOKENS",
     "SearchHit",
     "SearchResult",
     "SearchSpec",

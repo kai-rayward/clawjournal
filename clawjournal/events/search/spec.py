@@ -15,9 +15,16 @@ from clawjournal.events.aggregate.spec import Predicate
 
 DEFAULT_LIMIT = 50
 HARD_LIMIT_CEILING = 1000
-DEFAULT_SNIPPET_LENGTH = 120
-MIN_SNIPPET_LENGTH = 16
-MAX_SNIPPET_LENGTH = 1024
+# FTS5's ``snippet(t, col, start, end, ellipsis, N)`` takes ``N`` as a
+# count of tokens (not characters), with a documented hard ceiling of
+# 64. Values above the ceiling are silently clamped by SQLite, so we
+# enforce the cap here to avoid advertising a range we can't honor.
+# v0.1's original ``--snippet-length`` flag claimed "characters" with
+# a 1024 ceiling — round 1 fixes the unit mismatch by renaming the
+# constant and the CLI flag.
+DEFAULT_SNIPPET_TOKENS = 16
+MIN_SNIPPET_TOKENS = 1
+MAX_SNIPPET_TOKENS = 64
 MAX_QUERY_BYTES = 4096
 
 # Logical names allowed in ``--type=...`` / ``--client=...`` /
@@ -47,9 +54,8 @@ class SearchSpec:
     filters: tuple[Predicate, ...] = ()
     since_iso: str | None = None
     limit: int = DEFAULT_LIMIT
-    snippet_length: int = DEFAULT_SNIPPET_LENGTH
+    snippet_tokens: int = DEFAULT_SNIPPET_TOKENS
     include_held: bool = False
-    canonical: bool = False
 
     def __post_init__(self) -> None:
         if not self.query or not self.query.strip():
@@ -65,10 +71,10 @@ class SearchSpec:
             raise ValueError(
                 f"--limit ceiling is {HARD_LIMIT_CEILING} (got {self.limit})"
             )
-        if not (MIN_SNIPPET_LENGTH <= self.snippet_length <= MAX_SNIPPET_LENGTH):
+        if not (MIN_SNIPPET_TOKENS <= self.snippet_tokens <= MAX_SNIPPET_TOKENS):
             raise ValueError(
-                f"--snippet-length must be between {MIN_SNIPPET_LENGTH} and "
-                f"{MAX_SNIPPET_LENGTH} (got {self.snippet_length})"
+                f"--snippet-tokens must be between {MIN_SNIPPET_TOKENS} and "
+                f"{MAX_SNIPPET_TOKENS} (got {self.snippet_tokens})"
             )
         for predicate in self.filters:
             if predicate.field not in SEARCH_FILTER_FIELDS:
@@ -80,11 +86,11 @@ class SearchSpec:
 
 __all__ = [
     "DEFAULT_LIMIT",
-    "DEFAULT_SNIPPET_LENGTH",
+    "DEFAULT_SNIPPET_TOKENS",
     "HARD_LIMIT_CEILING",
     "MAX_QUERY_BYTES",
-    "MAX_SNIPPET_LENGTH",
-    "MIN_SNIPPET_LENGTH",
+    "MAX_SNIPPET_TOKENS",
+    "MIN_SNIPPET_TOKENS",
     "SEARCH_FILTER_FIELDS",
     "SearchSpec",
 ]

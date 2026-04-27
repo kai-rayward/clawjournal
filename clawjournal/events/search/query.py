@@ -80,9 +80,8 @@ def parse_search_spec(
     source: str | None = None,
     since_iso: str | None = None,
     limit: int,
-    snippet_length: int,
+    snippet_tokens: int,
     include_held: bool,
-    canonical: bool = False,
 ) -> SearchSpec:
     """Build a validated ``SearchSpec`` from already-parsed CLI args.
 
@@ -107,9 +106,8 @@ def parse_search_spec(
         filters=tuple(filters),
         since_iso=since_iso,
         limit=limit,
-        snippet_length=snippet_length,
+        snippet_tokens=snippet_tokens,
         include_held=include_held,
-        canonical=canonical,
     )
 
 
@@ -185,18 +183,26 @@ def _build_hits_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
     # snippet() helper gets the highlight markers; the render layer
     # turns them into <mark>...</mark> after running snippet through
     # the secrets redactor (plan 11 §Security #4).
-    snippet_chars = spec.snippet_length
+    #
+    # FTS5 ``snippet()`` takes max-tokens (not chars), with a hard
+    # ceiling of 64. SearchSpec already enforces 1 <= snippet_tokens
+    # <= 64, so it is safe to interpolate as a fixed integer literal.
+    # Round-1 fix: v0.1 originally exposed ``--snippet-length`` as
+    # "characters" with a 1024 ceiling, but FTS5 silently clamped
+    # everything >=64 to 64. The flag, spec field, and constants are
+    # now ``--snippet-tokens`` to match the FTS5 contract.
+    snippet_tokens = spec.snippet_tokens
     sql = (
         "SELECT e.id, s.session_key, e.event_at, e.client, e.type, "
         "       e.confidence, e.source, e.source_path, e.source_offset, "
         "       e.seq, "
-        f"       snippet(events_fts, 0, '', '', '...', {snippet_chars}), "
+        "       snippet(events_fts, 0, '', '', '...', " + str(snippet_tokens) + "), "
         "       bm25(events_fts) "
         "FROM events_fts "
         "JOIN events AS e ON e.id = events_fts.rowid "
         "JOIN event_sessions AS s ON s.id = e.session_id "
         "LEFT JOIN sessions AS ws ON ws.session_key = s.session_key "
-        f"WHERE events_fts MATCH ? {where_clause}"
+        "WHERE events_fts MATCH ? " + where_clause +
         "ORDER BY bm25(events_fts) ASC, e.id ASC "
         "LIMIT ?"
     )
@@ -212,7 +218,7 @@ def _build_count_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
         "JOIN events AS e ON e.id = events_fts.rowid "
         "JOIN event_sessions AS s ON s.id = e.session_id "
         "LEFT JOIN sessions AS ws ON ws.session_key = s.session_key "
-        f"WHERE events_fts MATCH ? {where_clause}"
+        "WHERE events_fts MATCH ? " + where_clause
     )
     bound = [spec.query] + params
     return sql, bound
