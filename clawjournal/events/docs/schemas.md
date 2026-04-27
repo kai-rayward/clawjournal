@@ -122,7 +122,7 @@ hits: [
       "source_offset": <int>,
       "seq": <int>
     },
-    "snippet": <string>,               # secrets redacted; v0.1 emits no <mark>
+    "snippet": <string>,               # secrets-redacted + path-anonymized; v0.1 emits no <mark>
     "bm25": <float>,                   # FTS5 relevance, smaller is closer
     "timeline_url": <string>           # clawjournal://session/<key>#event-<id>
   },
@@ -138,9 +138,14 @@ _meta: {
 ```
 
 `session_key` and `raw_ref.source_path` are anonymized before
-emission. Snippets are run through `clawjournal/redaction/secrets.py`
-before emit, so secrets that the regex would catch on export render
-as `[SECRET_REDACTED]` here too. Plan 11 §Security #3 + #4.
+emission. Snippets go through a two-pass scrub: first
+`clawjournal/redaction/secrets.py` (secrets → typed placeholder),
+then `Anonymizer().text()` (home-rooted absolute paths and bare
+usernames → `[REDACTED_PATH]` / `[REDACTED_USERNAME]`). Plan 11
+§Security #3 + #4 plus §Acceptance ("grep for `/Users/` or
+`/home/` in search JSON output is empty"). Round-4 fix: v0.1 ran
+only the secrets pass on snippets, leaking absolute paths from
+ENOENT-shaped error messages and tool-call argument JSON.
 
 ## structured error envelope
 
