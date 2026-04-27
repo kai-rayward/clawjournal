@@ -151,6 +151,64 @@ def test_triggers_keep_fts_in_sync_on_insert_and_delete(conn):
     assert result_after.rows_matched == 0
 
 
+def test_ensure_search_schema_recovers_from_partial_migration(tmp_path):
+    """Round 3: if ``ensure_search_schema`` previously created
+    ``events_fts`` but failed before installing the triggers (because
+    ``events`` did not yet exist), a later call after ingest should
+    backfill the FTS index instead of short-circuiting on
+    ``pre_existing_fts``. The earlier check was correct for the
+    happy path but missed this recovery case."""
+
+    db_path = tmp_path / "partial.db"
+    c = sqlite3.connect(str(db_path))
+    # Phase 1: simulate a partial migration — create events_fts but
+    # NOT the triggers, and NOT the events table. This is the state
+    # we'd be in if the first ensure_search_schema call hit "no such
+    # table: events" while creating the triggers.
+    c.execute(
+        "CREATE VIRTUAL TABLE events_fts USING fts5("
+        "raw_json, content='events', content_rowid='id', "
+        "tokenize=\"unicode61 remove_diacritics 2 tokenchars '-_'\")"
+    )
+    c.commit()
+    c.close()
+
+    # Phase 2: events ingest happens — events table created, rows
+    # inserted. The triggers don't exist yet so events_fts stays empty.
+    c = sqlite3.connect(str(db_path))
+    ensure_events_schema(c)
+    c.executescript(SESSIONS_TABLE_SQL)
+    cur = c.execute(
+        "INSERT INTO event_sessions (session_key, client, started_at, "
+        "status) VALUES ('claude:proj:s1', 'claude', "
+        "'2026-04-21T10:00:00Z', 'ended')"
+    )
+    sid = cur.lastrowid
+    c.execute(
+        "INSERT INTO events (session_id, type, event_at, ingested_at, "
+        "source, source_path, source_offset, seq, client, confidence, "
+        "lossiness, raw_json) VALUES (?, 'tool_result', "
+        "'2026-04-21T10:00:00Z', '2026-04-21T10:00:00Z', 'claude-jsonl', "
+        "'/x', 0, 0, 'claude', 'high', 'none', "
+        "'{\"text\": \"recovery_marker_token\"}')",
+        (sid,),
+    )
+    c.commit()
+    c.close()
+
+    # Phase 3: a fresh ensure_search_schema call should see
+    # FTS-empty + events-non-empty and trigger a backfill, leaving
+    # the search functional.
+    c = sqlite3.connect(str(db_path))
+    ensure_search_schema(c)
+    result = run(SearchSpec(query="recovery_marker_token"), c)
+    c.close()
+    assert result.rows_matched == 1, (
+        f"partial-migration recovery did not backfill FTS; "
+        f"hits={[h.event_id for h in result.hits]}"
+    )
+
+
 def test_rebuild_index_recovers_after_truncation(conn):
     sid = _add_session(conn, "claude:proj:s1")
     _add_event(conn, sid, '{"text": "needle in the haystack"}')

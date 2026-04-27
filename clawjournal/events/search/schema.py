@@ -71,33 +71,37 @@ END;
 def ensure_search_schema(conn: sqlite3.Connection) -> None:
     """Create the FTS virtual table + triggers if absent.
 
-    Idempotent — safe to call on every CLI invocation. The first call
-    on an existing index also runs a one-shot ``rebuild`` to backfill
-    rows that were inserted before the triggers existed; subsequent
-    calls find an already-populated FTS table and skip the rebuild.
+    Idempotent — safe to call on every CLI invocation. Backfills the
+    FTS index whenever it is empty but ``events`` is not, which
+    catches both the fresh-install case AND a recovery from partial
+    migration: if a previous call created ``events_fts`` but failed
+    to create the triggers (because ``events`` did not yet exist),
+    a later call after ``events ingest`` populated ``events`` would
+    have left the FTS out of sync. Round-3 self-review fix — the
+    earlier ``pre_existing_fts`` short-circuit was correct for the
+    happy path but missed the partial-migration recovery.
     """
 
     conn.execute("PRAGMA foreign_keys=ON")
-
-    pre_existing_fts = bool(
-        conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type='table' AND name='events_fts'"
-        ).fetchone()
-    )
-
     conn.executescript(EVENTS_FTS_TABLE_SQL)
     conn.executescript(EVENTS_FTS_TRIGGERS_SQL)
 
-    if pre_existing_fts:
-        return
-
-    # Fresh table — backfill from the events table. Skipped when
-    # `events` is empty (no-op rebuild is cheap but not free).
+    # ``events_fts_docsize`` is FTS5's internal docsize-shadow table;
+    # it has one row per indexed document. ``SELECT * FROM events_fts``
+    # in external-content mode reads through to the events table, so
+    # it cannot tell "indexed" from "not indexed" — counting docsize
+    # is the only reliable way to detect the FTS-empty state. When
+    # FTS-empty + events-non-empty, run a backfill so partial-
+    # migration recovery (FTS table created without triggers, then
+    # ingest happens) self-heals on the next search invocation.
+    fts_empty = (
+        conn.execute("SELECT count(*) FROM events_fts_docsize").fetchone()[0]
+        == 0
+    )
     has_events = bool(
         conn.execute("SELECT 1 FROM events LIMIT 1").fetchone()
     )
-    if has_events:
+    if fts_empty and has_events:
         rebuild_search_index(conn)
 
 
