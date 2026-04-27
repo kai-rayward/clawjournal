@@ -74,7 +74,7 @@ def result_to_payload(
 def _hit_to_dict(hit: SearchHit, *, anonymizer: Anonymizer) -> dict[str, Any]:
     safe_session_key = anonymizer.text(hit.session_key)
     safe_source_path = anonymizer.path(hit.source_path) if hit.source_path else ""
-    redacted_snippet, _, _ = redact_text(hit.snippet) if hit.snippet else ("", 0, [])
+    safe_snippet = _scrub_snippet(hit.snippet, anonymizer=anonymizer)
     timeline_url = (
         f"clawjournal://session/{safe_session_key}#event-{hit.event_id}"
     )
@@ -91,10 +91,37 @@ def _hit_to_dict(hit: SearchHit, *, anonymizer: Anonymizer) -> dict[str, Any]:
             "source_offset": hit.source_offset,
             "seq": hit.seq,
         },
-        "snippet": redacted_snippet,
+        "snippet": safe_snippet,
         "bm25": hit.bm25,
         "timeline_url": timeline_url,
     }
+
+
+def _scrub_snippet(snippet: str, *, anonymizer: Anonymizer) -> str:
+    """Two-pass scrub on the FTS5 snippet:
+
+    1. ``redact_text`` — replaces credentials with typed
+       placeholders (plan 11 §Security #4).
+    2. ``anonymizer.text`` — replaces home-rooted absolute paths
+       and bare usernames with ``[REDACTED_PATH]`` /
+       ``[REDACTED_USERNAME]``. Plan 11 §Acceptance pins that
+       ``/Users/`` and ``/home/`` never appear in JSON output —
+       round-4 self-review fix; v0.1 redacted secrets but left
+       path leaks in snippets because the snippet content is
+       extracted from ``raw_json`` which the indexer kept verbatim.
+
+    Order matters: secrets first, then anonymizer. The anonymizer's
+    regex looks for ``/Users/<u>/...`` patterns and won't trip over
+    secret placeholders; the secrets regex would not match
+    ``[REDACTED_PATH]`` either way, so the order is robust either
+    way for what we ship today, but doing secrets first matches the
+    "redact first, mark second" rule from plan 11 §Security #4.
+    """
+
+    if not snippet:
+        return ""
+    redacted, _, _ = redact_text(snippet)
+    return anonymizer.text(redacted)
 
 
 def render_human(
@@ -117,12 +144,10 @@ def render_human(
     else:
         for hit in result.hits:
             safe_session = anonymizer.text(hit.session_key)
-            redacted_snippet, _, _ = (
-                redact_text(hit.snippet) if hit.snippet else ("", 0, [])
-            )
+            safe_snippet = _scrub_snippet(hit.snippet, anonymizer=anonymizer)
             buf.write(
                 f"{hit.bm25:>8.3f}  {safe_session}  {hit.type}  "
-                f"{hit.event_at or '∅'}  {redacted_snippet}\n"
+                f"{hit.event_at or '∅'}  {safe_snippet}\n"
             )
         buf.write(
             f"\n{len(result.hits)} of {result.rows_matched} matches "

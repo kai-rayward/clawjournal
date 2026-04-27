@@ -87,6 +87,40 @@ def test_human_render_includes_redacted_snippet():
     assert secret_like not in text
 
 
+def test_snippet_path_anonymized(monkeypatch):
+    """Round 4: snippet content is extracted from ``raw_json`` which
+    the indexer keeps verbatim. Plan 11 §Acceptance says
+    ``/Users/`` and ``/home/`` must never appear in JSON output —
+    v0.1 ran ``redact_text`` (secrets) on snippets but missed the
+    path-anonymization pass."""
+
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
+    snippet_with_path = (
+        "ENOENT: no such file or directory, open "
+        "/Users/synthetic-user/proj/missing.json"
+    )
+    payload = json.loads(render_json(_result(snippet=snippet_with_path)))
+    out = payload["hits"][0]["snippet"]
+    assert "synthetic-user" not in out
+    assert "/Users/" not in out
+    assert "[REDACTED_PATH]" in out
+
+
+def test_snippet_redacts_both_secrets_and_paths(monkeypatch):
+    """Both scrub passes apply: secret placeholder lands AND home-
+    rooted path is collapsed."""
+
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
+    secret = "sk-" + "C" * 48
+    snippet = (
+        f"call to {secret} from /Users/synthetic-user/proj/app.py"
+    )
+    payload = json.loads(render_json(_result(snippet=snippet)))
+    out = payload["hits"][0]["snippet"]
+    assert secret not in out
+    assert "/Users/synthetic-user" not in out
+
+
 def test_human_render_no_hits_message():
     result = SearchResult(
         spec=SearchSpec(query="missing"),
