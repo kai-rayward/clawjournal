@@ -117,6 +117,60 @@ Required: `--by`. Allowed dimensions: `kind`, `confidence`,
 Flags: `--metric`, `--where`, `--since`, `--limit`, `--json`,
 `--request-id <id>`.
 
+## events search
+
+Cross-session full-text search over `events.raw_json` using SQLite
+FTS5. Backed by an external-content virtual table `events_fts` in
+`{INDEX_DB}`; insert/delete/update triggers on `events` keep it in
+lockstep. The schema is bootstrapped on first use — no separate
+migration step.
+
+Required: `<query>` (FTS5 MATCH expression — phrase queries
+`"tool error"`, AND/OR/NOT, prefix `auth*`, NEAR/N). Empty terms
+without operators are AND-ed by FTS5 implicitly. Query is
+parameterized (bound to `MATCH ?`) — never string-interpolated.
+
+Tokenizer: `unicode61 remove_diacritics 2 tokenchars '-_'`. Hyphen
+and underscore are part of tokens, so `snake_case` and `kebab-case`
+index as single tokens; a search for `rate limit` does NOT match
+`rate-limit` (tradeoff documented in plan 11 §Open questions).
+
+To search for a bareword that contains a hyphen (e.g. `rate-limit`,
+`my-tool`), wrap it in phrase quotes: `events search '"rate-limit"'`.
+FTS5's query parser treats unquoted `foo-bar` as a column filter on
+the non-existent column `foo` and raises `no such column` — the CLI
+maps that error to a usage_error with this hint.
+
+Allowed filter flags: `--client`, `--type`, `--confidence`,
+`--session`, `--source` (each repeat or comma-separate; `--session`
+takes a single value), `--since Nd|Nh|Nm|today|thisweek`. All
+filters land as parameterized predicates.
+
+Hold-state: events from sessions in `pending_review` or active
+`embargoed` are excluded by default. Pass `--include-held` to
+surface them. Sessions that have not been touched by the workbench
+(no `sessions` row) are NOT held — they pass through unchanged.
+
+Output bucket-key values run through `Anonymizer().path()` for
+`raw_ref.source_path` and `Anonymizer().text()` for `session_key`,
+matching the `events aggregate` treatment. Snippets run through
+`redaction/secrets.py` before emit so a fixture with a known secret
+in `raw_json` produces a search hit whose snippet shows
+`[SECRET_REDACTED]`, not the plaintext (plan 11 §Security #4).
+
+Result-set caps: default `--limit 50`, ceiling 1000. Query string
+cap: 4096 bytes (UTF-8). Snippet length: default 120 chars, range
+16-1024.
+
+Special modes:
+- `--rebuild-index` reindexes `events_fts` from `events` (FTS5's
+  documented `'rebuild'` command). Use after `DELETE FROM events_fts`
+  or any surgery on `events` that bypassed the triggers.
+
+Flags: `--client`, `--type`, `--confidence`, `--session`,
+`--source`, `--since`, `--limit`, `--snippet-length`,
+`--include-held`, `--rebuild-index`, `--json`, `--request-id <id>`.
+
 ## events export
 
 Package a session into a self-describing JSON bundle (events,

@@ -102,6 +102,46 @@ home-rooted absolute paths are anonymized via
 ``[REDACTED_PATH]`` or ``codex:[REDACTED_PATH]`` for embedded
 paths). Plan 10 §Security #2.
 
+## events search --json
+
+```
+events_search_schema_version: "1.0"
+query: <string>                        # the user's MATCH expression, verbatim
+rewritten_match: <string>              # the expression actually bound to MATCH
+hits: [
+  {
+    "event_id": <int>,
+    "session_key": <string>,           # anonymized via Anonymizer().text()
+    "event_at": <iso-timestamp|null>,
+    "client": <string>,
+    "type": <string>,
+    "confidence": <string>,
+    "source": <string>,
+    "raw_ref": {
+      "source_path": <string>,         # anonymized via Anonymizer().path()
+      "source_offset": <int>,
+      "seq": <int>
+    },
+    "snippet": <string>,               # secrets redacted; v0.1 emits no <mark>
+    "bm25": <float>,                   # FTS5 relevance, smaller is closer
+    "timeline_url": <string>           # clawjournal://session/<key>#event-<id>
+  },
+  ...
+]
+_meta: {
+  elapsed_ms: <int>,
+  rows_matched: <int>,                 # COUNT(*) before --limit truncation
+  rows_returned: <int>,                # = len(hits)
+  include_held: <bool>,                # echoes the user's --include-held flag
+  request_id: <string>                 # only when --request-id is set
+}
+```
+
+`session_key` and `raw_ref.source_path` are anonymized before
+emission. Snippets are run through `clawjournal/redaction/secrets.py`
+before emit, so secrets that the regex would catch on export render
+as `[SECRET_REDACTED]` here too. Plan 11 §Security #3 + #4.
+
 ## structured error envelope
 
 When `--json` is set on the new agent commands and an error occurs:
