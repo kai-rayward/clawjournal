@@ -151,6 +151,71 @@ def test_triggers_keep_fts_in_sync_on_insert_and_delete(conn):
     assert result_after.rows_matched == 0
 
 
+def test_partial_migration_rebuild_persists_across_close(tmp_path):
+    """Round 7: the rebuild from ``ensure_search_schema``'s partial-
+    migration recovery must commit. sqlite3.connect()'s default
+    isolation level auto-begins a transaction on FTS5's 'rebuild'
+    insert; without an explicit commit, conn.close() rolls the
+    rebuild back. The earlier recovery test queried before close so
+    it never noticed the rollback. This test reopens and verifies
+    the FTS index actually persisted.
+    """
+
+    db_path = tmp_path / "rebuild_persist.db"
+
+    # Phase 1: simulate partial migration (FTS table only, no triggers).
+    c = sqlite3.connect(str(db_path))
+    c.execute(
+        "CREATE VIRTUAL TABLE events_fts USING fts5("
+        "raw_json, content='events', content_rowid='id', "
+        "tokenize=\"unicode61 remove_diacritics 2 tokenchars '-_'\")"
+    )
+    c.commit()
+    c.close()
+
+    # Phase 2: events ingest populates events without firing triggers.
+    c = sqlite3.connect(str(db_path))
+    ensure_events_schema(c)
+    c.executescript(SESSIONS_TABLE_SQL)
+    cur = c.execute(
+        "INSERT INTO event_sessions (session_key, client, started_at, "
+        "status) VALUES ('claude:proj:s1', 'claude', "
+        "'2026-04-21T10:00:00Z', 'ended')"
+    )
+    sid = cur.lastrowid
+    c.execute(
+        "INSERT INTO events (session_id, type, event_at, ingested_at, "
+        "source, source_path, source_offset, seq, client, confidence, "
+        "lossiness, raw_json) VALUES (?, 'tool_result', "
+        "'2026-04-21T10:00:00Z', '2026-04-21T10:00:00Z', 'claude-jsonl', "
+        "'/x', 0, 0, 'claude', 'high', 'none', "
+        "'{\"text\": \"persistence_marker_token\"}')",
+        (sid,),
+    )
+    c.commit()
+    c.close()
+
+    # Phase 3: ensure_search_schema runs and (we hope) commits the
+    # rebuild. Close without an explicit commit on this connection.
+    c = sqlite3.connect(str(db_path))
+    ensure_search_schema(c)
+    c.close()
+
+    # Phase 4: reopen with a fresh connection. If the rebuild was
+    # rolled back by Phase 3's close, docsize is 0 and the next
+    # ensure_search_schema call would have to rebuild again — an
+    # eternal loop in production.
+    c2 = sqlite3.connect(str(db_path))
+    docs = c2.execute(
+        "SELECT count(*) FROM events_fts_docsize"
+    ).fetchone()[0]
+    c2.close()
+    assert docs == 1, (
+        f"FTS rebuild was rolled back at close: docsize_count={docs}; "
+        f"each subsequent search would re-rebuild and re-roll-back"
+    )
+
+
 def test_ensure_search_schema_recovers_from_partial_migration(tmp_path):
     """Round 3: if ``ensure_search_schema`` previously created
     ``events_fts`` but failed before installing the triggers (because

@@ -54,10 +54,14 @@ def result_to_payload(
 ) -> dict[str, Any]:
     anonymizer = Anonymizer()
     hits_out = [_hit_to_dict(hit, anonymizer=anonymizer) for hit in result.hits]
+    # Anonymize the user's MATCH expression on echo. A user searching for
+    # paths (`events search "/Users/me/secret"`) would otherwise round-trip
+    # the path verbatim into any agent-side log of the JSON envelope. Same
+    # treatment the error-envelope `message` gets in `doctor/envelope.py`.
     payload: dict[str, Any] = {
         "events_search_schema_version": EVENTS_SEARCH_SCHEMA_VERSION,
-        "query": result.spec.query,
-        "rewritten_match": result.rewritten_match,
+        "query": anonymizer.text(result.spec.query),
+        "rewritten_match": anonymizer.text(result.rewritten_match),
         "hits": hits_out,
         "_meta": {
             "elapsed_ms": result.elapsed_ms,
@@ -137,8 +141,11 @@ def render_human(
     anonymizer = Anonymizer()
     buf = StringIO()
     if not result.hits:
+        # Anonymize the user's query in the no-matches message so a path-
+        # shaped query doesn't echo back unredacted; see result_to_payload
+        # above for the rationale.
         buf.write(
-            f"no matches for {result.spec.query!r} "
+            f"no matches for {anonymizer.text(result.spec.query)!r} "
             f"(searched in {result.elapsed_ms} ms)\n"
         )
     else:
@@ -147,7 +154,7 @@ def render_human(
             safe_snippet = _scrub_snippet(hit.snippet, anonymizer=anonymizer)
             buf.write(
                 f"{hit.bm25:>8.3f}  {safe_session}  {hit.type}  "
-                f"{hit.event_at or '∅'}  {safe_snippet}\n"
+                f"{hit.event_at or '-'}  {safe_snippet}\n"
             )
         buf.write(
             f"\n{len(result.hits)} of {result.rows_matched} matches "

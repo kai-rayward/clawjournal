@@ -103,6 +103,15 @@ def ensure_search_schema(conn: sqlite3.Connection) -> None:
     )
     if fts_empty and has_events:
         rebuild_search_index(conn)
+        # Round-7 fix: must commit. sqlite3.connect() defaults to
+        # isolation_level="" which auto-begins a transaction on DML
+        # (the FTS5 'rebuild' insert qualifies). Without an explicit
+        # commit, the rebuild lands in an open transaction; a later
+        # conn.close() rolls it back, and the next ensure_search_schema
+        # call re-detects FTS-empty and rebuilds again — an eternal
+        # rebuild loop with rolled-back work. The earlier search-
+        # recovery test masked the bug by querying before close.
+        conn.commit()
 
 
 def rebuild_search_index(conn: sqlite3.Connection) -> None:

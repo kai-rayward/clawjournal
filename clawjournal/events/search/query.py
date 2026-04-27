@@ -169,7 +169,15 @@ def run(spec: SearchSpec, conn: sqlite3.Connection) -> SearchResult:
     return SearchResult(
         spec=spec,
         hits=hits,
-        rewritten_match=spec.query.strip(),
+        # `rewritten_match` is the value actually bound to FTS5's MATCH
+        # predicate. Today it's identical to `spec.query`; the field
+        # exists so downstream consumers can pin the contract before any
+        # query rewriting (synonym expansion, alias resolution, etc.) is
+        # introduced. Round-7 fix: was previously `spec.query.strip()`,
+        # which both lied about being "rewritten" AND could differ from
+        # what was actually bound (the SQL builder uses spec.query
+        # unstripped).
+        rewritten_match=spec.query,
         rows_matched=rows_matched,
         elapsed_ms=elapsed_ms,
     )
@@ -177,24 +185,18 @@ def run(spec: SearchSpec, conn: sqlite3.Connection) -> SearchResult:
 
 def _build_hits_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
     where_clause, params = _build_where(spec)
-    # The MATCH parameter MUST be bound (not interpolated). FTS5's
-    # snippet() helper gets the highlight markers; the render layer
-    # turns them into <mark>...</mark> after running snippet through
-    # the secrets redactor (plan 11 §Security #4).
-    #
-    # FTS5 ``snippet()`` takes max-tokens (not chars), with a hard
-    # ceiling of 64. SearchSpec already enforces 1 <= snippet_tokens
-    # <= 64, so it is safe to interpolate as a fixed integer literal.
-    # Round-1 fix: v0.1 originally exposed ``--snippet-length`` as
-    # "characters" with a 1024 ceiling, but FTS5 silently clamped
-    # everything >=64 to 64. The flag, spec field, and constants are
-    # now ``--snippet-tokens`` to match the FTS5 contract.
-    snippet_tokens = spec.snippet_tokens
+    # Both `?`-bound: the MATCH expression (security-critical — FTS5
+    # parses it as a query language) and snippet()'s max-tokens (just
+    # consistency with the rest of the parameter binding pattern).
+    # SearchSpec enforces 1 <= snippet_tokens <= 64 so the latter is
+    # already trusted, but binding it removes one source of SQL
+    # composition. SQLite accepts integer binding for snippet()'s
+    # numeric args — verified against sqlite 3.x.
     sql = (
         "SELECT e.id, s.session_key, e.event_at, e.client, e.type, "
         "       e.confidence, e.source, e.source_path, e.source_offset, "
         "       e.seq, "
-        "       snippet(events_fts, 0, '', '', '...', " + str(snippet_tokens) + "), "
+        "       snippet(events_fts, 0, '', '', '...', ?), "
         "       bm25(events_fts) "
         "FROM events_fts "
         "JOIN events AS e ON e.id = events_fts.rowid "
@@ -204,7 +206,7 @@ def _build_hits_sql(spec: SearchSpec) -> tuple[str, list[Any]]:
         "ORDER BY bm25(events_fts) ASC, e.id ASC "
         "LIMIT ?"
     )
-    bound = [spec.query] + params + [spec.limit]
+    bound = [spec.snippet_tokens, spec.query] + params + [spec.limit]
     return sql, bound
 
 

@@ -133,6 +133,46 @@ def test_human_render_no_hits_message():
     assert "no matches" in text
 
 
+def test_query_echo_is_anonymized_in_json(monkeypatch):
+    """Round 7: the user's literal MATCH expression is echoed in the
+    JSON envelope (`query` and `rewritten_match` fields). If the user
+    searched for a path, that path would round-trip into any agent
+    log of the JSON payload. Both fields must run through
+    Anonymizer().text() — same treatment the error-envelope `message`
+    field gets in `doctor/envelope.py`."""
+
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
+    leaky_query = '"/Users/synthetic-user/.config/secret"'
+    result = SearchResult(
+        spec=SearchSpec(query=leaky_query),
+        hits=[],
+        rewritten_match=leaky_query,
+        rows_matched=0,
+        elapsed_ms=1,
+    )
+    payload = json.loads(render_json(result))
+    assert "synthetic-user" not in payload["query"]
+    assert "synthetic-user" not in payload["rewritten_match"]
+    assert "[REDACTED_PATH]" in payload["query"]
+
+
+def test_query_echo_is_anonymized_in_human_no_matches(monkeypatch):
+    """The human-mode no-matches message also echoes the query — same
+    anonymization rule applies."""
+
+    monkeypatch.setenv("HOME", "/Users/synthetic-user")
+    leaky_query = '"/Users/synthetic-user/secret"'
+    result = SearchResult(
+        spec=SearchSpec(query=leaky_query),
+        hits=[],
+        rewritten_match=leaky_query,
+        rows_matched=0,
+        elapsed_ms=1,
+    )
+    text = render_human(result)
+    assert "synthetic-user" not in text
+
+
 def test_timeline_url_includes_anonymized_session_key(monkeypatch):
     monkeypatch.setenv("HOME", "/Users/synthetic-user")
     payload = json.loads(
