@@ -3433,8 +3433,9 @@ def main() -> None:
         help="Filter to a single session_key",
     )
     events_search.add_argument(
-        "--source", default=None, metavar="SRC",
-        help="Filter to a single source (e.g. claude-jsonl)",
+        "--source", action="append", default=[], metavar="SRC",
+        help="Filter to these sources (e.g. claude-jsonl). Repeat or "
+             "comma-separate, same as --client / --type / --confidence",
     )
     events_search.add_argument(
         "--since", default=None, metavar="DURATION",
@@ -4906,20 +4907,33 @@ def _run_events_search(args) -> None:
                     json_mode=json_mode,
                 )
             )
+        # Capture indexed-doc count post-rebuild so JSON consumers
+        # can verify the rebuild actually populated the index.
+        indexed = conn.execute(
+            "SELECT count(*) FROM events_fts_docsize"
+        ).fetchone()[0]
         conn.close()
         if json_mode:
-            payload = {"events_search_rebuild": "ok"}
+            from .events.search import EVENTS_SEARCH_SCHEMA_VERSION
+            payload: dict[str, Any] = {
+                "events_search_schema_version": EVENTS_SEARCH_SCHEMA_VERSION,
+                "rebuild": "ok",
+                "indexed_documents": int(indexed),
+            }
             if request_id is not None:
                 payload["request_id"] = request_id
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         else:
-            sys.stdout.write("events_fts rebuild complete\n")
+            sys.stdout.write(
+                f"events_fts rebuild complete ({indexed} documents indexed)\n"
+            )
         return
 
     try:
         clients = tuple(_split_csv_flag(args.client))
         types = tuple(_split_csv_flag(args.event_type))
         confidences = tuple(_split_csv_flag(args.confidence))
+        sources = tuple(_split_csv_flag(args.source))
         since_iso = parse_since(args.since)
         spec = parse_search_spec(
             query=args.query,
@@ -4927,7 +4941,7 @@ def _run_events_search(args) -> None:
             type_=types,
             confidence=confidences,
             session=args.session,
-            source=args.source,
+            source=sources,
             since_iso=since_iso,
             limit=args.limit if args.limit is not None else DEFAULT_LIMIT,
             snippet_tokens=(

@@ -212,13 +212,37 @@ def test_request_id_echoed_in_meta(isolated_home, tmp_path):
 
 
 def test_rebuild_index_succeeds(isolated_home, tmp_path):
+    """Round 5: rebuild's JSON output now pins the schema version
+    and reports the indexed-document count, so consumers can verify
+    the rebuild actually populated the index instead of just trusting
+    a bare 'ok' string."""
+
     _seed_db(tmp_path)
     result = _run(
         ["events", "search", "--rebuild-index", "--json"], isolated_home,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["events_search_rebuild"] == "ok"
+    assert payload["events_search_schema_version"] == "1.0"
+    assert payload["rebuild"] == "ok"
+    assert payload["indexed_documents"] == 1
+
+
+def test_multi_source_filter(isolated_home, tmp_path):
+    """Round 5: ``--source`` now accepts repeat / comma-separated
+    values for parity with --client / --type / --confidence."""
+
+    _seed_db(tmp_path)
+    # Pass two source values; the seeded event has source=claude-jsonl.
+    result = _run(
+        ["events", "search", "authentication", "--source",
+         "claude-jsonl,codex-rollout", "--json"],
+        isolated_home,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload["hits"]) == 1
+    assert payload["hits"][0]["source"] == "claude-jsonl"
 
 
 def test_oversize_query_rejected(isolated_home, tmp_path):

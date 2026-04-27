@@ -75,7 +75,7 @@ def parse_search_spec(
     type_: tuple[str, ...] = (),
     confidence: tuple[str, ...] = (),
     session: str | None = None,
-    source: str | None = None,
+    source: tuple[str, ...] = (),
     since_iso: str | None = None,
     limit: int,
     snippet_tokens: int,
@@ -98,7 +98,7 @@ def parse_search_spec(
     if session:
         filters.append(Predicate(field="session", op="=", value=session))
     if source:
-        filters.append(Predicate(field="source", op="=", value=source))
+        filters.append(_predicate_for("source", source))
     return SearchSpec(
         query=query,
         filters=tuple(filters),
