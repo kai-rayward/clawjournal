@@ -147,6 +147,23 @@ usernames → `[REDACTED_PATH]` / `[REDACTED_USERNAME]`). Plan 11
 only the secrets pass on snippets, leaking absolute paths from
 ENOENT-shaped error messages and tool-call argument JSON.
 
+## events search --rebuild-index --json
+
+```
+events_search_schema_version: "1.0"
+rebuild: "ok"
+indexed_documents: <int>                 # row count of events_fts_docsize after rebuild
+_meta: { request_id: <string> }          # only when --request-id is set
+```
+
+Emitted by `events search --rebuild-index --json`. Pinned to the
+same schema version as the search-hits payload so consumers can
+treat both surfaces under one version gate. `indexed_documents`
+lets the caller verify the rebuild actually populated the index
+instead of trusting a bare `"ok"` string. `_meta.request_id`
+follows the convention from §structured error envelope — same
+top-level key on both success and error responses.
+
 ## structured error envelope
 
 When `--json` is set on the new agent commands and an error occurs:

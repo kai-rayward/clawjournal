@@ -4921,7 +4921,7 @@ def _run_events_search(args) -> None:
                 "indexed_documents": int(indexed),
             }
             if request_id is not None:
-                payload["request_id"] = request_id
+                payload["_meta"] = {"request_id": request_id}
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         else:
             sys.stdout.write(

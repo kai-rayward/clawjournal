@@ -228,6 +228,28 @@ def test_rebuild_index_succeeds(isolated_home, tmp_path):
     assert payload["indexed_documents"] == 1
 
 
+def test_rebuild_index_request_id_lands_in_meta(isolated_home, tmp_path):
+    """Round 7: the rebuild payload's ``request_id`` lives at
+    ``_meta.request_id``, not as a top-level sibling — matches the
+    convention pinned by every other agent surface (search hits,
+    error envelope) so consumers only check one location."""
+
+    _seed_db(tmp_path)
+    result = _run(
+        ["events", "search", "--rebuild-index", "--json",
+         "--request-id", "rb-42"],
+        isolated_home,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["_meta"]["request_id"] == "rb-42"
+    # Regression guard: must not also appear at the top level.
+    assert "request_id" not in payload, (
+        f"request_id leaked to top level on rebuild payload: "
+        f"keys={sorted(payload)}"
+    )
+
+
 def test_multi_source_filter(isolated_home, tmp_path):
     """Round 5: ``--source`` now accepts repeat / comma-separated
     values for parity with --client / --type / --confidence."""
