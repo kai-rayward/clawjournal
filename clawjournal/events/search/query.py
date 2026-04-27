@@ -23,13 +23,11 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from clawjournal.events.aggregate.spec import Predicate
 from clawjournal.events.search.spec import SEARCH_FILTER_FIELDS, SearchSpec
-
-
-_HELD_STATES: tuple[str, ...] = ("pending_review", "embargoed")
 
 
 @dataclass(frozen=True)
@@ -235,15 +233,29 @@ def _build_where(spec: SearchSpec) -> tuple[str, list[Any]]:
         pieces.append("e.event_at >= ?")
         params.append(spec.since_iso)
     if not spec.include_held:
-        # Held sessions are filtered out by hold_state. Workbench may
-        # not have a row for every event_session (sessions that have
-        # not yet been touched by the workbench), so NULL hold_state
-        # also passes — only the explicit non-default states block.
-        placeholders = ",".join("?" for _ in _HELD_STATES)
+        # Held sessions are filtered out. Two cases block:
+        #   1. ``hold_state = 'pending_review'`` — under findings
+        #      review; surfacing the events defeats the point.
+        #   2. ``hold_state = 'embargoed'`` AND ``embargo_until`` is
+        #      either NULL (defensive) or in the future. An embargo
+        #      whose ``embargo_until`` has already passed is treated
+        #      as released — same semantics as
+        #      ``workbench.index.effective_hold_state``. Without this
+        #      check, expired embargoes would silently linger as
+        #      search-blocked even though every other code path
+        #      treats them as released. Round-2 self-review fix.
+        # Workbench may not have a ``sessions`` row for every
+        # event_session, so NULL hold_state passes through
+        # (treated as not held).
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         pieces.append(
-            f"(ws.hold_state IS NULL OR ws.hold_state NOT IN ({placeholders}))"
+            "(ws.hold_state IS NULL "
+            "OR (ws.hold_state != 'pending_review' "
+            "    AND NOT (ws.hold_state = 'embargoed' "
+            "             AND (ws.embargo_until IS NULL "
+            "                  OR ws.embargo_until > ?))))"
         )
-        params.extend(_HELD_STATES)
+        params.append(now_iso)
     if not pieces:
         return "", params
     return "AND " + " AND ".join(pieces) + " ", params

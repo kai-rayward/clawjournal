@@ -27,7 +27,8 @@ SESSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     session_key TEXT,
-    hold_state TEXT
+    hold_state TEXT,
+    embargo_until TEXT
 );
 """
 
@@ -46,7 +47,7 @@ _event_seq = {"n": 0}
 
 
 def _add_session(
-    conn, session_key, *, client="claude", hold_state=None,
+    conn, session_key, *, client="claude", hold_state=None, embargo_until=None,
 ):
     cur = conn.execute(
         "INSERT INTO event_sessions (session_key, client, started_at, status) "
@@ -56,9 +57,9 @@ def _add_session(
     sid = cur.lastrowid
     if hold_state is not None:
         conn.execute(
-            "INSERT INTO sessions (session_id, session_key, hold_state) "
-            "VALUES (?, ?, ?)",
-            (session_key, session_key, hold_state),
+            "INSERT INTO sessions (session_id, session_key, hold_state, "
+            "embargo_until) VALUES (?, ?, ?, ?)",
+            (session_key, session_key, hold_state, embargo_until),
         )
     return sid
 
@@ -191,12 +192,38 @@ def test_held_sessions_surfaced_with_include_held(conn):
 
 def test_embargoed_sessions_also_excluded_by_default(conn):
     sid_open = _add_session(conn, "claude:proj:s1")
-    sid_emb = _add_session(conn, "claude:proj:s2", hold_state="embargoed")
+    # An active embargo (until 2099) should block.
+    sid_emb = _add_session(
+        conn, "claude:proj:s2",
+        hold_state="embargoed", embargo_until="2099-01-01T00:00:00Z",
+    )
     _add_event(conn, sid_open, '{"text": "shared_token open"}')
     _add_event(conn, sid_emb, '{"text": "shared_token embargoed"}')
 
     result = run(SearchSpec(query="shared_token"), conn)
     assert result.rows_matched == 1
+
+
+def test_expired_embargo_passes_through_default_search(conn):
+    """Round 2: an embargo whose ``embargo_until`` has already passed
+    is operationally released — same semantics as
+    ``workbench.index.effective_hold_state``. Without this rule,
+    expired embargoes would silently linger as search-blocked even
+    though every other code path treats them as released."""
+
+    sid_open = _add_session(conn, "claude:proj:s1")
+    sid_expired = _add_session(
+        conn, "claude:proj:s2",
+        hold_state="embargoed", embargo_until="2000-01-01T00:00:00Z",
+    )
+    _add_event(conn, sid_open, '{"text": "shared_token open"}')
+    _add_event(conn, sid_expired, '{"text": "shared_token expired_embargo"}')
+
+    result = run(SearchSpec(query="shared_token"), conn)
+    assert result.rows_matched == 2, (
+        f"expired embargo should pass through default search; got "
+        f"{[h.session_key for h in result.hits]}"
+    )
 
 
 def test_session_with_no_workbench_row_passes_through(conn):
