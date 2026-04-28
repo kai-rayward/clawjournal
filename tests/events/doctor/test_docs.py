@@ -70,6 +70,11 @@ def test_schemas_topic_has_named_schema_records():
         f"events aggregate --json schema missing from schemas topic; "
         f"found: {sorted(names)}"
     )
+    # Plan 11's search envelope joins the same schemas surface.
+    assert any("search" in name for name in names), (
+        f"events search --json schema missing from schemas topic; "
+        f"found: {sorted(names)}"
+    )
 
 
 def test_commands_topic_covers_every_feature_record():

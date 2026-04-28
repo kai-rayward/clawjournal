@@ -3403,6 +3403,77 @@ def main() -> None:
     )
     _add_aggregate_flags(events_cost_aggregate, domain="cost")
 
+    # Search subcommand (plan 11): cross-session FTS5 over events.raw_json.
+    events_search = events_sub.add_parser(
+        "search",
+        help="Cross-session full-text search over events (FTS5 over raw_json)",
+    )
+    events_search.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help="FTS5 MATCH expression (phrase \"...\", AND/OR/NOT, prefix foo*, "
+             "NEAR/N). Required unless --rebuild-index is set",
+    )
+    events_search.add_argument(
+        "--client", action="append", default=[], metavar="CLIENT",
+        help="Filter to this client (repeat or comma-separate)",
+    )
+    events_search.add_argument(
+        "--type", action="append", default=[], metavar="TYPE",
+        dest="event_type",
+        help="Filter to these event types (repeat or comma-separate)",
+    )
+    events_search.add_argument(
+        "--confidence", action="append", default=[], metavar="LEVEL",
+        help="Filter to these confidence levels (repeat or comma-separate)",
+    )
+    events_search.add_argument(
+        "--session", default=None, metavar="KEY",
+        help="Filter to a single session_key",
+    )
+    events_search.add_argument(
+        "--source", action="append", default=[], metavar="SRC",
+        help="Filter to these sources (e.g. claude-jsonl). Repeat or "
+             "comma-separate, same as --client / --type / --confidence",
+    )
+    events_search.add_argument(
+        "--since", default=None, metavar="DURATION",
+        help="Lower-bound time filter: Nd / Nh / Nm / today / thisweek",
+    )
+    events_search.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Top-N hits to return (default: 50, ceiling: 1000)",
+    )
+    events_search.add_argument(
+        "--snippet-tokens", type=int, default=None, metavar="N",
+        dest="snippet_tokens",
+        help="Snippet window length in tokens, not characters (default: 16, "
+             "range 1-64). FTS5 caps at 64 tokens internally; values above "
+             "64 are silently clamped, so the cap is enforced here. v0.1 "
+             "originally called this --snippet-length and claimed "
+             "characters — round-1 fix renames to match the FTS5 contract",
+    )
+    events_search.add_argument(
+        "--include-held", action="store_true", dest="include_held",
+        help="Include events from held sessions (pending_review / embargoed). "
+             "Default: held sessions are excluded so search results don't "
+             "surface content under redaction review",
+    )
+    events_search.add_argument(
+        "--rebuild-index", action="store_true", dest="rebuild_index",
+        help="One-shot reindex of events_fts from events. Use after a "
+             "DELETE FROM events_fts or any surgery on events that bypassed "
+             "the triggers",
+    )
+    events_search.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of human output",
+    )
+    events_search.add_argument(
+        "--request-id", dest="request_id",
+        help="Opaque ID echoed into _meta.request_id when --json is set",
+    )
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -4107,6 +4178,10 @@ def _run_events(args) -> None:
         _run_events_aggregate(args)
         return
 
+    if args.events_command == "search":
+        _run_events_search(args)
+        return
+
     conn = open_index()
     try:
         summary = ingest_pending(conn, source_filter=args.source)
@@ -4723,6 +4798,239 @@ def _parse_metric_token(token: str, registry) -> "Metric":  # type: ignore[name-
         f"unrecognized metric: {token!r} "
         f"(expected count | sum:<field> | avg:<field>)"
     )
+
+
+def _run_events_search(args) -> None:
+    """Cross-session FTS over events.raw_json (plan 11).
+
+    Wraps schema bootstrap, validation, query, and render. Errors flow
+    through plan 08's structured envelope: usage_error → 2,
+    index_missing → 3 (FTS table absent or events table absent),
+    unspecified → 9.
+    """
+
+    import sqlite3
+
+    from .events.aggregate import parse_since
+    from .events.doctor.envelope import (
+        KIND_INDEX_MISSING,
+        KIND_UNSPECIFIED,
+        KIND_USAGE_ERROR,
+        emit_error,
+    )
+    from .events.search import (
+        DEFAULT_LIMIT,
+        DEFAULT_SNIPPET_TOKENS,
+        ensure_search_schema,
+        parse_search_spec,
+        rebuild_search_index,
+        render_human,
+        render_json,
+        run as run_search,
+    )
+    from .workbench.index import open_index
+
+    request_id = getattr(args, "request_id", None)
+    json_mode = bool(getattr(args, "json", False))
+
+    rebuild_only = bool(getattr(args, "rebuild_index", False))
+    if not rebuild_only and not args.query:
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message="missing required positional: <query>",
+                hint="pass an FTS5 MATCH expression, or --rebuild-index to "
+                     "reindex the FTS table",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        conn = open_index()
+    except FileNotFoundError as exc:
+        sys.exit(
+            emit_error(
+                code=3,
+                kind=KIND_INDEX_MISSING,
+                message=f"index database not found: {exc}",
+                hint="run `clawjournal scan` then `clawjournal events ingest`",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        ensure_search_schema(conn)
+    except sqlite3.OperationalError as exc:
+        # Most likely "no such table: events" — workbench DB exists
+        # but events ingest never ran. Map to index_missing.
+        conn.close()
+        msg = str(exc)
+        if "no such table" in msg:
+            sys.exit(
+                emit_error(
+                    code=3,
+                    kind=KIND_INDEX_MISSING,
+                    message=msg,
+                    hint="run `clawjournal events ingest` to populate the "
+                         "events tables before searching",
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"could not initialize FTS schema: {msg}",
+                hint="re-run with --json for the structured payload",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    if rebuild_only:
+        try:
+            rebuild_search_index(conn)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            conn.close()
+            sys.exit(
+                emit_error(
+                    code=9,
+                    kind=KIND_UNSPECIFIED,
+                    message=f"FTS rebuild failed: {exc}",
+                    hint="check `~/.clawjournal/index.db` is writable",
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        # Capture indexed-doc count post-rebuild so JSON consumers
+        # can verify the rebuild actually populated the index.
+        indexed = conn.execute(
+            "SELECT count(*) FROM events_fts_docsize"
+        ).fetchone()[0]
+        conn.close()
+        if json_mode:
+            from .events.search import EVENTS_SEARCH_SCHEMA_VERSION
+            payload: dict[str, Any] = {
+                "events_search_schema_version": EVENTS_SEARCH_SCHEMA_VERSION,
+                "rebuild": "ok",
+                "indexed_documents": int(indexed),
+            }
+            if request_id is not None:
+                payload["_meta"] = {"request_id": request_id}
+            sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        else:
+            sys.stdout.write(
+                f"events_fts rebuild complete ({indexed} documents indexed)\n"
+            )
+        return
+
+    try:
+        clients = tuple(_split_csv_flag(args.client))
+        types = tuple(_split_csv_flag(args.event_type))
+        confidences = tuple(_split_csv_flag(args.confidence))
+        sources = tuple(_split_csv_flag(args.source))
+        since_iso = parse_since(args.since)
+        spec = parse_search_spec(
+            query=args.query,
+            client=clients,
+            type_=types,
+            confidence=confidences,
+            session=args.session,
+            source=sources,
+            since_iso=since_iso,
+            limit=args.limit if args.limit is not None else DEFAULT_LIMIT,
+            snippet_tokens=(
+                args.snippet_tokens if args.snippet_tokens is not None
+                else DEFAULT_SNIPPET_TOKENS
+            ),
+            include_held=bool(args.include_held),
+        )
+    except ValueError as exc:
+        conn.close()
+        sys.exit(
+            emit_error(
+                code=2,
+                kind=KIND_USAGE_ERROR,
+                message=str(exc),
+                hint="see `clawjournal events docs commands` for events search "
+                     "reference",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+
+    try:
+        result = run_search(spec, conn)
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        msg = str(exc)
+        # FTS5 raises OperationalError on a malformed MATCH expression.
+        # Common shapes: "fts5: syntax error", "unterminated string",
+        # "no such column: <X>" (FTS5 treats `foo-bar` as a column
+        # filter `foo` ⇒ `bar`; users who typed a hyphen-bareword
+        # actually want the phrase query `"foo-bar"`). Schema and
+        # filter shape are validated upstream, so any OperationalError
+        # here is almost certainly query-shape — map to usage_error
+        # so agents see exit code 2 rather than the catch-all 9.
+        # Schema-level OperationalError ("no such table: events_fts")
+        # was already caught by ensure_search_schema above.
+        lowered = msg.lower()
+        looks_like_user_query_error = any(
+            tok in lowered
+            for tok in (
+                "fts5",
+                "syntax error",
+                "unterminated",
+                " near ",
+                "no such column",
+            )
+        )
+        if looks_like_user_query_error:
+            sys.exit(
+                emit_error(
+                    code=2,
+                    kind=KIND_USAGE_ERROR,
+                    message=f"FTS5 rejected query: {msg}",
+                    hint="quote phrase queries (\"foo bar\"), use prefix as "
+                         "foo*, escape literal punctuation",
+                    request_id=request_id,
+                    json_mode=json_mode,
+                )
+            )
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"search failed: {msg}",
+                hint="re-run with --json for the structured payload",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    except Exception as exc:
+        conn.close()
+        sys.exit(
+            emit_error(
+                code=9,
+                kind=KIND_UNSPECIFIED,
+                message=f"search failed: {exc!r}",
+                hint="re-run with --json for the structured payload",
+                request_id=request_id,
+                json_mode=json_mode,
+            )
+        )
+    conn.close()
+
+    if json_mode:
+        sys.stdout.write(render_json(result, request_id=request_id))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_human(result))
 
 
 _INSPECT_HUMAN_DEFAULT_TRUNCATE = 1024

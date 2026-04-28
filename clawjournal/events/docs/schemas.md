@@ -102,6 +102,68 @@ home-rooted absolute paths are anonymized via
 ``[REDACTED_PATH]`` or ``codex:[REDACTED_PATH]`` for embedded
 paths). Plan 10 §Security #2.
 
+## events search --json
+
+```
+events_search_schema_version: "1.0"
+query: <string>                        # the user's MATCH expression, verbatim
+rewritten_match: <string>              # the expression actually bound to MATCH
+hits: [
+  {
+    "event_id": <int>,
+    "session_key": <string>,           # anonymized via Anonymizer().text()
+    "event_at": <iso-timestamp|null>,
+    "client": <string>,
+    "type": <string>,
+    "confidence": <string>,
+    "source": <string>,
+    "raw_ref": {
+      "source_path": <string>,         # anonymized via Anonymizer().path()
+      "source_offset": <int>,
+      "seq": <int>
+    },
+    "snippet": <string>,               # secrets-redacted + path-anonymized; v0.1 emits no <mark>
+    "bm25": <float>,                   # FTS5 relevance, smaller is closer
+    "timeline_url": <string>           # clawjournal://session/<key>#event-<id>
+  },
+  ...
+]
+_meta: {
+  elapsed_ms: <int>,
+  rows_matched: <int>,                 # COUNT(*) before --limit truncation
+  rows_returned: <int>,                # = len(hits)
+  include_held: <bool>,                # echoes the user's --include-held flag
+  request_id: <string>                 # only when --request-id is set
+}
+```
+
+`session_key` and `raw_ref.source_path` are anonymized before
+emission. Snippets go through a two-pass scrub: first
+`clawjournal/redaction/secrets.py` (secrets → typed placeholder),
+then `Anonymizer().text()` (home-rooted absolute paths and bare
+usernames → `[REDACTED_PATH]` / `[REDACTED_USERNAME]`). Plan 11
+§Security #3 + #4 plus §Acceptance ("grep for `/Users/` or
+`/home/` in search JSON output is empty"). Round-4 fix: v0.1 ran
+only the secrets pass on snippets, leaking absolute paths from
+ENOENT-shaped error messages and tool-call argument JSON.
+
+## events search --rebuild-index --json
+
+```
+events_search_schema_version: "1.0"
+rebuild: "ok"
+indexed_documents: <int>                 # row count of events_fts_docsize after rebuild
+_meta: { request_id: <string> }          # only when --request-id is set
+```
+
+Emitted by `events search --rebuild-index --json`. Pinned to the
+same schema version as the search-hits payload so consumers can
+treat both surfaces under one version gate. `indexed_documents`
+lets the caller verify the rebuild actually populated the index
+instead of trusting a bare `"ok"` string. `_meta.request_id`
+follows the convention from §structured error envelope — same
+top-level key on both success and error responses.
+
 ## structured error envelope
 
 When `--json` is set on the new agent commands and an error occurs:

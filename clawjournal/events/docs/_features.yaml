@@ -1,8 +1,5 @@
 # Single source for `events features --json:features` and the
 # `events docs commands` topic. Plan 08 §events features.
-#
-# When 11 ships `events search`, add its entry here and a per-command
-# section to `commands.md`.
 version: 1
 features:
   - id: events.ingest
@@ -17,6 +14,9 @@ features:
   - id: events.aggregate
     command: clawjournal events aggregate
     summary: "Cross-session aggregation over events (counts/sums/avgs by dimension)"
+  - id: events.search
+    command: clawjournal events search
+    summary: "Cross-session full-text search over events.raw_json (FTS5)"
   - id: events.cost.ingest
     command: clawjournal events cost ingest
     summary: "Extract token usage and detect cost anomalies"
