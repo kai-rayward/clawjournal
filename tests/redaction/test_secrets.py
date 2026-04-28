@@ -655,6 +655,22 @@ class TestStripeKey:
         findings = scan_text(text)
         assert any(f["type"] == "stripe_key" for f in findings)
 
+    def test_secret_key_test_variant(self):
+        # Round-2: cover all 6 (sk|pk|rk) × (live|test) combinations.
+        text = "sk_test_" + "Q" * 24
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_key" for f in findings)
+
+    def test_publishable_key_test_variant(self):
+        text = "pk_test_" + "R" * 24
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_key" for f in findings)
+
+    def test_restricted_key_live_variant(self):
+        text = "rk_live_" + "S" * 24
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_key" for f in findings)
+
     def test_short_tail_does_not_match(self):
         # 23 chars after the underscore — below the 24-char minimum.
         text = "sk_live_" + "X" * 23
@@ -739,6 +755,48 @@ class TestBearerBound:
         # shaped's 0.85.
         assert CONFIDENCE["bearer_generic"] == 0.75
         assert CONFIDENCE["bearer"] == 0.85
+
+    def test_uppercase_bearer_classifies_as_jwt_bearer(self):
+        """Round-2: existing `bearer` regex was case-sensitive, so an
+        upstream `Authorization: BEARER eyJ…` (uppercase) would fall
+        through to `bearer_generic` at 0.75 instead of `bearer` at
+        0.85. The `(?i:Bearer)` group accepts every case while keeping
+        the body matching strict."""
+
+        bearer = "BEARER eyJ" + "A" * 30 + "." + "B" * 30 + "." + "C" * 30
+        findings = scan_text(bearer)
+        types = {f["type"] for f in findings}
+        assert "bearer" in types, (
+            f"uppercase BEARER should match the JWT-shaped bearer regex; "
+            f"got types={sorted(types)}"
+        )
+
+    def test_lowercase_bearer_also_matches(self):
+        bearer = "bearer eyJ" + "A" * 30 + "." + "B" * 30 + "." + "C" * 30
+        findings = scan_text(bearer)
+        types = {f["type"] for f in findings}
+        assert "bearer" in types
+
+    def test_bearer_does_not_split_identifier(self):
+        """Round-2: `\\b` prevents the regex from carving `Bearer xxx`
+        out of an identifier-shaped span like `myBearer xxx`. Without
+        the boundary the regex matched at offset 2 and left `my` in
+        the text — not a privacy leak (the secret was still redacted),
+        but a classification quality bug."""
+
+        # Build a generic-bearer-shaped span (40 chars, no JWT shape).
+        # Embedded inside an identifier `myBearer …`.
+        text = "myBearer " + "Z" * 40
+        findings = scan_text(text)
+        # Neither bearer pattern should fire — the `Bearer` keyword sits
+        # mid-identifier and the leading `\b` blocks the match.
+        bearer_findings = [
+            f for f in findings if f["type"] in ("bearer", "bearer_generic")
+        ]
+        assert bearer_findings == [], (
+            f"\\b should block bearer-pattern match inside identifier; "
+            f"got {bearer_findings}"
+        )
 
     def test_jwt_shaped_bearer_fires_both_patterns_at_scan_level(self):
         """Round-1 self-review: the JWT-shaped bearer pattern AND the

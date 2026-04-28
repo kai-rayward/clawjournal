@@ -113,8 +113,15 @@ SECRET_PATTERNS = [
     # separated by literal `.`. Real JWTs sit well under 2048 per
     # segment; the cap fails-loud rather than producing pathological
     # match times on adversarial input.
+    #
+    # `\b(?i:Bearer)` round-2 hardening: the leading `\b` prevents the
+    # regex from splitting an identifier (`myBearer eyJ…` no longer
+    # carves out `Bearer eyJ…` and leaves `my` orphaned), and `(?i:)`
+    # accepts `BEARER`/`bearer`/`Bearer` so case-mangled headers still
+    # land at the higher-confidence `bearer` classification (0.85)
+    # rather than falling through to `bearer_generic` (0.75).
     ("bearer", re.compile(
-        r"Bearer\s+(eyJ[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048})"
+        r"\b(?i:Bearer)\s+(eyJ[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048})"
     )),
 
     # Generic Bearer tokens — non-JWT-shaped opaque/OAuth bearers that
@@ -122,8 +129,12 @@ SECRET_PATTERNS = [
     # same ReDoS-prevention reason. Distinct entry so confidence (0.75)
     # can sit lower than JWT-shaped (0.85) — generic bearers are higher-
     # FP because the character class is broader.
+    #
+    # Leading `\b` matches the JWT-shaped variant's round-2 hardening
+    # so this regex also can't carve a substring out of a longer
+    # identifier.
     ("bearer_generic", re.compile(
-        r"(?i)Bearer\s+([A-Za-z0-9\-_.~+/]{20,2048}=*)"
+        r"\b(?i:Bearer)\s+([A-Za-z0-9\-_.~+/]{20,2048}=*)"
     )),
 
     # IP addresses (public, non-loopback, non-private-by-default)
