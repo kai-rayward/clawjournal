@@ -54,6 +54,12 @@ SECRET_PATTERNS = [
     # NPM tokens
     ("npm_token", re.compile(r"npm_[A-Za-z0-9]{30,}")),
 
+    # Stripe API keys — `sk_live_…`, `pk_live_…`, `rk_live_…`, plus the
+    # `_test_…` variants. Cass's table flags this as a likely gap; verified
+    # absent before adding. The 24+ char tail matches every real Stripe
+    # key shape (current keys are 24-32 chars after the underscore).
+    ("stripe_key", re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b")),
+
     # AWS access key IDs (but not in regex pattern context)
     ("aws_key", re.compile(r"(?<![A-Za-z0-9\[])AKIA[0-9A-Z]{16}(?![0-9A-Z\]{}])")),
 
@@ -101,9 +107,23 @@ SECRET_PATTERNS = [
         re.IGNORECASE,
     )),
 
-    # Bearer tokens in headers
+    # Bearer tokens in headers, JWT-shaped. Three character runs bounded
+    # at {20,2048} per segment (was {20,}) — closes the polynomial-
+    # backtracking surface from three unbounded character classes
+    # separated by literal `.`. Real JWTs sit well under 2048 per
+    # segment; the cap fails-loud rather than producing pathological
+    # match times on adversarial input.
     ("bearer", re.compile(
-        r"Bearer\s+(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})"
+        r"Bearer\s+(eyJ[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048})"
+    )),
+
+    # Generic Bearer tokens — non-JWT-shaped opaque/OAuth bearers that
+    # the JWT-shaped pattern above misses. Bounded at {20,2048} for the
+    # same ReDoS-prevention reason. Distinct entry so confidence (0.75)
+    # can sit lower than JWT-shaped (0.85) — generic bearers are higher-
+    # FP because the character class is broader.
+    ("bearer_generic", re.compile(
+        r"(?i)Bearer\s+([A-Za-z0-9\-_.~+/]{20,2048}=*)"
     )),
 
     # IP addresses (public, non-loopback, non-private-by-default)
@@ -136,10 +156,11 @@ CONFIDENCE: dict[str, float] = {
     "anthropic_key": 0.98, "openai_key": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
     "pypi_token": 0.98, "npm_token": 0.98,
+    "stripe_key": 0.98,
     "aws_key": 0.98, "aws_secret": 0.95,
     "slack_token": 0.98, "discord_webhook": 0.95,
     "jwt_partial": 0.80, "db_url": 0.85,
-    "bearer": 0.85, "cli_token_flag": 0.80,
+    "bearer": 0.85, "bearer_generic": 0.75, "cli_token_flag": 0.80,
     "env_secret": 0.75, "generic_secret": 0.80,
     "url_token": 0.80,
     "ip_address": 0.60, "email": 0.65,
@@ -167,6 +188,8 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "env_secret": "[REDACTED_ENV_SECRET]",
     "generic_secret": "[REDACTED_SECRET]",
     "bearer": "[REDACTED_BEARER]",
+    "bearer_generic": "[REDACTED_BEARER]",
+    "stripe_key": "[REDACTED_STRIPE_KEY]",
     "ip_address": "[REDACTED_IP]",
     "url_token": "[REDACTED_URL_TOKEN]",
     "email": "[REDACTED_EMAIL]",
@@ -250,6 +273,62 @@ _MIN_SCAN_LENGTH = 6
 _ASSIGNMENT_PATTERNS = frozenset({"env_secret", "generic_secret", "aws_secret"})
 
 
+# Negative-context heuristic for `ip_address`. The IP regex blacklists
+# obvious private/reserved prefixes via lookaheads but cannot tell a
+# real IPv4 address from a 4-segment version string. Two cheap checks
+# in the surrounding text catch the common false-positive shapes:
+#
+#   1. **Version-introducer keyword in the immediate prefix.** Strings
+#      like ``version 1.2.3.4``, ``commit 1.2.3.4``, ``release 2.0.1.4``
+#      look exactly like IP addresses to the regex.
+#   2. **Part of a longer dotted-numeric run.** Inside ``1.2.3.4.5`` the
+#      regex can match both ``1.2.3.4`` and ``2.3.4.5``; both should be
+#      suppressed because the surrounding shape is a 5-segment version,
+#      not two adjacent IPs.
+#
+# Real configs DO contain real IPs (`dns_server=8.8.8.8`), so we do
+# not also suppress on `=`/`:` assignment context — the existing
+# ALLOWLIST handles known-good public IPs (Google/Cloudflare DNS) by
+# explicit literal entry.
+_IP_VERSION_INTRODUCER = re.compile(
+    r"(?:^|\s|[\(\[<])(?:v|ver|version|commit|release|build|tag|sha|rev"
+    r"|major|minor|patch)\s*[:=]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _ip_looks_like_version(text: str, match: "re.Match[str]") -> bool:
+    """True when an ip_address-shaped match is more plausibly a version."""
+
+    start, end = match.start(), match.end()
+
+    # Char immediately before is `.` preceded by a digit → match is the
+    # tail of a longer dotted-numeric run, e.g. `0.1.2.3.4`.
+    if (
+        start >= 2
+        and text[start - 1] == "."
+        and text[start - 2].isdigit()
+    ):
+        return True
+
+    # Char immediately after is `.` followed by a digit → match is the
+    # head of a longer dotted-numeric run, e.g. `1.2.3.4.5`.
+    if (
+        end + 1 <= len(text) - 1
+        and text[end] == "."
+        and text[end + 1].isdigit()
+    ):
+        return True
+
+    # Trailing 24 chars before the match end with a version introducer.
+    ctx_start = max(0, start - 24)
+    prefix = text[ctx_start:start]
+    if _IP_VERSION_INTRODUCER.search(prefix):
+        return True
+
+    return False
+
+
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
     if not text or len(text) < _MIN_SCAN_LENGTH:
         return []
@@ -281,6 +360,12 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
                     continue
                 if inner.count(".") > 2:
                     continue
+
+            # For ip_address, suppress version-shaped matches
+            # (e.g. `version 1.2.3.4`, the slices of `1.2.3.4.5`).
+            # The regex itself can't carry this context check.
+            if name == "ip_address" and _ip_looks_like_version(text, match):
+                continue
 
             findings.append({
                 "type": name,

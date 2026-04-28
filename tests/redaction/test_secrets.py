@@ -627,3 +627,172 @@ class TestUserAllowlist:
         # Should not raise — the invalid entry is silently skipped
         findings = scan_text(text, user_allowlist=allowlist)
         assert any(f["type"] == "ip_address" for f in findings)
+
+
+# --- A2: Stripe key pattern ---
+
+
+class TestStripeKey:
+    """A2: new `stripe_key` pattern matches the four real Stripe key
+    shapes (`sk_live_…`, `pk_live_…`, `rk_live_…`, plus the `_test_`
+    variants). Confidence pinned to 0.98 — the prefix is unambiguous."""
+
+    def test_secret_key_live(self):
+        text = "stripe key is sk_live_" + "A" * 30 + " do not commit"
+        result, count, _ = redact_text(text)
+        assert count == 1
+        assert "sk_live_" not in result
+        assert "[REDACTED_STRIPE_KEY]" in result
+
+    def test_publishable_key_live(self):
+        text = "config has pk_live_" + "B" * 28
+        findings = scan_text(text)
+        types = {f["type"] for f in findings}
+        assert "stripe_key" in types
+
+    def test_restricted_key_test(self):
+        text = "rk_test_" + "9" * 24
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_key" for f in findings)
+
+    def test_short_tail_does_not_match(self):
+        # 23 chars after the underscore — below the 24-char minimum.
+        text = "sk_live_" + "X" * 23
+        findings = scan_text(text)
+        assert not any(f["type"] == "stripe_key" for f in findings)
+
+    def test_wrong_prefix_does_not_match(self):
+        # `sklive_…` (no underscore between sk and live) is not a Stripe
+        # key shape.
+        text = "sklive_xxxxxxxxxxxxxxxxxxxxxxxxx"
+        findings = scan_text(text)
+        assert not any(f["type"] == "stripe_key" for f in findings)
+
+    def test_confidence_and_placeholder_registered(self):
+        assert CONFIDENCE["stripe_key"] == 0.98
+        assert SECRET_PLACEHOLDER["stripe_key"] == "[REDACTED_STRIPE_KEY]"
+
+
+# --- A2: Bearer bound + generic bearer ---
+
+
+class TestBearerBound:
+    """A2: the JWT-shaped bearer regex now bounds each segment at
+    {20,2048} (was {20,}); a separate `bearer_generic` pattern catches
+    non-JWT-shaped bearers. The bound prevents polynomial backtracking
+    on adversarial input."""
+
+    def test_jwt_shaped_bearer_still_redacts(self):
+        # Realistic JWT-shaped bearer; each segment well under 2048.
+        # Either the `bearer` pattern OR the `jwt` pattern can match
+        # (the inner JWT pattern wins via dedup ordering — both
+        # outcomes are security-equivalent: the secret is gone).
+        bearer = (
+            "Bearer eyJ" + "A" * 30 + "." + "B" * 30 + "." + "C" * 30
+        )
+        result, count, _ = redact_text(bearer)
+        assert count >= 1
+        assert "A" * 30 not in result
+        assert "[REDACTED_" in result
+
+    def test_generic_bearer_redacts(self):
+        # Opaque OAuth-style bearer — no JWT shape, JWT-only regex
+        # would have missed this.
+        bearer = "Authorization: Bearer " + "Z" * 40
+        findings = scan_text(bearer)
+        assert any(f["type"] == "bearer_generic" for f in findings)
+
+    def test_bound_prevents_pathological_runtime(self):
+        """Adversarial 8 KiB string mostly matching the JWT shape but
+        terminated wrong. Without the {20,2048} bound, the unbounded
+        {20,} runs amplified backtracking on each retry. With the bound,
+        scan_text returns in well under a second."""
+
+        import time
+        # 8 KiB of valid bearer-tail chars, no terminating dot/segment —
+        # forces the regex to attempt many partial matches.
+        adversarial = "Bearer eyJ" + ("A" * 8000)
+        started = time.perf_counter()
+        scan_text(adversarial)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, (
+            f"scan_text took {elapsed:.3f}s on 8 KiB adversarial bearer "
+            f"input; bound regression"
+        )
+
+    def test_generic_bearer_confidence_lower_than_jwt(self):
+        # Generic bearers have higher FP risk; pinned at 0.75 vs JWT-
+        # shaped's 0.85.
+        assert CONFIDENCE["bearer_generic"] == 0.75
+        assert CONFIDENCE["bearer"] == 0.85
+
+
+# --- A2: IP version-context guard ---
+
+
+class TestIpVersionGuard:
+    """A2: ip_address matches that are more plausibly version strings
+    (preceded by 'version'/'commit'/etc, or part of a longer dotted-
+    numeric run) are suppressed. Real public IPs without that context
+    still redact."""
+
+    def test_real_public_ip_still_redacts(self):
+        # RFC5737 documentation prefix — not in ALLOWLIST, no version
+        # context. Should still fire.
+        text = "Server is at 203.0.113.5 — please update"
+        findings = scan_text(text)
+        assert any(
+            f["type"] == "ip_address" and f["match"] == "203.0.113.5"
+            for f in findings
+        )
+
+    def test_version_prefix_suppresses(self):
+        text = "Bumped to version 1.2.3.4 last night"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings), (
+            f"version-prefixed IP should be suppressed; "
+            f"got {[f for f in findings if f['type'] == 'ip_address']}"
+        )
+
+    def test_release_prefix_suppresses(self):
+        text = "release 2.0.1.4 ships tomorrow"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_commit_prefix_suppresses(self):
+        text = "commit 198.51.100.7 introduced the regression"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_v_prefix_suppresses(self):
+        text = "Tag v1.2.3.4 published"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_dotted_run_suppresses_both_slices(self):
+        """In `1.2.3.4.5` the regex matches both `1.2.3.4` and `2.3.4.5`;
+        both should be suppressed because the surrounding shape is a
+        5-segment version, not two adjacent IPs."""
+
+        text = "Build 1.2.3.4.5 deployed"
+        findings = scan_text(text)
+        ip_findings = [f for f in findings if f["type"] == "ip_address"]
+        assert ip_findings == [], (
+            f"dotted-run slices should both be suppressed; got {ip_findings}"
+        )
+
+    def test_known_public_dns_still_allowlisted(self):
+        # ALLOWLIST has 8.8.8.8, 1.1.1.1 etc as not-secret. Verify the
+        # version guard doesn't break that path either way (it should be
+        # suppressed by ALLOWLIST first).
+        text = "DNS is 8.8.8.8"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_redact_text_end_to_end_for_version(self):
+        text = "version 1.2.3.4 and a real IP at 203.0.113.5"
+        result, count, _ = redact_text(text)
+        # Only the real IP should redact.
+        assert "1.2.3.4" in result
+        assert "203.0.113.5" not in result
+        assert "[REDACTED_IP]" in result
