@@ -458,10 +458,22 @@ def redact_text(
             start, end = f["start"], f["end"]
             ctx_before = text[max(0, start - 40):start]
             ctx_after = text[end:end + 40]
-            # Redact high-confidence secrets in context (recursive, but only
-            # captures high-conf patterns so no infinite recursion risk)
-            safe_before = _redact_high_confidence_only(ctx_before)
-            safe_after = _redact_high_confidence_only(ctx_after)
+            # Redact high-confidence secrets in context. Two layers:
+            # (1) blank any byte that overlaps a high-conf finding's
+            # span in the FULL findings list — catches the "secret
+            # tail leaks into the 40-char window because the regex
+            # can't re-match a truncated tail" gap (round-4 self-
+            # review). (2) regex-based pass for any high-conf secret
+            # that fully fits inside the window. Order matters: span
+            # blanking first so the regex sees clean text.
+            safe_before = _blank_high_conf_overlaps(
+                ctx_before, max(0, start - 40), findings,
+            )
+            safe_after = _blank_high_conf_overlaps(
+                ctx_after, end, findings,
+            )
+            safe_before = _redact_high_confidence_only(safe_before)
+            safe_after = _redact_high_confidence_only(safe_after)
             entry["context_before"] = safe_before
             entry["context_after"] = safe_after
         log.append(entry)
@@ -473,6 +485,54 @@ def redact_text(
         result = result[:f["start"]] + placeholder + result[f["end"]:]
 
     return result, len(deduped), log
+
+
+def _blank_high_conf_overlaps(
+    substring: str,
+    sub_start: int,
+    all_findings: list[dict],
+) -> str:
+    """Round-4 self-review: blank bytes in a context window that overlap
+    a high-confidence finding's span in the source text.
+
+    `_redact_high_confidence_only`'s regex-based pass cannot re-match
+    a truncated tail of a high-conf secret (the regex needs the prefix
+    + minimum-length tail). Without this pre-pass, the trailing bytes
+    of an outer secret leak into the context_before/context_after
+    fields of a neighboring medium-conf finding's redaction-log entry.
+    Round 4 found this leak widening with the new bearer_generic
+    pattern (broader alphabet) plus stripe_key/stripe_webhook_secret
+    (new high-conf families); fix is to blank known high-conf spans
+    using the full findings list instead of relying on regex re-match
+    against truncated input.
+
+    `sub_start` is the offset of `substring` in the source text so
+    overlap can be computed in source coordinates.
+    """
+
+    if not substring:
+        return substring
+    sub_end = sub_start + len(substring)
+    overlaps: list[tuple[int, int, str]] = []
+    for f in all_findings:
+        if f["confidence"] < 0.90:
+            continue
+        # Overlap range in source-text coordinates
+        ov_start = max(f["start"], sub_start)
+        ov_end = min(f["end"], sub_end)
+        if ov_start < ov_end:
+            placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
+            # Translate to substring coordinates
+            overlaps.append((ov_start - sub_start, ov_end - sub_start, placeholder))
+    if not overlaps:
+        return substring
+    # Sort descending by start so right-to-left replacement preserves
+    # earlier offsets.
+    overlaps.sort(key=lambda x: x[0], reverse=True)
+    out = substring
+    for s, e, ph in overlaps:
+        out = out[:s] + ph + out[e:]
+    return out
 
 
 def _redact_high_confidence_only(text: str) -> str:

@@ -39,7 +39,16 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 1
+ENGINE_VERSION = 2  # round-4 bump: A2 added stripe_key, stripe_webhook_secret,
+                    # and bearer_generic patterns + tightened the JWT bearer
+                    # regex (`\b` prefix, case-insensitive keyword). Old
+                    # findings rows for sessions scanned with ENGINE_VERSION=1
+                    # missed these, so revision drift from this constant
+                    # forces a re-scan via `compute_findings_revision` next
+                    # time the session settles. `apply_findings_to_blob`
+                    # already re-scans live at share time, so the bump is
+                    # about the user-facing review UI showing accurate
+                    # findings counts on pre-A2 sessions.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 

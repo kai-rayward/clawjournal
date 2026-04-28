@@ -999,3 +999,87 @@ class TestIpVersionGuard:
             f["type"] == "ip_address" and f["match"] == "203.0.113.0"
             for f in findings
         )
+
+
+class TestContextLeakFix:
+    """Round-4: a high-conf secret near a medium-conf finding used to
+    leak its truncated tail into the medium-conf entry's
+    `context_before`/`context_after` log fields. The regex-based
+    `_redact_high_confidence_only` couldn't re-match a tail because
+    the prefix was clipped from the 40-char window. The fix
+    (`_blank_high_conf_overlaps`) walks the full findings list and
+    blanks any byte that overlaps a high-conf span in source
+    coordinates, then runs the regex pass for any high-conf secret
+    that fully fits inside the window."""
+
+    def test_stripe_key_does_not_leak_into_neighbor_context(self):
+        # Construct an input where:
+        # - a stripe_key (high-conf, 0.98) sits at the start
+        # - an email (medium-conf, 0.65) sits ~20 chars later
+        # - the email's context_before captures the LAST 40 chars of
+        #   text — which includes the tail of the stripe key. Without
+        #   the fix, the truncated stripe key tail leaks as plaintext
+        #   into the email's context_before.
+        stripe = "sk_live_" + "A" * 40  # 48 chars total
+        email = "alice@example.org"
+        # email's context_before window = 40 chars before email's start.
+        # If stripe sits at offset 0, email at offset 49 (one space),
+        # email's context_before is positions 9-49 = `A`*39 + ` `.
+        # The stripe key prefix `sk_live_` is at positions 0-7,
+        # outside the 40-char window — so the regex sees only `A*39`
+        # (no `sk_live_` prefix → no match → leak without the fix).
+        text = f"{stripe} {email}"
+        _, _, log = redact_text(text)
+        email_entry = next(
+            (e for e in log if e["type"] == "email"),
+            None,
+        )
+        assert email_entry is not None, f"email entry not in log; log={log}"
+        ctx = email_entry.get("context_before", "")
+        assert "A" * 30 not in ctx, (
+            f"stripe-key tail leaked into email's context_before: "
+            f"ctx_before={ctx!r}"
+        )
+        # The fix should have replaced the overlap with the placeholder.
+        assert "[REDACTED_STRIPE_KEY]" in ctx, (
+            f"high-conf overlap should be placeholder-blanked; "
+            f"ctx_before={ctx!r}"
+        )
+
+    def test_anthropic_key_does_not_leak_into_ip_context(self):
+        # Anthropic key (high-conf 0.98) followed by a medium-conf
+        # ip_address. Same shape as the stripe case.
+        anthropic = "sk-ant-api03-" + "A" * 60
+        ip = "203.0.113.5"
+        text = f"{anthropic} ip={ip}"
+        _, _, log = redact_text(text)
+        ip_entry = next(
+            (e for e in log if e["type"] == "ip_address"),
+            None,
+        )
+        assert ip_entry is not None
+        ctx = ip_entry.get("context_before", "")
+        assert "sk-ant-api03" not in ctx
+        assert "A" * 30 not in ctx
+
+    def test_short_high_conf_secret_in_window_still_regex_redacted(self):
+        """When a high-conf secret fits ENTIRELY inside the 40-char
+        context window, the existing regex pass redacts it. The new
+        span-blank pass is a no-op (no overlap because the high-conf
+        finding's span is wholly inside the window). Both paths must
+        cooperate, not double-redact or fight."""
+
+        # Tiny stripe key (24-char tail) fits in 32-char window.
+        stripe = "sk_live_" + "A" * 24
+        email = "bob@example.org"
+        text = f"start {stripe} {email}"
+        _, _, log = redact_text(text)
+        email_entry = next(
+            (e for e in log if e["type"] == "email"),
+            None,
+        )
+        assert email_entry is not None
+        ctx = email_entry.get("context_before", "")
+        # Either path is acceptable as long as the secret is gone.
+        assert "sk_live_" not in ctx or "[REDACTED_STRIPE_KEY]" in ctx
+        assert "A" * 24 not in ctx
