@@ -698,9 +698,60 @@ class TestStripeKey:
             "Stripe regex should not match into a longer identifier"
         )
 
+    def test_key_followed_by_underscore_word_still_matches(self):
+        """Round-3: trailing `\\b` was the original terminator; it
+        failed when the key was abutted by `_word` because `_` is a
+        word char. Real text like an f-string `{sk_live_xxx}_id` would
+        leak the secret. Replaced with `(?![A-Za-z0-9])` which
+        terminates on `_` and other non-alphanumeric chars."""
+
+        text = "let key = 'sk_live_" + "A" * 24 + "_metadata' # leak"
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_key" for f in findings), (
+            f"Stripe key followed by _word should still match; "
+            f"got {[f['type'] for f in findings]}"
+        )
+
     def test_confidence_and_placeholder_registered(self):
         assert CONFIDENCE["stripe_key"] == 0.98
         assert SECRET_PLACEHOLDER["stripe_key"] == "[REDACTED_STRIPE_KEY]"
+
+
+class TestStripeWebhookSecret:
+    """Round-3: webhook signing secrets (`whsec_…`) are functionally
+    distinct from API keys (used for signature verification, not auth)
+    so they get their own pattern + placeholder."""
+
+    def test_basic_match(self):
+        text = "STRIPE_WEBHOOK_SECRET=whsec_" + "A" * 32
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_webhook_secret" for f in findings)
+
+    def test_short_tail_does_not_match(self):
+        text = "whsec_" + "B" * 23  # below 24-char minimum
+        findings = scan_text(text)
+        assert not any(
+            f["type"] == "stripe_webhook_secret" for f in findings
+        )
+
+    def test_terminator_allows_underscore_continuation(self):
+        text = "secret = whsec_" + "C" * 24 + "_label"
+        findings = scan_text(text)
+        assert any(f["type"] == "stripe_webhook_secret" for f in findings)
+
+    def test_embedded_in_identifier_does_not_match(self):
+        text = "mywhsec_" + "D" * 30
+        findings = scan_text(text)
+        assert not any(
+            f["type"] == "stripe_webhook_secret" for f in findings
+        )
+
+    def test_confidence_and_placeholder_registered(self):
+        assert CONFIDENCE["stripe_webhook_secret"] == 0.98
+        assert (
+            SECRET_PLACEHOLDER["stripe_webhook_secret"]
+            == "[REDACTED_STRIPE_WEBHOOK_SECRET]"
+        )
 
 
 # --- A2: Bearer bound + generic bearer ---
@@ -890,3 +941,61 @@ class TestIpVersionGuard:
         assert "1.2.3.4" in result
         assert "203.0.113.5" not in result
         assert "[REDACTED_IP]" in result
+
+    def test_short_keyword_with_separator_still_suppresses(self):
+        """`tag 100.200.50.99` — `tag` precedes a real IP with a space
+        separator. The version guard fires and suppresses (we can't
+        tell a build tag from a real IP after a bare `tag`)."""
+
+        text = "tag 100.200.50.99"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_v_prefix_with_separator_suppresses(self):
+        text = "v 1.2.3.4"
+        findings = scan_text(text)
+        assert not any(f["type"] == "ip_address" for f in findings)
+
+    def test_short_keyword_no_separator_unreachable_by_design(self):
+        """Round-3 self-review: an over-fire concern was raised about
+        `tag100.200.50.99` (no space between keyword and IP) silently
+        suppressing a real IP. Empirically, the IP regex's own leading
+        `\\b` doesn't fire when the previous char is a word character
+        (the last char of the keyword). So the IP regex never matches
+        in this position, the guard never runs, and the over-fire is
+        unreachable. Pin this so a future widening of the IP regex's
+        boundary policy makes the test fail loudly and forces a guard
+        update."""
+
+        text = "tag100.200.50.99"  # contiguous, no separator
+        findings = scan_text(text)
+        ip_findings = [f for f in findings if f["type"] == "ip_address"]
+        assert ip_findings == [], (
+            f"IP regex should not fire when preceded by a word char; "
+            f"got {ip_findings}. If this fails, the guard regex needs "
+            f"the round-3 separator-required tightening."
+        )
+
+    def test_ip_at_exact_end_of_string(self):
+        """Round-3: pin the head-guard's index-bounds check. The match
+        end might equal len(text); the guard must not IndexError."""
+
+        text = "Server is at 203.0.113.5"  # IP at exact EOS
+        findings = scan_text(text)
+        assert any(
+            f["type"] == "ip_address" and f["match"] == "203.0.113.5"
+            for f in findings
+        )
+
+    def test_ip_in_cidr_notation_redacts(self):
+        """Round-3: CIDR-suffixed IP (`/24`) should still redact — the
+        `/` is non-word and non-digit, so neither guard heuristic
+        suppresses. Pinning so a future tweak doesn't break netblock
+        redaction."""
+
+        text = "block 203.0.113.0/24 from outside"
+        findings = scan_text(text)
+        assert any(
+            f["type"] == "ip_address" and f["match"] == "203.0.113.0"
+            for f in findings
+        )

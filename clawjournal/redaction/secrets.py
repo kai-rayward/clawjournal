@@ -58,7 +58,27 @@ SECRET_PATTERNS = [
     # `_test_…` variants. Cass's table flags this as a likely gap; verified
     # absent before adding. The 24+ char tail matches every real Stripe
     # key shape (current keys are 24-32 chars after the underscore).
-    ("stripe_key", re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b")),
+    #
+    # Round-3 fix: trailing terminator is `(?![A-Za-z0-9])` instead of
+    # `\b`. A real Stripe key abutted by `_word` (e.g. inside an
+    # f-string like `f"{sk_live_xxx}_id"`) would never satisfy `\b`
+    # because `_` is a word character — engine would backtrack the
+    # greedy `{24,}` body all the way down and never find a boundary.
+    # The negative lookahead correctly terminates on `_` and any other
+    # non-alphanumeric character while still blocking match into a
+    # longer alphanumeric run (preserves the round-1 identifier-
+    # embedding regression test).
+    ("stripe_key", re.compile(
+        r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}(?![A-Za-z0-9])"
+    )),
+
+    # Stripe webhook signing secrets — used to verify the authenticity
+    # of incoming webhook events. Different secret class than the API
+    # keys above (signature verification rather than API auth), so a
+    # distinct entry + placeholder. Same boundary discipline.
+    ("stripe_webhook_secret", re.compile(
+        r"\bwhsec_[A-Za-z0-9]{24,}(?![A-Za-z0-9])"
+    )),
 
     # AWS access key IDs (but not in regex pattern context)
     ("aws_key", re.compile(r"(?<![A-Za-z0-9\[])AKIA[0-9A-Z]{16}(?![0-9A-Z\]{}])")),
@@ -167,7 +187,7 @@ CONFIDENCE: dict[str, float] = {
     "anthropic_key": 0.98, "openai_key": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
     "pypi_token": 0.98, "npm_token": 0.98,
-    "stripe_key": 0.98,
+    "stripe_key": 0.98, "stripe_webhook_secret": 0.98,
     "aws_key": 0.98, "aws_secret": 0.95,
     "slack_token": 0.98, "discord_webhook": 0.95,
     "jwt_partial": 0.80, "db_url": 0.85,
@@ -201,6 +221,7 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "bearer": "[REDACTED_BEARER]",
     "bearer_generic": "[REDACTED_BEARER]",
     "stripe_key": "[REDACTED_STRIPE_KEY]",
+    "stripe_webhook_secret": "[REDACTED_STRIPE_WEBHOOK_SECRET]",
     "ip_address": "[REDACTED_IP]",
     "url_token": "[REDACTED_URL_TOKEN]",
     "email": "[REDACTED_EMAIL]",
@@ -309,6 +330,13 @@ _ASSIGNMENT_PATTERNS = frozenset({"env_secret", "generic_secret", "aws_secret"})
 # a version far back in the sentence) are recoverable; false positives
 # (a real public IP gets passed through because of an unrelated
 # `version` somewhere upstream) would silently leak.
+#
+# Trailing `\s*[:=]?\s*$` accepts the unreachable "keyword followed
+# immediately by the IP with no separator" case as a no-op: the IP
+# regex's own leading `\b` cannot fire when the previous char is a
+# word character (the keyword's last char), so this branch is
+# inert in practice. Documenting rather than tightening because
+# tightening would add complexity without changing behavior.
 _IP_VERSION_INTRODUCER = re.compile(
     r"(?:^|\s|[\(\[<])(?:v|ver|version|commit|release|build|tag|sha|rev"
     r"|major|minor|patch)\s*[:=]?\s*$",
