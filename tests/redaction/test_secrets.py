@@ -668,6 +668,20 @@ class TestStripeKey:
         findings = scan_text(text)
         assert not any(f["type"] == "stripe_key" for f in findings)
 
+    def test_embedded_in_identifier_does_not_match(self):
+        """Round-1 self-review: pin the `\\b` boundary at the start of
+        the regex. `mysk_live_…` should NOT match because `\\b` requires
+        a non-word→word transition before `s`, and `y` (in `my`) is a
+        word char. Without the boundary, the regex would over-match and
+        flag any identifier that happens to contain a Stripe-like
+        suffix."""
+
+        text = "let mysk_live_AAAAAAAAAAAAAAAAAAAAAAAAA = 1"
+        findings = scan_text(text)
+        assert not any(f["type"] == "stripe_key" for f in findings), (
+            "Stripe regex should not match into a longer identifier"
+        )
+
     def test_confidence_and_placeholder_registered(self):
         assert CONFIDENCE["stripe_key"] == 0.98
         assert SECRET_PLACEHOLDER["stripe_key"] == "[REDACTED_STRIPE_KEY]"
@@ -725,6 +739,28 @@ class TestBearerBound:
         # shaped's 0.85.
         assert CONFIDENCE["bearer_generic"] == 0.75
         assert CONFIDENCE["bearer"] == 0.85
+
+    def test_jwt_shaped_bearer_fires_both_patterns_at_scan_level(self):
+        """Round-1 self-review: the JWT-shaped bearer pattern AND the
+        generic bearer pattern are strict supersets at the regex level
+        (both match `Bearer <token>` shapes). At scan_text the user sees
+        both findings; redact_text's dedup loop resolves to one
+        replacement. Pin both behaviors so a future registry reorder
+        can't silently drop one."""
+
+        bearer = "Bearer eyJ" + "A" * 30 + "." + "B" * 30 + "." + "C" * 30
+        findings = scan_text(bearer)
+        types = {f["type"] for f in findings}
+        # The inner JWT pattern also matches (eyJ shape inside the
+        # bearer span). All three of bearer / bearer_generic / jwt fire
+        # as candidate findings; dedup picks one for replacement.
+        assert "bearer" in types
+        assert "bearer_generic" in types
+
+        # Exactly one redaction lands end-to-end.
+        result, count, _ = redact_text(bearer)
+        assert count == 1
+        assert "A" * 30 not in result and "B" * 30 not in result
 
 
 # --- A2: IP version-context guard ---

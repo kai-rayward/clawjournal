@@ -290,6 +290,14 @@ _ASSIGNMENT_PATTERNS = frozenset({"env_secret", "generic_secret", "aws_secret"})
 # not also suppress on `=`/`:` assignment context — the existing
 # ALLOWLIST handles known-good public IPs (Google/Cloudflare DNS) by
 # explicit literal entry.
+# Intentionally conservative — only fires when the keyword IMMEDIATELY
+# precedes the IP (with optional whitespace and `:`/`=`). Strings like
+# ``Apache version 2.4 and the 1.2.3.4 server`` will NOT suppress the
+# IP because `version` doesn't sit right before `1.2.3.4`. This is the
+# right trade-off: false negatives (the IP redacts when it's actually
+# a version far back in the sentence) are recoverable; false positives
+# (a real public IP gets passed through because of an unrelated
+# `version` somewhere upstream) would silently leak.
 _IP_VERSION_INTRODUCER = re.compile(
     r"(?:^|\s|[\(\[<])(?:v|ver|version|commit|release|build|tag|sha|rev"
     r"|major|minor|patch)\s*[:=]?\s*$",
