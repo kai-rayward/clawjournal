@@ -43,6 +43,13 @@ _FAKE_JWT = (
 )
 _FAKE_ANTHROPIC = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"
 _FAKE_GITHUB = "ghp_abcdefghijklmnopqrstuvwxyzABCDEF0123"
+# Round-4 additions: cover the A2 pattern types end-to-end through the
+# DB-backed scan_session_for_findings → write_findings_to_db →
+# apply_findings_to_blob path (rounds 1-3 only validated them through
+# the legacy redact_text path).
+_FAKE_STRIPE = "sk_live_" + "A" * 28
+_FAKE_STRIPE_WEBHOOK = "whsec_" + "B" * 32
+_FAKE_OPAQUE_BEARER = "Bearer " + "C" * 40  # generic-shape, not JWT
 
 
 def _session_with_secrets():
@@ -72,9 +79,22 @@ def _session_with_secrets():
                     "output": "OK",
                 }],
             },
+            {
+                # Round-4: stripe_key, stripe_webhook_secret, and a
+                # generic-shape bearer all flow through the same
+                # findings substrate. Pin that they emit RawFinding
+                # records and survive write→apply round-trip.
+                "role": "assistant",
+                "content": (
+                    f"Charge with {_FAKE_STRIPE}; webhook signs with "
+                    f"{_FAKE_STRIPE_WEBHOOK}; opaque bearer: {_FAKE_OPAQUE_BEARER}"
+                ),
+                "thinking": "",
+                "tool_uses": [],
+            },
         ],
         "stats": {
-            "user_messages": 1, "assistant_messages": 1, "tool_uses": 1,
+            "user_messages": 1, "assistant_messages": 2, "tool_uses": 1,
             "input_tokens": 100, "output_tokens": 50,
         },
     }
@@ -116,6 +136,44 @@ class TestScanSessionForFindings:
             assert _FAKE_JWT not in dumped
             assert _FAKE_ANTHROPIC not in dumped
             assert _FAKE_GITHUB not in dumped
+
+    def test_a2_patterns_emit_raw_findings(self, conn):
+        """Round-4: pin that the A2-added patterns (stripe_key,
+        stripe_webhook_secret, bearer_generic) flow through the
+        DB-backed scan path and produce RawFinding records the same
+        way JWT/anthropic/github do. Rounds 1-3 only validated the
+        legacy redact_text path; this pins the substrate."""
+
+        raw = scan_session_for_findings(_session_with_secrets())
+        types = {f.entity_type for f in raw}
+        assert "stripe_key" in types, (
+            f"stripe_key missing from findings substrate: types={sorted(types)}"
+        )
+        assert "stripe_webhook_secret" in types, (
+            f"stripe_webhook_secret missing: types={sorted(types)}"
+        )
+        # The opaque bearer in the fixture gets caught by bearer_generic
+        # (no JWT shape, no inner JWT match overlay).
+        assert "bearer_generic" in types, (
+            f"bearer_generic missing: types={sorted(types)}"
+        )
+
+    def test_a2_secrets_no_plaintext_in_db(self, conn):
+        """Round-4: write→read round-trip for the A2 patterns;
+        plaintext must not appear in any DB column."""
+
+        raw = scan_session_for_findings(_session_with_secrets())
+        _seed_session_row(conn)
+        write_findings_to_db(conn, "sess-1", raw, revision="v1:t")
+        conn.commit()
+        rows = conn.execute("SELECT * FROM findings").fetchall()
+        for row in rows:
+            dumped = str(dict(row))
+            assert "sk_live_" + "A" * 28 not in dumped
+            assert "whsec_" + "B" * 32 not in dumped
+            # The opaque bearer body is 40 C's; a substring check is
+            # enough to detect leakage.
+            assert "C" * 40 not in dumped
 
 
 def _field_text(blob, finding):

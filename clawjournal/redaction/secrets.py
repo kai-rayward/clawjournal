@@ -54,6 +54,32 @@ SECRET_PATTERNS = [
     # NPM tokens
     ("npm_token", re.compile(r"npm_[A-Za-z0-9]{30,}")),
 
+    # Stripe API keys — `sk_live_…`, `pk_live_…`, `rk_live_…`, plus the
+    # `_test_…` variants. Cass's table flags this as a likely gap; verified
+    # absent before adding. The 24+ char tail matches every real Stripe
+    # key shape (current keys are 24-32 chars after the underscore).
+    #
+    # Round-3 fix: trailing terminator is `(?![A-Za-z0-9])` instead of
+    # `\b`. A real Stripe key abutted by `_word` (e.g. inside an
+    # f-string like `f"{sk_live_xxx}_id"`) would never satisfy `\b`
+    # because `_` is a word character — engine would backtrack the
+    # greedy `{24,}` body all the way down and never find a boundary.
+    # The negative lookahead correctly terminates on `_` and any other
+    # non-alphanumeric character while still blocking match into a
+    # longer alphanumeric run (preserves the round-1 identifier-
+    # embedding regression test).
+    ("stripe_key", re.compile(
+        r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{24,}(?![A-Za-z0-9])"
+    )),
+
+    # Stripe webhook signing secrets — used to verify the authenticity
+    # of incoming webhook events. Different secret class than the API
+    # keys above (signature verification rather than API auth), so a
+    # distinct entry + placeholder. Same boundary discipline.
+    ("stripe_webhook_secret", re.compile(
+        r"\bwhsec_[A-Za-z0-9]{24,}(?![A-Za-z0-9])"
+    )),
+
     # AWS access key IDs (but not in regex pattern context)
     ("aws_key", re.compile(r"(?<![A-Za-z0-9\[])AKIA[0-9A-Z]{16}(?![0-9A-Z\]{}])")),
 
@@ -101,9 +127,34 @@ SECRET_PATTERNS = [
         re.IGNORECASE,
     )),
 
-    # Bearer tokens in headers
+    # Bearer tokens in headers, JWT-shaped. Three character runs bounded
+    # at {20,2048} per segment (was {20,}) — closes the polynomial-
+    # backtracking surface from three unbounded character classes
+    # separated by literal `.`. Real JWTs sit well under 2048 per
+    # segment; the cap fails-loud rather than producing pathological
+    # match times on adversarial input.
+    #
+    # `\b(?i:Bearer)` round-2 hardening: the leading `\b` prevents the
+    # regex from splitting an identifier (`myBearer eyJ…` no longer
+    # carves out `Bearer eyJ…` and leaves `my` orphaned), and `(?i:)`
+    # accepts `BEARER`/`bearer`/`Bearer` so case-mangled headers still
+    # land at the higher-confidence `bearer` classification (0.85)
+    # rather than falling through to `bearer_generic` (0.75).
     ("bearer", re.compile(
-        r"Bearer\s+(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})"
+        r"\b(?i:Bearer)\s+(eyJ[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048}\.[A-Za-z0-9_-]{20,2048})"
+    )),
+
+    # Generic Bearer tokens — non-JWT-shaped opaque/OAuth bearers that
+    # the JWT-shaped pattern above misses. Bounded at {20,2048} for the
+    # same ReDoS-prevention reason. Distinct entry so confidence (0.75)
+    # can sit lower than JWT-shaped (0.85) — generic bearers are higher-
+    # FP because the character class is broader.
+    #
+    # Leading `\b` matches the JWT-shaped variant's round-2 hardening
+    # so this regex also can't carve a substring out of a longer
+    # identifier.
+    ("bearer_generic", re.compile(
+        r"\b(?i:Bearer)\s+([A-Za-z0-9\-_.~+/]{20,2048}=*)"
     )),
 
     # IP addresses (public, non-loopback, non-private-by-default)
@@ -136,10 +187,11 @@ CONFIDENCE: dict[str, float] = {
     "anthropic_key": 0.98, "openai_key": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
     "pypi_token": 0.98, "npm_token": 0.98,
+    "stripe_key": 0.98, "stripe_webhook_secret": 0.98,
     "aws_key": 0.98, "aws_secret": 0.95,
     "slack_token": 0.98, "discord_webhook": 0.95,
     "jwt_partial": 0.80, "db_url": 0.85,
-    "bearer": 0.85, "cli_token_flag": 0.80,
+    "bearer": 0.85, "bearer_generic": 0.75, "cli_token_flag": 0.80,
     "env_secret": 0.75, "generic_secret": 0.80,
     "url_token": 0.80,
     "ip_address": 0.60, "email": 0.65,
@@ -167,6 +219,9 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "env_secret": "[REDACTED_ENV_SECRET]",
     "generic_secret": "[REDACTED_SECRET]",
     "bearer": "[REDACTED_BEARER]",
+    "bearer_generic": "[REDACTED_BEARER]",
+    "stripe_key": "[REDACTED_STRIPE_KEY]",
+    "stripe_webhook_secret": "[REDACTED_STRIPE_WEBHOOK_SECRET]",
     "ip_address": "[REDACTED_IP]",
     "url_token": "[REDACTED_URL_TOKEN]",
     "email": "[REDACTED_EMAIL]",
@@ -250,6 +305,77 @@ _MIN_SCAN_LENGTH = 6
 _ASSIGNMENT_PATTERNS = frozenset({"env_secret", "generic_secret", "aws_secret"})
 
 
+# Negative-context heuristic for `ip_address`. The IP regex blacklists
+# obvious private/reserved prefixes via lookaheads but cannot tell a
+# real IPv4 address from a 4-segment version string. Two cheap checks
+# in the surrounding text catch the common false-positive shapes:
+#
+#   1. **Version-introducer keyword in the immediate prefix.** Strings
+#      like ``version 1.2.3.4``, ``commit 1.2.3.4``, ``release 2.0.1.4``
+#      look exactly like IP addresses to the regex.
+#   2. **Part of a longer dotted-numeric run.** Inside ``1.2.3.4.5`` the
+#      regex can match both ``1.2.3.4`` and ``2.3.4.5``; both should be
+#      suppressed because the surrounding shape is a 5-segment version,
+#      not two adjacent IPs.
+#
+# Real configs DO contain real IPs (`dns_server=8.8.8.8`), so we do
+# not also suppress on `=`/`:` assignment context — the existing
+# ALLOWLIST handles known-good public IPs (Google/Cloudflare DNS) by
+# explicit literal entry.
+# Intentionally conservative — only fires when the keyword IMMEDIATELY
+# precedes the IP (with optional whitespace and `:`/`=`). Strings like
+# ``Apache version 2.4 and the 1.2.3.4 server`` will NOT suppress the
+# IP because `version` doesn't sit right before `1.2.3.4`. This is the
+# right trade-off: false negatives (the IP redacts when it's actually
+# a version far back in the sentence) are recoverable; false positives
+# (a real public IP gets passed through because of an unrelated
+# `version` somewhere upstream) would silently leak.
+#
+# Trailing `\s*[:=]?\s*$` accepts the unreachable "keyword followed
+# immediately by the IP with no separator" case as a no-op: the IP
+# regex's own leading `\b` cannot fire when the previous char is a
+# word character (the keyword's last char), so this branch is
+# inert in practice. Documenting rather than tightening because
+# tightening would add complexity without changing behavior.
+_IP_VERSION_INTRODUCER = re.compile(
+    r"(?:^|\s|[\(\[<])(?:v|ver|version|commit|release|build|tag|sha|rev"
+    r"|major|minor|patch)\s*[:=]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _ip_looks_like_version(text: str, match: "re.Match[str]") -> bool:
+    """True when an ip_address-shaped match is more plausibly a version."""
+
+    start, end = match.start(), match.end()
+
+    # Char immediately before is `.` preceded by a digit → match is the
+    # tail of a longer dotted-numeric run, e.g. `0.1.2.3.4`.
+    if (
+        start >= 2
+        and text[start - 1] == "."
+        and text[start - 2].isdigit()
+    ):
+        return True
+
+    # Char immediately after is `.` followed by a digit → match is the
+    # head of a longer dotted-numeric run, e.g. `1.2.3.4.5`.
+    if (
+        end + 1 <= len(text) - 1
+        and text[end] == "."
+        and text[end + 1].isdigit()
+    ):
+        return True
+
+    # Trailing 24 chars before the match end with a version introducer.
+    ctx_start = max(0, start - 24)
+    prefix = text[ctx_start:start]
+    if _IP_VERSION_INTRODUCER.search(prefix):
+        return True
+
+    return False
+
+
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
     if not text or len(text) < _MIN_SCAN_LENGTH:
         return []
@@ -281,6 +407,12 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
                     continue
                 if inner.count(".") > 2:
                     continue
+
+            # For ip_address, suppress version-shaped matches
+            # (e.g. `version 1.2.3.4`, the slices of `1.2.3.4.5`).
+            # The regex itself can't carry this context check.
+            if name == "ip_address" and _ip_looks_like_version(text, match):
+                continue
 
             findings.append({
                 "type": name,
@@ -326,10 +458,22 @@ def redact_text(
             start, end = f["start"], f["end"]
             ctx_before = text[max(0, start - 40):start]
             ctx_after = text[end:end + 40]
-            # Redact high-confidence secrets in context (recursive, but only
-            # captures high-conf patterns so no infinite recursion risk)
-            safe_before = _redact_high_confidence_only(ctx_before)
-            safe_after = _redact_high_confidence_only(ctx_after)
+            # Redact high-confidence secrets in context. Two layers:
+            # (1) blank any byte that overlaps a high-conf finding's
+            # span in the FULL findings list — catches the "secret
+            # tail leaks into the 40-char window because the regex
+            # can't re-match a truncated tail" gap (round-4 self-
+            # review). (2) regex-based pass for any high-conf secret
+            # that fully fits inside the window. Order matters: span
+            # blanking first so the regex sees clean text.
+            safe_before = _blank_high_conf_overlaps(
+                ctx_before, max(0, start - 40), findings,
+            )
+            safe_after = _blank_high_conf_overlaps(
+                ctx_after, end, findings,
+            )
+            safe_before = _redact_high_confidence_only(safe_before)
+            safe_after = _redact_high_confidence_only(safe_after)
             entry["context_before"] = safe_before
             entry["context_after"] = safe_after
         log.append(entry)
@@ -341,6 +485,54 @@ def redact_text(
         result = result[:f["start"]] + placeholder + result[f["end"]:]
 
     return result, len(deduped), log
+
+
+def _blank_high_conf_overlaps(
+    substring: str,
+    sub_start: int,
+    all_findings: list[dict],
+) -> str:
+    """Round-4 self-review: blank bytes in a context window that overlap
+    a high-confidence finding's span in the source text.
+
+    `_redact_high_confidence_only`'s regex-based pass cannot re-match
+    a truncated tail of a high-conf secret (the regex needs the prefix
+    + minimum-length tail). Without this pre-pass, the trailing bytes
+    of an outer secret leak into the context_before/context_after
+    fields of a neighboring medium-conf finding's redaction-log entry.
+    Round 4 found this leak widening with the new bearer_generic
+    pattern (broader alphabet) plus stripe_key/stripe_webhook_secret
+    (new high-conf families); fix is to blank known high-conf spans
+    using the full findings list instead of relying on regex re-match
+    against truncated input.
+
+    `sub_start` is the offset of `substring` in the source text so
+    overlap can be computed in source coordinates.
+    """
+
+    if not substring:
+        return substring
+    sub_end = sub_start + len(substring)
+    overlaps: list[tuple[int, int, str]] = []
+    for f in all_findings:
+        if f["confidence"] < 0.90:
+            continue
+        # Overlap range in source-text coordinates
+        ov_start = max(f["start"], sub_start)
+        ov_end = min(f["end"], sub_end)
+        if ov_start < ov_end:
+            placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
+            # Translate to substring coordinates
+            overlaps.append((ov_start - sub_start, ov_end - sub_start, placeholder))
+    if not overlaps:
+        return substring
+    # Sort descending by start so right-to-left replacement preserves
+    # earlier offsets.
+    overlaps.sort(key=lambda x: x[0], reverse=True)
+    out = substring
+    for s, e, ph in overlaps:
+        out = out[:s] + ph + out[e:]
+    return out
 
 
 def _redact_high_confidence_only(text: str) -> str:
