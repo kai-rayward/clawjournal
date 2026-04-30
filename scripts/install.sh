@@ -17,6 +17,11 @@
 
 set -eu
 
+# Capture stderr from venv creation in a per-run temp file. mktemp avoids the
+# /tmp/<predictable-name> race (multi-user systems, symlink attacks).
+ERR_LOG="$(mktemp 2>/dev/null || echo "/tmp/clawjournal-venv.$$.err")"
+trap 'rm -f "$ERR_LOG"' EXIT INT TERM
+
 WITH_FRONTEND=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -81,17 +86,15 @@ echo "[ok] Python: $("$PYTHON" --version 2>&1) ($(command -v "$PYTHON"))"
 #    python3-venv isn't installed — surface that clearly.
 if [ ! -x "$VENV_DIR/bin/python" ] && [ ! -x "$VENV_DIR/Scripts/python.exe" ]; then
   echo "-> Creating venv at $VENV_DIR"
-  if ! "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/clawjournal-venv.err; then
-    cat /tmp/clawjournal-venv.err >&2
+  if ! "$PYTHON" -m venv "$VENV_DIR" 2>"$ERR_LOG"; then
+    cat "$ERR_LOG" >&2
     cat >&2 <<EOF
 
 Hint: on Debian/Ubuntu the venv module is in a separate package:
   sudo apt install -y python3-venv python3-full
 EOF
-    rm -f /tmp/clawjournal-venv.err
     exit 1
   fi
-  rm -f /tmp/clawjournal-venv.err
 fi
 
 if [ -x "$VENV_DIR/bin/python" ]; then
@@ -107,7 +110,8 @@ echo "-> Installing ClawJournal (editable) from $REPO_DIR"
 "$VENV_PY" -m pip install --quiet --upgrade pip
 "$VENV_PY" -m pip install --quiet -e "$REPO_DIR"
 
-# 4) Optional: build the browser workbench.
+# 4) Optional: build the browser workbench. Failures here are non-fatal — the
+#    CLI install already succeeded; only the opt-in frontend is missing.
 if [ "$WITH_FRONTEND" -eq 1 ]; then
   if ! command -v npm >/dev/null 2>&1; then
     cat >&2 <<EOF
@@ -116,7 +120,9 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
 EOF
   else
     echo "-> Building browser workbench"
-    (cd "$REPO_DIR/clawjournal/web/frontend" && npm install --silent && npm run build --silent)
+    if ! ( cd "$REPO_DIR/clawjournal/web/frontend" && npm install --silent && npm run build --silent ); then
+      echo "[!] Frontend build failed. The CLI is installed; re-run with --with-frontend after fixing the build." >&2
+    fi
   fi
 fi
 

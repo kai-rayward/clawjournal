@@ -103,7 +103,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $VenvPy -m pip install --quiet -e $RepoDir
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# 4) Optional frontend build.
+# 4) Optional frontend build. Failures here are non-fatal — the CLI install
+#    already succeeded; only the opt-in frontend is missing.
 if ($WithFrontend) {
     $npm = Get-Command npm -ErrorAction SilentlyContinue
     if (-not $npm) {
@@ -113,7 +114,14 @@ if ($WithFrontend) {
         Push-Location (Join-Path $RepoDir 'clawjournal\web\frontend')
         try {
             & npm install --silent
-            & npm run build --silent
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "npm install failed (exit $LASTEXITCODE); workbench not built. The CLI is installed."
+            } else {
+                & npm run build --silent
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "npm run build failed (exit $LASTEXITCODE); workbench not built. The CLI is installed."
+                }
+            }
         } finally {
             Pop-Location
         }
