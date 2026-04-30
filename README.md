@@ -30,7 +30,7 @@ Inside any compatible coding agent (Claude Code, Codex, Cursor, Gemini CLI, Open
 npx skills add kai-rayward/clawjournal
 ```
 
-Then tell the agent: *"setup clawjournal"*. It installs the PyPI package, scans your local sessions with default settings, and opens the workbench at `http://localhost:8384`. Nothing is uploaded.
+Then tell the agent: *"setup clawjournal"*. It clones the repo into `~/clawjournal`, installs ClawJournal in an isolated venv, scans your local sessions with default settings, and opens the workbench at `http://localhost:8384`. Nothing is uploaded.
 
 Prefer the terminal? See Stage 1 in the flow below — every stage shows both skills and shell commands.
 
@@ -63,15 +63,45 @@ Day-to-day, prompts like *"triage my new sessions"*, *"score everything unscored
 npx skills add kai-rayward/clawjournal
 ```
 
-Adds the three ClawJournal skills to your agent. The PyPI package itself is installed in Stage 2 as part of `setup clawjournal`.
+Adds the three ClawJournal skills to your agent. ClawJournal itself is installed when you run `setup clawjournal` (the wizard executes the same source-install path documented below).
 
-**Shell — in any bash/zsh terminal:**
+**Shell — install from source (recommended):**
+
+The GitHub source is the canonical version. The PyPI wheel currently lags behind, so features documented in this README may not be present in `pip install clawjournal`. The bundled installer script picks a Python 3.10+ interpreter, creates an isolated venv at `~/.clawjournal-venv`, and installs ClawJournal in editable mode. It's idempotent — re-run any time to upgrade against the latest checkout.
+
+macOS / Linux / WSL / Git Bash on Windows — clone, then run *one* of the install commands (`--with-frontend` requires Node.js):
+
+```bash
+git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+cd ~/clawjournal
+
+./scripts/install.sh                  # CLI only
+# or
+./scripts/install.sh --with-frontend  # also build the browser workbench
+```
+
+Native Windows PowerShell — clone, then run *one* of the install commands:
+
+```powershell
+git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+Set-Location "$HOME\clawjournal"
+
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1                 # CLI only
+# or
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend   # also build the browser workbench
+```
+
+After the script completes, either add the venv bin directory to your `PATH` or invoke the binary directly: `~/.clawjournal-venv/bin/clawjournal` on POSIX, or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` on Windows.
+
+The browser workbench (`clawjournal serve`) needs a one-time frontend build — pass the `--with-frontend` / `-WithFrontend` flag during install, or see [Build the browser workbench](#build-the-browser-workbench) below. Skip it if you'll only use the CLI.
+
+**Shell — install from PyPI (fallback, may be out of date):**
 
 ```bash
 pipx install clawjournal        # or: pip install clawjournal
 ```
 
-Requires Python 3.10+. `pipx` is preferred because it isolates the CLI in its own environment and puts `clawjournal` on your `PATH`. The PyPI wheel already includes the pre-built browser workbench — no frontend build required.
+Faster, and the wheel ships the pre-built workbench (no Node.js needed). Use this only if installing from source isn't an option — `pip show clawjournal` will tell you the wheel's version, which currently lags the GitHub source by many releases.
 
 **TruffleHog (required for sharing):**
 
@@ -91,7 +121,7 @@ For a first-time run with defaults (all sources, no exclusions), say:
 
 > *"setup clawjournal"*
 
-The skill installs the PyPI package, runs a first scan, and opens the workbench. Later, to narrow scope or add redactions:
+The skill installs ClawJournal from GitHub, runs a first scan, and opens the workbench. Later, to narrow scope or add redactions:
 
 > *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."*
 
@@ -212,28 +242,26 @@ Upload is gated on hold-state: only sessions in `auto_redacted` or `released` ca
 
 ---
 
-## Build from source (contributors)
+## Build the browser workbench
 
-You only need this path if you're developing ClawJournal itself — the PyPI wheel is the right choice for everyone else.
+`clawjournal serve` opens a local Vite app from `clawjournal/web/frontend/dist/`. The PyPI wheel ships this `dist/` pre-built; a source install needs a one-time build.
 
-> Commands below assume a POSIX shell (bash/zsh). On Windows, run them inside WSL or Git Bash. Native PowerShell users: replace `source .venv/bin/activate` with `.venv\Scripts\Activate.ps1`.
+The simplest way is to re-run the installer with the frontend flag:
 
 ```bash
-git clone https://github.com/kai-rayward/clawjournal.git
-cd clawjournal
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
+~/clawjournal/scripts/install.sh --with-frontend                    # POSIX
+powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend   # Windows
+```
 
-# One-time frontend build for the browser workbench
-cd clawjournal/web/frontend
+Or do it manually:
+
+```bash
+cd ~/clawjournal/clawjournal/web/frontend
 npm install
 npm run build
-cd ../../..
-
-clawjournal scan
-clawjournal serve
 ```
+
+Either path requires Node.js. Skip the build entirely if you're only using the CLI (`scan`, `inbox`, `search`, `bundle-export`, …).
 
 <details>
 <summary><b>Python not installed?</b></summary>
@@ -249,26 +277,7 @@ ClawJournal requires Python 3.10+.
 </details>
 
 <details>
-<summary><b>Using a virtual environment (recommended)</b></summary>
-
-Modern Linux distributions (Debian 12+, Ubuntu 23.04+) and some macOS setups block system-wide pip installs ([PEP 668](https://peps.python.org/pep-0668/)).
-
-From the repo root:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-```
-
-> If you see `externally-managed-environment`, make sure the venv is activated before running `python -m pip`.
-
-</details>
-
-<details>
-<summary><b>Node.js required only when building from source</b></summary>
-
-The PyPI wheel ships the pre-built workbench. You only need Node if you're building from source.
+<summary><b>Node.js (only for the frontend build)</b></summary>
 
 | Platform | Install command |
 |----------|----------------|
@@ -276,11 +285,23 @@ The PyPI wheel ships the pre-built workbench. You only need Node if you're build
 | **Windows** | Download from [nodejs.org](https://nodejs.org) |
 | **Linux** | `sudo apt install nodejs npm` |
 
+</details>
+
+<details>
+<summary><b>Developing ClawJournal itself</b></summary>
+
 ```bash
-cd clawjournal/web/frontend
-npm install
-npm run build
+git clone https://github.com/kai-rayward/clawjournal.git
+cd clawjournal
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+pytest
 ```
+
+On native Windows (no WSL / Git Bash), replace `source .venv/bin/activate` with `.venv\Scripts\Activate.ps1`.
+
+If you see `externally-managed-environment` on Linux/macOS, make sure the venv is activated before running `python -m pip` ([PEP 668](https://peps.python.org/pep-0668/)).
 
 </details>
 

@@ -1,0 +1,20 @@
+* text=auto eol=lf
+
+# Force LF for shell scripts so they remain executable when cloned on Windows
+# with core.autocrlf=true (CRLF in a shebang breaks bash with "bad interpreter").
+*.sh    text eol=lf
+
+# PowerShell scripts work fine with either, but pin to CRLF for native tooling.
+*.ps1   text eol=crlf
+
+# Binary files: skip line-ending normalization.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.zip   binary
+*.gz    binary

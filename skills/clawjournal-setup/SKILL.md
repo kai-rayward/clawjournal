@@ -12,58 +12,64 @@ Interactive setup wizard. Walk the user through each step. Only pause when user 
 ## 0. Preflight
 
 Check if `clawjournal` is already installed:
-- `which clawjournal && clawjournal --version`
-- `test -x ~/.clawjournal-venv/bin/clawjournal && ~/.clawjournal-venv/bin/clawjournal --version`
+- `command -v clawjournal && clawjournal status`
+- `test -x ~/.clawjournal-venv/bin/clawjournal && ~/.clawjournal-venv/bin/clawjournal status`
 
-**If found:** Skip to Step 2. If only `~/.clawjournal-venv/bin/clawjournal` exists, use that full path for commands below.
+**If found and the user is just resuming:** skip to Step 2. If only `~/.clawjournal-venv/bin/clawjournal` exists, use that full path for commands below.
+**If found but the user wants the latest:** re-run Step 1's installer (idempotent — it'll fast-forward the checkout and reinstall in place), then continue to Step 2.
 **If not found:** Continue to Step 1.
 
 ## 1. Install
 
-Check Python environment:
-- `python3 --version`
+Use the bundled installer scripts. They detect a Python 3.10+ interpreter, create an isolated venv at `~/.clawjournal-venv`, and `pip install -e` the repo. Idempotent — safe to re-run.
 
-If Python not found or < 3.10:
-- Ask: "Python 3.10+ is required. Would you like me to install it?"
-- macOS: `brew install python`
-- Linux: `sudo apt-get install -y python3 python3-full`
-- Windows: direct user to python.org/downloads
+First, ask: "Do you want the browser workbench? (Recommended — it's the primary review surface. Otherwise the CLI works alone.)" Use the answer to pick whether to pass the frontend flag below.
 
-Install clawjournal from GitHub. The snippets below assume a POSIX shell. On native Windows (no WSL / Git Bash), translate each step to the equivalent PowerShell commands before running them.
+**macOS / Linux / WSL / Git Bash on Windows:**
 
-1. Clone or update the repo:
-   ```bash
-   if [ -d ~/clawjournal/.git ]; then
-     git -C ~/clawjournal pull --ff-only
-   else
-     git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
-   fi
-   ```
-2. Create a venv and install editable:
-   ```bash
-   python3 -m venv ~/.clawjournal-venv
-   ~/.clawjournal-venv/bin/python -m pip install -e ~/clawjournal
-   ```
-3. If the user wants the browser UI, ensure Node.js/npm is available and build the frontend once:
-   ```bash
-   cd ~/clawjournal/clawjournal/web/frontend
-   npm install
-   npm run build
-   cd ~/clawjournal
-   ```
+```bash
+if [ -d ~/clawjournal/.git ]; then
+  git -C ~/clawjournal pull --ff-only
+else
+  git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+fi
 
-If `node` / `npm` is missing and the user wants the browser UI:
-- Ask: "Node.js is required for the browser workbench. Would you like me to install it?"
-- macOS: `brew install node`
-- Linux: `sudo apt-get install -y nodejs npm`
-- Windows: direct user to nodejs.org
+# Pick ONE based on the user's answer above:
+~/clawjournal/scripts/install.sh                    # CLI only
+~/clawjournal/scripts/install.sh --with-frontend    # also build the browser workbench (needs Node.js)
+```
 
-Verify:
-- `~/.clawjournal-venv/bin/clawjournal --version`
+**Native Windows PowerShell** (no WSL / Git Bash):
 
-If verification fails, read the error and fix. Common issues:
-- `clawjournal` not on PATH — use `~/.clawjournal-venv/bin/clawjournal` directly
-- repo clone missing or stale — verify `~/clawjournal` exists and retry `python -m pip install -e ~/clawjournal`
+```powershell
+if (Test-Path "$HOME\clawjournal\.git") {
+  git -C "$HOME\clawjournal" pull --ff-only
+} else {
+  git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+}
+
+# Pick ONE based on the user's answer above:
+powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1"                # CLI only
+powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend  # also build the browser workbench (needs Node.js)
+```
+
+The script's exit code and printed output tell you exactly what to do next. Common failure modes the script surfaces directly:
+
+- **Python 3.10+ not found** — install via the platform hint the script prints, then re-run. macOS users may also need `xcode-select --install` to get a working `python3`.
+- **`python3 -m venv` fails on Debian/Ubuntu** — run `sudo apt install -y python3-venv python3-full`, then re-run the script.
+- **`node` / `npm` missing** when `--with-frontend` was requested — the script skips the frontend with a warning. Install Node.js (macOS: `brew install node`, Linux: `sudo apt-get install -y nodejs npm`, Windows: nodejs.org) and re-run with the flag.
+
+Verify (POSIX):
+
+```bash
+~/.clawjournal-venv/bin/clawjournal status
+```
+
+Verify (PowerShell):
+
+```powershell
+& "$HOME\.clawjournal-venv\Scripts\clawjournal.exe" status
+```
 
 ## 2. Scan Sessions
 
@@ -101,14 +107,25 @@ Ask: "How would you like to review your traces?"
 
 **Option A — Browser UI (recommended for local machines):**
 
-Build the frontend first if `~/clawjournal/clawjournal/web/frontend/dist/index.html` is missing:
+Check whether the frontend is already built:
 
 ```bash
-cd ~/clawjournal/clawjournal/web/frontend
-npm install
-npm run build
-cd ~/clawjournal
+test -f ~/clawjournal/clawjournal/web/frontend/dist/index.html && echo built || echo missing
 ```
+
+If missing, re-run the installer with the frontend flag (POSIX):
+
+```bash
+~/clawjournal/scripts/install.sh --with-frontend
+```
+
+PowerShell equivalent:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend
+```
+
+Then start the workbench:
 
 ```bash
 ~/.clawjournal-venv/bin/clawjournal serve
@@ -147,6 +164,6 @@ Tell the user:
 
 **Permission errors on scan:** ClawJournal reads session files from `~/.claude/`, `~/.codex/`, etc. Ensure these directories are readable.
 
-**Browser UI shows a placeholder page:** The frontend has not been built yet. Run `cd ~/clawjournal/clawjournal/web/frontend && npm install && npm run build`.
+**Browser UI shows a placeholder page:** The frontend has not been built yet. Re-run the installer with the frontend flag: `~/clawjournal/scripts/install.sh --with-frontend` (or `.\scripts\install.ps1 -WithFrontend` on PowerShell). Requires Node.js.
 
 **venv issues on Linux:** If you see `externally-managed-environment`, make sure you're installing into the venv: `python3 -m venv ~/.clawjournal-venv && ~/.clawjournal-venv/bin/python -m pip install -e ~/clawjournal`.
