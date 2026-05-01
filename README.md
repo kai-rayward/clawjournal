@@ -24,25 +24,27 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-Pick the block for your OS and run all the commands in it. The install script handles Python detection, venv creation, and editable install on macOS, Linux, WSL, and Windows.
+**Prerequisites:** `git` and a Python 3.10+ interpreter (the install script auto-detects Python). Optional: Node.js / npm for the browser workbench. On bare Ubuntu/Debian containers you may also need `sudo apt install -y git python3-venv python3-full`.
+
+Pick the block for your OS and run the commands in order. The script handles Python detection, venv creation, and editable install.
 
 **macOS / Linux / WSL / Git Bash on Windows:**
 
 ```bash
 git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
 cd ~/clawjournal
-./scripts/install.sh --with-frontend       # (or `sh scripts/install.sh --with-frontend` if a tarball clone dropped the +x bit)
+./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend  (if the +x bit is missing)
 ```
 
-**Native Windows PowerShell** (`pwsh` 7+ is fine; legacy `powershell` 5.1 also works):
+**Native Windows PowerShell** (`pwsh` 7+ on modern Windows; substitute `powershell` for the legacy 5.1 launcher):
 
 ```powershell
 git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
 ```
 
-The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384` (requires Node.js — the script warns and continues if `npm` is missing). Drop the flag for a CLI-only install if you don't need `clawjournal serve`; `scan`, `inbox`, `search`, and `bundle-export` work without the workbench.
+The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384`. **If Node.js is not installed, the script warns and continues with a CLI-only install** — `clawjournal serve` will then 404; install Node and re-run the script with the flag to fix. Drop the flag entirely if you only need `scan`, `inbox`, `search`, and `bundle-export` (these don't need the workbench).
 
 **Verify** — you should see a JSON response with `"stage"` and `"stage_number"`:
 
@@ -58,7 +60,17 @@ The script prints `[ok] ClawJournal <version> installed.` on success. The defaul
 { "stage": "configure", "stage_number": 2, "total_stages": 4, ... }
 ```
 
-The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). Add the venv bin directory to your `PATH` to call it as plain `clawjournal`. The install is idempotent — re-run the script any time to upgrade against the latest `git pull`.
+The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). The install is idempotent — re-run the script any time to upgrade against the latest `git pull`.
+
+**To call it as plain `clawjournal` instead of the full path** (current shell session; add to your shell profile to persist):
+
+```bash
+export PATH="$HOME/.clawjournal-venv/bin:$PATH"          # POSIX (bash/zsh)
+```
+
+```powershell
+$env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path   # PowerShell
+```
 
 > **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add kai-rayward/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
 >
