@@ -4,7 +4,7 @@ Review and curate your coding agent conversation traces — 100% locally. ClawJo
 
 ## Install in one step
 
-> **You — coding agent reading this README:** detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install any missing prereqs (git, Python 3.10+, and Node.js if the user wants the workbench), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+> **You — coding agent reading this README:** detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
 
 **You — human:** copy this README into Claude Code, Codex, OpenClaw, Hermes, OpenCode, Cursor, or any other coding agent and ask it to install ClawJournal. The agent will follow the instruction above and take care of the rest. Prefer to run the commands yourself? The [Quickstart](#quickstart) below is exactly what the agent would execute.
 
