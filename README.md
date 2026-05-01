@@ -31,18 +31,18 @@ Pick the block for your OS and run all the commands in it. The install script ha
 ```bash
 git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
 cd ~/clawjournal
-./scripts/install.sh
+./scripts/install.sh --with-frontend       # (or `sh scripts/install.sh --with-frontend` if a tarball clone dropped the +x bit)
 ```
 
-**Native Windows PowerShell:**
+**Native Windows PowerShell** (`pwsh` 7+ is fine; legacy `powershell` 5.1 also works):
 
 ```powershell
 git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
 ```
 
-The script prints `[ok] ClawJournal <version> installed.` on success. Pass `--with-frontend` (POSIX) or `-WithFrontend` (PowerShell) to also build the browser workbench (requires Node.js).
+The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384` (requires Node.js — the script warns and continues if `npm` is missing). Drop the flag for a CLI-only install if you don't need `clawjournal serve`; `scan`, `inbox`, `search`, and `bundle-export` work without the workbench.
 
 **Verify** — you should see a JSON response with `"stage"` and `"stage_number"`:
 
@@ -89,7 +89,7 @@ With skills installed, prompts like *"triage my new sessions"*, *"score everythi
 
 ### 1. Install
 
-If you followed [Quickstart](#quickstart) above, you're done — skip to Stage 2. Two alternative paths:
+The canonical install is the shell script in [Quickstart](#quickstart) above — that's what you want unless your environment blocks it. If you used Quickstart, skip to Stage 2. Two fallbacks:
 
 **Skills install (guided wizard inside your coding agent):**
 
@@ -107,13 +107,15 @@ pipx install clawjournal        # or: pip install clawjournal
 
 The PyPI wheel ships the pre-built workbench (no Node.js needed) but is currently many versions behind the source — features documented in this README may be missing. Use this only when installing from source isn't an option. `pip show clawjournal` reports the wheel's version.
 
-**TruffleHog (required for sharing exports, regardless of install path):**
+**TruffleHog** is **not** required to install or use ClawJournal locally. It is required only for [Stage 6 Package & Share](#6-package--share) — every `bundle-export` and `share` runs an independent secrets scan on the redacted output, and exports are blocked if TruffleHog is missing or finds anything. Install it before your first share; you can defer it.
 
 ```bash
-brew install trufflehog      # macOS; Linux/Windows: see upstream installer
+brew install trufflehog                                    # macOS
+curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
+# Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
 ```
 
-Every `bundle-export` and `share` runs an independent secrets scan on the redacted output before the export is considered complete. Exports are blocked if TruffleHog is missing or finds anything. See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
+See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
 
 ### 2. Configure
 
