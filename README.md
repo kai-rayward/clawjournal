@@ -41,7 +41,11 @@ brew install git python              # workbench (optional): brew install node
 
 # Debian / Ubuntu (drop `sudo` if you're root in a container):
 sudo apt update && sudo apt install -y git curl python3-full python3-venv
-sudo apt install -y nodejs npm       # workbench (optional). 24.04+ ships Node 18; on older LTS use NodeSource: curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - && sudo apt install -y nodejs
+
+# Workbench (optional). Ubuntu 24.04+ apt is fine; on 22.04 or older, distro Node
+# is too old for the Vite build — install the LTS via NodeSource first:
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash -
+sudo apt install -y nodejs
 
 # Windows (PowerShell, native package manager). The flags suppress interactive prompts that block autonomous installs:
 winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements --scope user
