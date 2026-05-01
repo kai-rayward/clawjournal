@@ -16,8 +16,9 @@ If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, *
 
 ### What to expect
 
-- **Permission prompts.** Your AI will ask permission to run several commands and install tools — typically 5 to 10 prompts. **Click "Allow" each time.** This is normal. The tools (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
-- **A few minutes of waiting.** Downloads and installs take 1–5 minutes total on a modern laptop. The agent will tell you what it's doing.
+- **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
+- **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
+- **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
 - **A success message at the end:** `[ok] ClawJournal 0.1.12 installed.` (the version number may differ).
 
 ### Open the workbench
@@ -71,6 +72,11 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 ---
 
 ## Quickstart
+
+> Non-coders following the **Install in one step** section above don't need to read this. The shell commands here are for AI agents and developers who run installs by hand. Click the section below to expand it.
+
+<details>
+<summary><b>Show shell commands (for AI agents and developers)</b></summary>
 
 **Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Skip any line whose tool is already installed:
 
@@ -148,6 +154,8 @@ $env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path   # PowerShell
 > **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add kai-rayward/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
 >
 > **Can't clone? Behind a firewall?** `pipx install clawjournal` works as a fallback, but the PyPI wheel currently lags the source by many releases. See [Stage 1: Install](#1-install).
+
+</details>
 
 ---
 
