@@ -24,9 +24,20 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-**Prerequisites:** `git` and a Python 3.10+ interpreter (the install script auto-detects Python). Optional: Node.js / npm for the browser workbench. On bare Ubuntu/Debian containers you may also need `sudo apt install -y git python3-venv python3-full`.
+**Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Install per OS:
 
-Pick the block for your OS and run the commands in order. The script handles Python detection, venv creation, and editable install.
+```bash
+# macOS:
+brew install git python              # Node (optional, for workbench): brew install node
+
+# Debian / Ubuntu (run on bare containers; safe to skip if already installed):
+sudo apt update && sudo apt install -y git python3-full python3-venv
+sudo apt install -y nodejs npm        # optional, for workbench (24.04+ is fine; older LTS may need NodeSource)
+
+# Windows: install Git for Windows, Python 3.10+ from python.org, and (optionally) Node.js LTS from nodejs.org.
+```
+
+Then pick the block for your OS and run it. The install script handles Python detection, venv creation, and editable install. Run `./scripts/install.sh --help` for all options.
 
 **macOS / Linux / WSL / Git Bash on Windows:**
 
@@ -36,12 +47,13 @@ cd ~/clawjournal
 ./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend  (if the +x bit is missing)
 ```
 
-**Native Windows PowerShell** (`pwsh` 7+ on modern Windows; substitute `powershell` for the legacy 5.1 launcher):
+**Native Windows PowerShell** — use `pwsh` (PowerShell 7+) if available, otherwise `powershell` (legacy 5.1) works the same:
 
 ```powershell
 git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
 pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+# If `pwsh` is not installed: powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
 ```
 
 The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384`. **If Node.js is not installed, the script warns and continues with a CLI-only install** — `clawjournal serve` will then 404; install Node and re-run the script with the flag to fix. Drop the flag entirely if you only need `scan`, `inbox`, `search`, and `bundle-export` (these don't need the workbench).
@@ -250,8 +262,8 @@ Upload is gated on hold-state: only sessions in `auto_redacted` or `released` ca
 The simplest way is to re-run the installer with the frontend flag:
 
 ```bash
-~/clawjournal/scripts/install.sh --with-frontend                    # POSIX
-powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend   # Windows
+~/clawjournal/scripts/install.sh --with-frontend                                            # POSIX
+pwsh -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend    # Windows (substitute `powershell` if pwsh isn't installed)
 ```
 
 Or do it manually:
