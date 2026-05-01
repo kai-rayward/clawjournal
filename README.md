@@ -2,11 +2,27 @@
 
 Review and curate your coding agent conversation traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
-## Install in one step
+## Install in one step (no coding required)
 
-> **You — coding agent reading this README:** detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install ClawJournal without writing any code or running any commands yourself.
 
-**You — human:** copy this README into Claude Code, Codex, OpenClaw, Hermes, OpenCode, Cursor, or any other coding agent and ask it to install ClawJournal. The agent will follow the instruction above and take care of the rest. Prefer to run the commands yourself? The [Quickstart](#quickstart) below is exactly what the agent would execute.
+**1.** Open your AI assistant.
+
+**2.** Paste this message:
+
+> *Install ClawJournal from https://github.com/kai-rayward/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
+
+**3.** The AI does the rest. It'll figure out your OS (Mac, Windows, Linux), install any tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
+
+**Done?** You'll see something like `[ok] ClawJournal 0.1.12 installed.` and a web address (`http://localhost:8384`) — that's the ClawJournal workbench in your browser.
+
+**Something went wrong?** Tell your AI *"it didn't work, please fix it."* Most install hiccups (a missing tool, a permission prompt, a stale package) are routine — the agent has the context to recover.
+
+**What to do next?** Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent conversations."* It'll walk you through scan, score, and review in your browser.
+
+> *AI agent reading this README:* detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+
+Already a developer and prefer to run the commands yourself? The [Quickstart](#quickstart) section below is the same path the agent would execute, in plain shell commands.
 
 ## Your data stays local
 
