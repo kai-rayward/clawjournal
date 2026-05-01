@@ -12,17 +12,43 @@ If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, *
 
 > *Install ClawJournal from https://github.com/kai-rayward/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
 
-**3.** The AI does the rest. It'll figure out your OS (Mac, Windows, Linux), install any tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
+**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
 
-**Done?** You'll see something like `[ok] ClawJournal 0.1.12 installed.` and a web address (`http://localhost:8384`) — that's the ClawJournal workbench in your browser.
+### What to expect
 
-**Something went wrong?** Tell your AI *"it didn't work, please fix it."* Most install hiccups (a missing tool, a permission prompt, a stale package) are routine — the agent has the context to recover.
+- **Permission prompts.** Your AI will ask permission to run several commands and install tools — typically 5 to 10 prompts. **Click "Allow" each time.** This is normal. The tools (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
+- **A few minutes of waiting.** Downloads and installs take 1–5 minutes total on a modern laptop. The agent will tell you what it's doing.
+- **A success message at the end:** `[ok] ClawJournal 0.1.12 installed.` (the version number may differ).
 
-**What to do next?** Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent conversations."* It'll walk you through scan, score, and review in your browser.
+### Open the workbench
 
-> *AI agent reading this README:* detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+After install, your AI will give you a web address that looks like `http://localhost:8384`. **That's a URL — copy it into the address bar of your web browser** (Chrome, Safari, Firefox, Edge — any of them) and press Enter. The ClawJournal workbench opens locally on your own computer; nothing is uploaded.
 
-Already a developer and prefer to run the commands yourself? The [Quickstart](#quickstart) section below is the same path the agent would execute, in plain shell commands.
+### If something doesn't work
+
+- **General fix:** tell your AI *"it didn't work, please fix it."* Most install hiccups (a missing tool, a stale package) are routine.
+- **If the AI says it can't do something:** reply *"try a different approach"* or *"are you sure? please try another way."* Installation problems usually have multiple solutions; the agent can find one.
+- **If a permission prompt scares you:** ask your AI *"what does this command do, and is it safe?"* before clicking Allow.
+
+### What to do next
+
+Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent conversations."* It'll walk you through configure, scan, and review in your browser.
+
+---
+
+<details>
+<summary><b>For AI agents reading this README directly</b> (humans following the 3 steps above can skip this)</summary>
+
+Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+
+</details>
+
+<details>
+<summary><b>For developers who want to run the commands by hand</b></summary>
+
+The [Quickstart](#quickstart) section below has the explicit per-OS shell commands the agent would execute. Same end result as the AI-driven path.
+
+</details>
 
 ## Your data stays local
 
