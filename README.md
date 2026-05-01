@@ -2,6 +2,57 @@
 
 Review and curate your coding agent conversation traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
+## Install in one step (no coding required)
+
+If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install ClawJournal without writing any code or running any commands yourself.
+
+**1.** Open your AI assistant.
+
+**2.** Paste this message:
+
+> *Install ClawJournal from https://github.com/kai-rayward/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
+
+**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
+
+### What to expect
+
+- **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
+- **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
+- **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
+- **A success message at the end:** `[ok] ClawJournal 0.1.12 installed.` (the version number may differ).
+
+### Open the workbench
+
+After install, your AI will give you a web address that looks like `http://localhost:8384`. **That's a URL — copy it into the address bar of your web browser** (Chrome, Safari, Firefox, Edge — any of them) and press Enter. The ClawJournal workbench opens locally on your own computer; nothing is uploaded.
+
+### If something doesn't work
+
+- **General fix:** tell your AI *"it didn't work, please fix it."* Most install hiccups (a missing tool, a stale package) are routine.
+- **If the AI says it can't do something:** reply *"try a different approach"* or *"are you sure? please try another way."* Installation problems usually have multiple solutions; the agent can find one.
+- **If a permission prompt scares you:** ask your AI *"what does this command do, and is it safe?"* before clicking Allow.
+
+### What to do next
+
+Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent conversations."* It'll walk you through configure, scan, and review in your browser.
+
+Your first scan may take a minute or two if you have lots of past sessions, and the workbench may show an empty list briefly while it indexes — that's normal. The page refreshes automatically as conversations are added.
+
+---
+
+<details>
+<summary><b>For AI agents reading this README directly</b> (humans following the 3 steps above can skip this)</summary>
+
+Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+
+</details>
+
+<details>
+<summary><b>For developers who want to run the commands by hand</b></summary>
+
+The [Quickstart](#quickstart) section below has the explicit per-OS shell commands the agent would execute. Same end result as the AI-driven path.
+
+</details>
+
 ## Your data stays local
 
 Everything in the default workflow runs on your own computer:
@@ -24,28 +75,104 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-Inside any compatible coding agent (Claude Code, Codex, Cursor, Gemini CLI, OpenCode, [many more](https://github.com/nicepkg/skills)):
+> Non-coders following the **Install in one step** section above don't need to read this. The shell commands here are for AI agents and developers who run installs by hand. Click the section below to expand it.
+
+<details>
+<summary><b>Show shell commands (for AI agents and developers)</b></summary>
+
+**Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Skip any line whose tool is already installed:
 
 ```bash
-npx skills add kai-rayward/clawjournal
+# macOS (install Homebrew first if you don't have it; NONINTERACTIVE=1 skips the RETURN prompt
+# that would otherwise hang an autonomous install. Second line puts brew on PATH for the current shell):
+NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)"
+brew install git python              # workbench (optional): brew install node
+
+# Debian / Ubuntu (drop `sudo` if you're root in a container):
+sudo apt update && sudo apt install -y git curl python3-full python3-venv
+
+# Workbench (optional). Ubuntu 24.04+ apt is fine; on 22.04 or older, distro Node
+# is too old for the Vite build — install the LTS via NodeSource first:
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash -
+sudo apt install -y nodejs
+
+# Windows (PowerShell, native package manager). The flags suppress interactive prompts that block autonomous installs:
+winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements --scope user
+winget install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements --scope user
+winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements              # workbench (optional). The Node MSI doesn't support --scope user; this needs admin or will prompt for elevation.
+
+# Refresh PATH in the current PowerShell session (winget doesn't do this for you):
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 ```
 
-Then tell the agent: *"setup clawjournal"*. It installs the PyPI package, scans your local sessions with default settings, and opens the workbench at `http://localhost:8384`. Nothing is uploaded.
+Then pick the block for your OS and run it. The install script handles Python detection, venv creation, and editable install. Run `./scripts/install.sh --help` for all options.
 
-Prefer the terminal? See Stage 1 in the flow below — every stage shows both skills and shell commands.
+**macOS / Linux / WSL / Git Bash on Windows:**
+
+```bash
+git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+cd ~/clawjournal
+./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend  (if the +x bit is missing)
+```
+
+**Native Windows PowerShell** — use `pwsh` (PowerShell 7+) if available, otherwise `powershell` (legacy 5.1) works the same:
+
+```powershell
+git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+Set-Location "$HOME\clawjournal"
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+# If `pwsh` is not installed: powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+```
+
+The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384`. **If Node.js is not installed, the script warns and continues with a CLI-only install** — `clawjournal serve` will then 404; install Node and re-run the script with the flag to fix. Drop the flag entirely if you only need `scan`, `inbox`, `search`, and `bundle-export` (these don't need the workbench).
+
+**Verify** — you should see a JSON response with `"stage"` and `"stage_number"`:
+
+```bash
+~/.clawjournal-venv/bin/clawjournal status                              # POSIX
+```
+
+```powershell
+& "$HOME\.clawjournal-venv\Scripts\clawjournal.exe" status              # PowerShell
+```
+
+```json
+{ "stage": "configure", "stage_number": 2, "total_stages": 4, ... }
+```
+
+The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). The install is idempotent — re-run the script any time to upgrade against the latest `git pull`.
+
+**To call it as plain `clawjournal` instead of the full path** (current shell session; add to your shell profile to persist):
+
+```bash
+export PATH="$HOME/.clawjournal-venv/bin:$PATH"          # POSIX (bash/zsh)
+```
+
+```powershell
+$env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path   # PowerShell
+```
+
+> **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add kai-rayward/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
+>
+> **Can't clone? Behind a firewall?** `pipx install clawjournal` works as a fallback, but the PyPI wheel currently lags the source by many releases. See [Stage 1: Install](#1-install).
+
+</details>
 
 ---
 
 ## End-to-end flow
 
-Six stages from a blank machine to a shared bundle. Each stage shows the skills-first way (inside your coding agent) and the shell-direct way.
+After install, six stages take you from indexing local sessions to (optionally) sharing a redacted bundle. **Non-coders: each stage starts with the natural-language prompt to give your AI assistant.** The shell commands the agent runs are tucked into expandable "Show shell commands" sections — you can ignore them.
+
+> *Heads up for developers running commands by hand: the shell snippets use bare `clawjournal`. If you haven't added the venv bin to `PATH`, prefix every command with `~/.clawjournal-venv/bin/` (POSIX) or `$HOME\.clawjournal-venv\Scripts\` (Windows).*
 
 ```
  Install ──► Configure ──► Scan ──► Triage ──► Score ──► Package & Share
     1            2           3          4          5              6
 ```
 
-**Three skills are installed by `npx skills add`:**
+**Optional skills layer** — `npx skills add kai-rayward/clawjournal` installs three skills into Claude Code / Codex / Cursor / Gemini CLI / OpenCode and similar agents:
 
 | Skill | Covers stages |
 |-------|---------------|
@@ -53,51 +180,57 @@ Six stages from a blank machine to a shared bundle. Each stage shows the skills-
 | **clawjournal** | 4 Triage · 6 Package & Share |
 | **clawjournal-score** | 5 Score |
 
-Day-to-day, prompts like *"triage my new sessions"*, *"score everything unscored"*, or *"package my approved sessions for export"* route to the right skill automatically.
+With skills installed, prompts like *"triage my new sessions"*, *"score everything unscored"*, or *"package my approved sessions for export"* route to the right skill. Skills are a convenience for agent-driven workflows — the shell commands below work the same without them.
 
 ### 1. Install
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+The canonical install is the shell script in [Quickstart](#quickstart) above — that's what you want unless your environment blocks it. If you used Quickstart, skip to Stage 2. Two fallbacks:
+
+**Skills install (guided wizard inside your coding agent):**
 
 ```bash
 npx skills add kai-rayward/clawjournal
 ```
 
-Adds the three ClawJournal skills to your agent. The PyPI package itself is installed in Stage 2 as part of `setup clawjournal`.
+Then say *"setup clawjournal"* inside the agent. The `clawjournal-setup` wizard runs `scripts/install.sh` (or `install.ps1`) under the hood and walks through scan + workbench launch. The end state is identical to the Quickstart shell install.
 
-**Shell — in any bash/zsh terminal:**
+**PyPI install (fallback, lags GitHub source):**
 
 ```bash
 pipx install clawjournal        # or: pip install clawjournal
 ```
 
-Requires Python 3.10+. `pipx` is preferred because it isolates the CLI in its own environment and puts `clawjournal` on your `PATH`. The PyPI wheel already includes the pre-built browser workbench — no frontend build required.
+The PyPI wheel ships the pre-built workbench (no Node.js needed) but is currently many versions behind the source — features documented in this README may be missing. Use this only when installing from source isn't an option. `pip show clawjournal` reports the wheel's version.
 
-**TruffleHog (required for sharing):**
+**TruffleHog** is **not** required to install or use ClawJournal locally. It is only needed for [Stage 6 Package & Share](#6-package--share) — every `bundle-export` and `share` runs an independent secrets scan on the redacted output, and exports are blocked if TruffleHog is missing or finds anything. Your AI can install it for you when you reach Stage 6, or you can defer it entirely if you only plan to use ClawJournal locally.
+
+<details>
+<summary><b>Show TruffleHog install commands (your AI handles this for you)</b></summary>
 
 ```bash
-brew install trufflehog      # macOS; Linux/Windows: see upstream installer
+brew install trufflehog                                    # macOS
+curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
+# Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
 ```
 
-Every `bundle-export` and `share` runs an independent secrets scan on the redacted output before the export is considered complete. Exports are blocked if TruffleHog is missing or finds anything. See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
+</details>
+
+See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
 
 ### 2. Configure
 
 Tell ClawJournal which agents' sessions to scan and what to exclude or redact.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+**Just say to your AI:**
 
-For a first-time run with defaults (all sources, no exclusions), say:
+> *"Configure clawjournal — scan all sources with defaults, no exclusions."*
+>
+> Or, to narrow scope: *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."*
 
-> *"setup clawjournal"*
+The agent translates this into the right CLI calls. Subsequent scans pick up new settings automatically.
 
-The skill installs the PyPI package, runs a first scan, and opens the workbench. Later, to narrow scope or add redactions:
-
-> *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."*
-
-Subsequent scans pick up the new settings automatically.
-
-**Shell — in any bash/zsh terminal:**
+<details>
+<summary><b>Show shell commands (what the agent runs)</b></summary>
 
 ```bash
 clawjournal config --source all                   # claude | codex | gemini | opencode | openclaw | kimi | custom | all
@@ -110,15 +243,16 @@ clawjournal config --confirm-projects             # lock in project selection
 
 `--exclude`, `--redact`, and `--redact-usernames` all append; they never overwrite. Safe to call repeatedly.
 
+</details>
+
 ### 3. Scan
 
-Reads your local session files into a SQLite DB and runs a per-session findings pipeline (secrets engine + PII engine). Findings are stored as hashed references — plaintext is never persisted.
+Reads your local session files into a private database on your computer. As it reads, ClawJournal automatically detects secrets and personal information so you can review them before sharing anything. Plaintext is never saved — only safe references.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+**Just say to your AI:** *"scan my coding-agent sessions"* (a first scan also runs automatically as part of *"setup clawjournal"*).
 
-Your agent runs scan as part of `setup clawjournal`. Re-scan any time with: *"scan my sessions again."*
-
-**Shell — in any bash/zsh terminal:**
+<details>
+<summary><b>Show shell command</b></summary>
 
 ```bash
 clawjournal scan
@@ -126,15 +260,16 @@ clawjournal scan
 
 The workbench daemon (`clawjournal serve`) also scans continuously in the background.
 
+</details>
+
 ### 4. Triage
 
-Approve sessions worth keeping, block the rest. Happens in the workbench (Sessions page) or the CLI.
+Mark which conversations you want to keep ("approve") and which to discard ("block"). The browser workbench at `localhost:8384` is the easiest place to do this — you'll see each conversation with a summary, and click Approve or Block.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+**Just say to your AI:** *"Open clawjournal and help me triage my unreviewed sessions."*
 
-> *"Open clawjournal and help me triage the unreviewed sessions."*
-
-**Shell — in any bash/zsh terminal:**
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal serve                                    # workbench UI — the primary review surface
@@ -146,7 +281,12 @@ clawjournal block <session_id> --reason "private"    # block
 clawjournal shortlist <session_id>                   # mark for deeper review
 ```
 
-Optional hold-state controls — useful when you want to quarantine a session without blocking it (CLI only):
+</details>
+
+Sometimes you want to set a conversation aside without blocking it permanently — for example, "this might be useful but I need to clear it with legal first." That's called a "hold." Just say to your AI: *"Put this session on hold pending legal review."* The agent will mark it. You can release it later, or set an embargo (auto-release at a specific date).
+
+<details>
+<summary><b>Show hold-state shell commands (CLI only — non-coders can ignore)</b></summary>
 
 ```bash
 clawjournal hold <id> --reason "pending legal review"
@@ -155,17 +295,18 @@ clawjournal embargo <id> --until 2026-06-01
 clawjournal hold-history <id>
 ```
 
+</details>
+
 ### 5. Score
 
-AI-assisted quality scoring on a 1–5 scale (1 = noise, 5 = excellent). Home-dir paths and usernames are anonymized before anything is sent to the judge.
+AI-assisted quality rating on a 1–5 scale (1 = noise, 5 = excellent). Personal info in your conversations is removed before anything is sent to the AI judge — your home folder paths and usernames are anonymized first.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+**Just say to your AI:** *"Score my unscored ClawJournal sessions and auto-block the noise."*
 
-> *"Score my unscored sessions."*
+The agent batches the scoring; sessions rated 1 get auto-blocked, sessions rated 2–5 stay visible for you to decide.
 
-This runs through the `clawjournal-score` skill and uses your current agent's automation CLI.
-
-**Shell — in any bash/zsh terminal:**
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal score --batch --auto-triage              # batch-score; auto-blocks noise (score 1) sessions
@@ -173,36 +314,34 @@ clawjournal score-view <id>                          # show score details
 clawjournal set-score <id> --quality 4               # manual override
 ```
 
-`--auto-triage` moves sessions with quality score 1 to `blocked`. Sessions scored 2–5 stay visible for you to decide.
-
 By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+
+</details>
 
 ### 6. Package & Share
 
-Bundle approved sessions into a redacted export on disk. Uploading that bundle is a separate, opt-in step.
+Package the conversations you approved into a redacted file on your computer. Uploading anywhere is a separate, opt-in step — by default the file just sits on your disk.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+**Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
-> *"Package my approved sessions and export them locally."*
->
-> *(optional)* *"Then share the bundle through the ingest service."*
+The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed.
 
-**Workbench — in your browser:**
+To actually upload after packaging (optional, requires a one-time email verification):
 
-Open the workbench (`clawjournal serve`) and walk the Share page: **Queue → Redact → Review → Package → Done**. The Redact step layers AI-assisted PII detection on top of the scan-time findings.
+> *(optional)* *"Now share the bundle through the ClawJournal ingest service. My email is you@university.edu."*
 
-**Shell — in any bash/zsh terminal:**
+Uploads are gated: only conversations you approved and confirmed for sharing leave your machine.
+
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal bundle-create --status approved          # bundle all approved sessions
 clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
 clawjournal bundle-export <bundle_id>                # write sessions.jsonl + manifest.json to disk
-```
 
-Optional upload:
-
-```bash
+# Optional upload:
 clawjournal verify-email you@university.edu          # one-time email verification
 clawjournal share --preview --status approved        # dry-run
 clawjournal bundle-share <bundle_id>                 # upload through the configured ingest service
@@ -210,30 +349,39 @@ clawjournal bundle-share <bundle_id>                 # upload through the config
 
 Upload is gated on hold-state: only sessions in `auto_redacted` or `released` can leave the machine.
 
+</details>
+
 ---
 
-## Build from source (contributors)
+## Build the browser workbench
 
-You only need this path if you're developing ClawJournal itself — the PyPI wheel is the right choice for everyone else.
+If you followed the **Install in one step** section at the top of this README, the workbench is already built — you don't need this section.
 
-> Commands below assume a POSIX shell (bash/zsh). On Windows, run them inside WSL or Git Bash. Native PowerShell users: replace `source .venv/bin/activate` with `.venv\Scripts\Activate.ps1`.
+This section is only for developers who installed without the workbench (no `--with-frontend` flag) and want to add it later, or who want to do the frontend build by hand.
+
+<details>
+<summary><b>Show frontend-build shell commands</b></summary>
+
+`clawjournal serve` opens a local Vite app from `clawjournal/web/frontend/dist/`. The PyPI wheel ships this `dist/` pre-built; a source install needs a one-time build.
+
+The simplest way is to re-run the installer with the frontend flag:
 
 ```bash
-git clone https://github.com/kai-rayward/clawjournal.git
-cd clawjournal
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
+~/clawjournal/scripts/install.sh --with-frontend                                            # POSIX
+pwsh -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend    # Windows (substitute `powershell` if pwsh isn't installed)
+```
 
-# One-time frontend build for the browser workbench
-cd clawjournal/web/frontend
+Or do it manually:
+
+```bash
+cd ~/clawjournal/clawjournal/web/frontend
 npm install
 npm run build
-cd ../../..
-
-clawjournal scan
-clawjournal serve
 ```
+
+Either path requires Node.js. Skip the build entirely if you're only using the CLI (`scan`, `inbox`, `search`, `bundle-export`, …).
+
+</details>
 
 <details>
 <summary><b>Python not installed?</b></summary>
@@ -249,26 +397,7 @@ ClawJournal requires Python 3.10+.
 </details>
 
 <details>
-<summary><b>Using a virtual environment (recommended)</b></summary>
-
-Modern Linux distributions (Debian 12+, Ubuntu 23.04+) and some macOS setups block system-wide pip installs ([PEP 668](https://peps.python.org/pep-0668/)).
-
-From the repo root:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-```
-
-> If you see `externally-managed-environment`, make sure the venv is activated before running `python -m pip`.
-
-</details>
-
-<details>
-<summary><b>Node.js required only when building from source</b></summary>
-
-The PyPI wheel ships the pre-built workbench. You only need Node if you're building from source.
+<summary><b>Node.js (only for the frontend build)</b></summary>
 
 | Platform | Install command |
 |----------|----------------|
@@ -276,11 +405,23 @@ The PyPI wheel ships the pre-built workbench. You only need Node if you're build
 | **Windows** | Download from [nodejs.org](https://nodejs.org) |
 | **Linux** | `sudo apt install nodejs npm` |
 
+</details>
+
+<details>
+<summary><b>Developing ClawJournal itself</b></summary>
+
 ```bash
-cd clawjournal/web/frontend
-npm install
-npm run build
+git clone https://github.com/kai-rayward/clawjournal.git
+cd clawjournal
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+pytest
 ```
+
+On native Windows (no WSL / Git Bash), replace `source .venv/bin/activate` with `.venv\Scripts\Activate.ps1`.
+
+If you see `externally-managed-environment` on Linux/macOS, make sure the venv is activated before running `python -m pip` ([PEP 668](https://peps.python.org/pep-0668/)).
 
 </details>
 
