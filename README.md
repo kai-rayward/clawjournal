@@ -27,7 +27,8 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 **Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Skip any line whose tool is already installed:
 
 ```bash
-# macOS:
+# macOS (install Homebrew first if you don't have it):
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 brew install git python              # workbench (optional): brew install node
 
 # Debian / Ubuntu (drop `sudo` if you're root in a container):
@@ -38,7 +39,9 @@ sudo apt install -y nodejs npm       # workbench (optional). 24.04+ ships Node 1
 winget install --id Git.Git -e
 winget install --id Python.Python.3.12 -e
 winget install --id OpenJS.NodeJS.LTS -e   # workbench (optional)
-# winget doesn't refresh the current shell's PATH; close this PowerShell window and open a new one before continuing.
+
+# Refresh PATH in the current PowerShell session (winget doesn't do this for you):
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 ```
 
 Then pick the block for your OS and run it. The install script handles Python detection, venv creation, and editable install. Run `./scripts/install.sh --help` for all options.
